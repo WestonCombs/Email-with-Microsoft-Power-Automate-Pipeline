@@ -1,9 +1,15 @@
 import json
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
+
+_PYTHON_FILES = Path(__file__).resolve().parent.parent
+if str(_PYTHON_FILES) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_FILES))
+from version import APP_VERSION
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -152,6 +158,7 @@ def apply_cell_styles(ws, start_row: int):
 
 
 def main():
+    print(f"Email Sorter v{APP_VERSION}")
     records = load_json(JSON_PATH)
 
     if os.path.exists(EXCEL_PATH):
