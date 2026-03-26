@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs may contain emails, paths, names, and order details
+run_log.txt
