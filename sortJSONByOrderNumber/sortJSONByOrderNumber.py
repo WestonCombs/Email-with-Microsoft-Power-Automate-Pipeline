@@ -1,15 +1,9 @@
 import json
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-
-_PYTHON_FILES = Path(__file__).resolve().parent.parent
-if str(_PYTHON_FILES) not in sys.path:
-    sys.path.insert(0, str(_PYTHON_FILES))
-from version import APP_VERSION
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -47,5 +41,4 @@ data.sort(key=lambda x: (
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
 
-print(f"Email Sorter v{APP_VERSION}")
 print(f"Sorted {len(data)} records by order_number then purchase_datetime and saved to:\n{OUTPUT_FILE}")

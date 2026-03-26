@@ -1,17 +1,11 @@
 import argparse
 import os
 import json
-import sys
 from pathlib import Path
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
-
-_PYTHON_FILES = Path(__file__).resolve().parent.parent
-if str(_PYTHON_FILES) not in sys.path:
-    sys.path.insert(0, str(_PYTHON_FILES))
-from version import APP_VERSION
 
 # Load .env from python_files/ (one level up from this script's subfolder)
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -176,7 +170,7 @@ TEXT:
 # =========================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=f"Email Sorter v{APP_VERSION}: extract structured purchase details from HTML emails."
+        description="Extract structured purchase details from HTML emails."
     )
     parser.add_argument(
         "--base-dir",
@@ -351,7 +345,6 @@ if __name__ == "__main__":
     sys.stderr = _Tee(_log_path, sys.stderr)
 
     print(f"\n{'='*60}")
-    print(f"Email Sorter v{APP_VERSION}")
     print(f"Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Args: {sys.argv[1:]}")
     print(f"{'='*60}")
