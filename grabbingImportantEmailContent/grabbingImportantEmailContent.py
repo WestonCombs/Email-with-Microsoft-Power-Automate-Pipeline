@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,7 +21,6 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 API_KEY = os.getenv(OPENAI_API_KEY_ENV)
 
 MODEL = "gpt-4o-mini"
-LOCAL_MODEL = "llama3"
 
 VALID_CATEGORIES = [
     "Order Placed",
@@ -339,14 +337,14 @@ def _check_and_throttle(headers) -> float:
 
 
 # =========================
-# PRIMARY EXTRACTION: OPENAI
+# EXTRACTION: OPENAI
 # =========================
 def extract_with_openai(
     text_only: str,
     candidates: list[dict],
     subject: str | None = None,
 ) -> dict:
-    """Direct extraction of purchase details using OpenAI (primary path)."""
+    """Extract purchase details using OpenAI."""
     candidates_json_str = json.dumps(candidates, indent=2) if candidates else "[]"
     subject_section = f"\nEMAIL SUBJECT: {subject}" if subject else ""
 
@@ -514,222 +512,6 @@ EMAIL TEXT:
 
 
 # =========================
-# FALLBACK EXTRACTION: LOCAL LLM
-# =========================
-LOCAL_PROMPT_TEMPLATE = """You are extracting structured purchase/order information from an email.
-
-RULES:
-1. Return ONLY valid JSON. No markdown fences, no explanation, no extra text.
-2. Use null for missing scalar fields and empty arrays for missing list fields.
-3. Do NOT guess. If a value is not clearly present, use null or an empty array.
-4. ORDER NUMBER = retailer confirmation ID. TRACKING NUMBER = shipping carrier ID. They are different.
-5. Distinguish PURCHASE DATE from shipment/delivery dates.
-6. purchase_datetime format: "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD".
-7. company is the retailer/store/merchant name.
-8. order_number: check subject line first, then body. Strip any leading "#".
-9. TRACKING CANDIDATES below were pre-extracted from email links. Confirm or reject each.
-   Include confirmed values in tracking_numbers and their source_url in tracking_links.
-   If no candidates, check the email text for tracking numbers.
-10. email_category: Classify this email as exactly one of:
-    "Order Placed", "Order Received", "Order Confirmed", "Order Delayed",
-    "Order Shipped", "Delivery Confirmation", "Purchased Gift Card", or "Unknown".
-    Hints: "Order Placed" emails rarely have tracking. "Order Shipped" usually has tracking.
-    "Delivery Confirmation" mentions delivery completion. "Purchased Gift Card" involves
-    gift card purchases, redemption codes, or gift card delivery.
-11. email_category_confidence: Your confidence (0-100) in the chosen category.
-
-Return JSON matching this exact schema:
-{{
-  "company": <string or null>,
-  "order_number": <string or null>,
-  "purchase_datetime": <string or null>,
-  "total_amount_paid": <number or null>,
-  "tax_paid": <number or null>,
-  "tracking_numbers": [<string>, ...],
-  "tracking_links": [<string>, ...],
-  "email_category": <string>,
-  "email_category_confidence": <number 0-100>
-}}
-
-EMAIL SUBJECT: {subject}
-
-TRACKING CANDIDATES:
-{candidates_json}
-
-EMAIL TEXT:
-{text}"""
-
-
-def _extract_first_json_object(s: str) -> str | None:
-    """Find the first top-level JSON object in a string (handles nested braces)."""
-    start = s.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(s)):
-        c = s[i]
-        if escape:
-            escape = False
-            continue
-        if in_string:
-            if c == "\\":
-                escape = True
-            elif c == '"':
-                in_string = False
-            continue
-        if c == '"':
-            in_string = True
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return s[start : i + 1]
-    return None
-
-
-def _strip_markdown_json_fence(s: str) -> str:
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
-    return s.strip()
-
-
-def _parse_local_llm_json_text(cleaned: str) -> dict | None:
-    """Try several strategies to extract a JSON dict; return dict or None."""
-    candidates: list[str] = []
-    t = cleaned.strip()
-    if t:
-        candidates.append(t)
-    fenced = _strip_markdown_json_fence(cleaned)
-    if fenced and fenced not in candidates:
-        candidates.append(fenced.strip())
-
-    for blob in candidates:
-        try:
-            out = json.loads(blob)
-            if isinstance(out, dict):
-                return out
-        except json.JSONDecodeError:
-            pass
-
-    for blob in candidates:
-        sub = _extract_first_json_object(blob)
-        if sub:
-            try:
-                out = json.loads(sub)
-                if isinstance(out, dict):
-                    return out
-            except json.JSONDecodeError:
-                pass
-
-    return None
-
-
-def _normalize_local_result(raw: dict) -> dict:
-    """Normalize local LLM output to the standard program schema.
-    Handles flat keys, camelCase variants, and confidence-annotated wrappers."""
-    def _scalar(*keys: str):
-        for k in keys:
-            v = raw.get(k)
-            if isinstance(v, dict):
-                v = v.get("value")
-            if v is not None:
-                return v
-        return None
-
-    def _list_field(*keys: str) -> list:
-        for k in keys:
-            entries = raw.get(k)
-            if isinstance(entries, list):
-                result = []
-                for item in entries:
-                    val = item.get("value") if isinstance(item, dict) else item
-                    if val is not None and str(val).strip():
-                        result.append(str(val).strip())
-                return result
-        return []
-
-    return {
-        "company": _scalar("company", "company_name"),
-        "order_number": _scalar("order_number", "orderNumber"),
-        "purchase_datetime": _scalar("purchase_datetime", "purchaseDate"),
-        "total_amount_paid": _scalar("total_amount_paid", "totalPaid"),
-        "tax_paid": _scalar("tax_paid", "taxPaid"),
-        "tracking_numbers": _list_field("tracking_numbers", "trackingNumbers"),
-        "tracking_links": _list_field("tracking_links", "trackingLinks"),
-        "email_category": _scalar("email_category", "emailCategory", "category"),
-        "email_category_confidence": _scalar(
-            "email_category_confidence", "emailCategoryConfidence",
-            "category_confidence",
-        ),
-    }
-
-
-def extract_with_local_llm(
-    text_only: str,
-    candidates: list[dict],
-    subject: str | None = None,
-) -> dict:
-    prompt = LOCAL_PROMPT_TEMPLATE.format(
-        subject=subject or "(none)",
-        candidates_json=json.dumps(candidates, indent=2),
-        text=text_only,
-    )
-
-    try:
-        result = subprocess.run(
-            ["ollama", "run", LOCAL_MODEL, "--format", "json"],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-        )
-        raw_output = result.stdout.strip()
-    except FileNotFoundError:
-        print("  WARNING: ollama not found on PATH. Skipping local extraction.")
-        return {"_error": "ollama_not_found"}
-    except subprocess.TimeoutExpired:
-        print("  WARNING: local LLM timed out.")
-        return {"_error": "local_llm_timeout"}
-    except Exception as e:
-        print(f"  WARNING: local LLM subprocess failed: {e}")
-        return {"_error": str(e)}
-
-    if result.returncode != 0:
-        print(f"  WARNING: ollama returned exit code {result.returncode}")
-        stderr_snippet = (result.stderr or "")[:300]
-        if stderr_snippet:
-            print(f"  stderr: {stderr_snippet}")
-        return {"_error": f"ollama_exit_{result.returncode}"}
-
-    cleaned = raw_output.strip()
-    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned).strip()
-
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if len(lines) >= 2:
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
-
-    parsed = _parse_local_llm_json_text(cleaned)
-    if parsed is None:
-        snippet = (cleaned[:400] + "\u2026") if len(cleaned) > 400 else cleaned
-        print("  WARNING: could not parse local LLM JSON output.")
-        print(f"  (first ~400 chars of model output): {snippet!r}")
-        return {"_error": "json_parse_failed", "_raw": raw_output[:800]}
-
-    return _normalize_local_result(parsed)
-
-
-# =========================
 # ARGS
 # =========================
 def parse_args() -> argparse.Namespace:
@@ -802,7 +584,6 @@ def process_file(
 
         extracted = None
 
-        # Primary: OpenAI direct extraction
         if API_KEY:
             print("  Running OpenAI extraction...")
             try:
@@ -813,17 +594,12 @@ def process_file(
                 print(f"  WARNING: OpenAI extraction failed: {e}")
                 extracted = None
 
-        # Fallback: Local LLM (when no API key or OpenAI failed)
         if extracted is None:
-            print("  Running local LLM extraction (fallback)...")
-            local_data = extract_with_local_llm(
-                text_only, candidates, subject=subject
-            )
-            if "_error" not in local_data:
-                extracted = local_data
+            if not API_KEY:
+                print("  WARNING: No OpenAI API key; using empty/default fields.")
             else:
-                print("  WARNING: local LLM extraction also failed.")
-                extracted = empty_extraction
+                print("  WARNING: Using empty/default fields (OpenAI unavailable or failed).")
+            extracted = empty_extraction
 
         if not clean_text(extracted.get("company")):
             extracted["company"] = infer_company_from_subject(subject)
@@ -990,7 +766,7 @@ def main():
     if not API_KEY:
         print(
             f"WARNING: {OPENAI_API_KEY_ENV} is not set. "
-            "OpenAI extraction will be skipped; using local LLM only."
+            "Structured extraction will be skipped (empty fields only)."
         )
 
     # Single-file mode
