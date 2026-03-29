@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -13,15 +14,29 @@ if not BASE_DIR:
 
 INPUT_FILE  = Path(BASE_DIR) / "email_contents" / "json" / "results.json"
 OUTPUT_FILE = INPUT_FILE
-
-with open(INPUT_FILE, "r", encoding="utf-8") as f:
-    data = json.load(f)
+LOG_PATH    = Path(BASE_DIR) / "programFileOutput.txt"
 
 _DATE_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
 
+
+class _Tee:
+    """Writes to both an original stream and a log file simultaneously."""
+    def __init__(self, log_path: Path, original_stream):
+        self._file = open(log_path, "a", encoding="utf-8")
+        self._original = original_stream
+    def write(self, msg):
+        self._original.write(msg)
+        self._file.write(msg.replace("\ufeff", "") if isinstance(msg, str) else msg)
+    def flush(self):
+        self._original.flush()
+        self._file.flush()
+    def close(self):
+        self._file.close()
+
+
 def _parse_datetime(value):
     """Return a datetime for sorting; nulls/unparseable values sort to the bottom."""
-    if not value:
+    if not value or not isinstance(value, str):
         return None
     for fmt in _DATE_FORMATS:
         try:
@@ -30,15 +45,45 @@ def _parse_datetime(value):
             continue
     return None
 
-# Primary sort: order_number (nulls last); secondary sort: purchase_datetime (nulls last)
-data.sort(key=lambda x: (
-    x.get("order_number") is None,
-    str(x.get("order_number") or ""),
-    _parse_datetime(x.get("purchase_datetime")) is None,
-    _parse_datetime(x.get("purchase_datetime")) or datetime.min,
-))
 
-with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
+def main():
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-print(f"Sorted {len(data)} records by order_number then purchase_datetime and saved to:\n{OUTPUT_FILE}")
+    data.sort(key=lambda x: (
+        x.get("order_number") is None,
+        str(x.get("order_number") or ""),
+        _parse_datetime(x.get("purchase_datetime")) is None,
+        _parse_datetime(x.get("purchase_datetime")) or datetime.min,
+    ))
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    print(f"Sorted {len(data)} records by order_number then purchase_datetime and saved to:\n{OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    _tee = _Tee(LOG_PATH, sys.stdout)
+    sys.stdout = _tee
+    sys.stderr = _Tee(LOG_PATH, sys.stderr)
+    _original_stdout = _tee._original
+    _original_stderr = sys.stderr._original
+
+    print(f"\n{'='*60}")
+    print(f"[sortJSONByOrderNumber] Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}")
+
+    try:
+        main()
+        print("Sort finished successfully.")
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        sys.stdout = _original_stdout
+        sys.stderr = _original_stderr
+        _tee.close()
+        sys.exit(1)
+
+    sys.stdout = _original_stdout
+    sys.stderr = _original_stderr
+    _tee.close()
