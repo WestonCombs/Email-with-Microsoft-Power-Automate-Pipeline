@@ -31,6 +31,7 @@ FIXED_COLUMNS = [
     "total_amount_paid",
     "tax_paid",
     "tracking_number",
+    "tracking_link",
     "duplicate_on_last_run",
 ]
 
@@ -44,6 +45,7 @@ FIXED_HEADERS = {
     "total_amount_paid":      "Total Paid",
     "tax_paid":               "Tax Paid",
     "tracking_number":        "Tracking Number",
+    "tracking_link":          "Tracking Link",
     "duplicate_on_last_run":  "Duplicate On Last Run",
 }
 
@@ -109,19 +111,6 @@ def get_company_value(record: dict):
     return infer_company_from_subject(record.get("subject"))
 
 
-def get_tracking_number_value(record: dict):
-    tracking_numbers = record.get("tracking_numbers", [])
-    if not isinstance(tracking_numbers, list):
-        return None
-
-    cleaned_numbers = [
-        str(value).strip()
-        for value in tracking_numbers
-        if value is not None and str(value).strip()
-    ]
-    return ", ".join(cleaned_numbers) if cleaned_numbers else None
-
-
 def _build_column_order() -> tuple[list[str], list[str]]:
     keys: list[str] = list(FIXED_COLUMNS)
     labels: list[str] = [FIXED_HEADERS[c] for c in FIXED_COLUMNS]
@@ -138,8 +127,6 @@ def _record_to_row(record: dict, column_keys: list[str]) -> list:
     for key in column_keys:
         if key == "company":
             row.append(get_company_value(record))
-        elif key == "tracking_number":
-            row.append(get_tracking_number_value(record))
         else:
             row.append(clean_value(record.get(key)))
     return row
@@ -163,7 +150,8 @@ def set_column_widths(ws, column_keys: list[str]):
         "email":                 30,
         "total_amount_paid":     14,
         "tax_paid":              12,
-        "tracking_number":       24,
+        "tracking_number":       28,
+        "tracking_link":         40,
         "duplicate_on_last_run": 24,
         "source_file_link":      14,
     }
