@@ -8,20 +8,29 @@ import re
 
 from bs4 import BeautifulSoup
 
+from htmlHandler.admin_log import trace
 
-def _remove_hidden_elements(soup: BeautifulSoup) -> None:
-    """Remove elements that are visually hidden in the rendered email."""
+_SRC = "convertHTMLToPlaintext"
+
+
+def _remove_hidden_elements(soup: BeautifulSoup) -> int:
+    """Remove elements that are visually hidden in the rendered email.
+    Returns the count of removed elements."""
+    removed = 0
     for el in soup.find_all(style=True):
         style = el.get("style") or ""
         if re.search(r"display\s*:\s*none", style, re.IGNORECASE) or \
            re.search(r"visibility\s*:\s*hidden", style, re.IGNORECASE):
             el.decompose()
+            removed += 1
+    return removed
 
 
-def _convert_tables_to_markdown(soup: BeautifulSoup) -> None:
+def _convert_tables_to_markdown(soup: BeautifulSoup) -> int:
     """Convert multi-row, multi-column data tables to markdown so the LLM
     sees row/column relationships (e.g. item-price pairings) that are lost
-    when tags are flattened to plain text."""
+    when tags are flattened to plain text.  Returns the count of converted tables."""
+    converted = 0
     for table in reversed(soup.find_all("table")):
         rows: list[list[str]] = []
         for tr in table.find_all("tr"):
@@ -46,14 +55,21 @@ def _convert_tables_to_markdown(soup: BeautifulSoup) -> None:
                 lines.append("| " + " | ".join(["---"] * max_cols) + " |")
 
         table.replace_with("\n" + "\n".join(lines) + "\n")
+        converted += 1
+    return converted
 
 
 def convert(html: str, max_chars: int = 50_000) -> str:
     """Convert raw HTML to clean plain text, trimmed to *max_chars*."""
+    trace(_SRC, f"convert() called — raw HTML len={len(html):,} chars", html[:200])
+
     soup = BeautifulSoup(html, "html.parser")
 
-    _remove_hidden_elements(soup)
-    _convert_tables_to_markdown(soup)
+    hidden_count = _remove_hidden_elements(soup)
+    trace(_SRC, f"removed {hidden_count} hidden elements")
+
+    table_count = _convert_tables_to_markdown(soup)
+    trace(_SRC, f"converted {table_count} data tables to markdown")
 
     for tag in soup(["script", "style", "noscript", "svg", "meta", "head"]):
         tag.decompose()
@@ -63,6 +79,14 @@ def convert(html: str, max_chars: int = 50_000) -> str:
     lines = [line for line in lines if line]
     cleaned = "\n".join(lines)
 
-    if len(cleaned) > max_chars:
+    was_truncated = len(cleaned) > max_chars
+    if was_truncated:
         cleaned = cleaned[:max_chars]
+
+    trace(
+        _SRC,
+        f"convert() result — plain text len={len(cleaned):,} chars, "
+        f"lines={len(cleaned.splitlines())}, truncated={was_truncated}",
+        cleaned[:200],
+    )
     return cleaned

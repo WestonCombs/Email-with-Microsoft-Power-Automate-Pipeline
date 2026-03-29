@@ -6,6 +6,10 @@ Handles both double-quoted and single-quoted attribute values.
 
 import re
 
+from htmlHandler.admin_log import trace
+
+_SRC = "ValuesExtractionByAttribute"
+
 _PATTERN_CACHE: dict[str, re.Pattern] = {}
 
 
@@ -28,6 +32,14 @@ def extract_attribute_values(html: str, attribute: str) -> list[str]:
     >>> extract_attribute_values('<a href="https://ups.com/track">Track</a>', "href")
     ['https://ups.com/track']
     """
+    raw_occurrences = html.lower().count(f'{attribute.lower()}=')
+    trace(
+        _SRC,
+        f"extract_attribute_values() called — html len={len(html):,}, "
+        f"attribute={attribute!r}, raw '{attribute}=' occurrences={raw_occurrences}",
+        html[:200],
+    )
+
     pattern = _get_pattern(attribute)
     seen: set[str] = set()
     values: list[str] = []
@@ -36,4 +48,11 @@ def extract_attribute_values(html: str, attribute: str) -> list[str]:
         if value and value not in seen:
             seen.add(value)
             values.append(value)
+
+    # Link-value preview disabled — tracking-link bug is resolved
+    # preview = ", ".join(values[:3]) if values else "(none)"
+    trace(
+        _SRC,
+        f"extract_attribute_values() result — {len(values)} unique values found",
+    )
     return values

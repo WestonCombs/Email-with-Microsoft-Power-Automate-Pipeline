@@ -15,6 +15,7 @@ from openai import OpenAI, RateLimitError
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PYTHON_FILES_DIR))
 
+from htmlHandler.admin_log import trace as _trace
 from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
 from htmlHandler.htmlValuesExtractionByAttribute.ValuesExtractionByAttribute import extract_attribute_values
 from htmlHandler.isHrefTrackingLink import determine_tracking_link
@@ -135,6 +136,55 @@ def clean_text(text) -> str | None:
     if text is None:
         return None
     return str(text).replace("\ufeff", "").strip() or None
+
+
+def read_email_html_file(file_path: Path) -> tuple[str, str]:
+    """Read HTML saved by Outlook / Power Automate.
+
+    Those tools often write **UTF-16 LE** (with or without BOM). Opening as UTF-8
+    produces mojibake: no ``href=`` substring, so link extraction returns [].
+    """
+    raw = file_path.read_bytes()
+    if not raw:
+        return "", "empty"
+
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8-sig"
+    if raw.startswith(b"\xff\xfe"):
+        return raw.decode("utf-16-le"), "utf-16-le (BOM)"
+    if raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16-be"), "utf-16-be (BOM)"
+
+    try:
+        utf8 = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        utf8 = None
+
+    if utf8 is not None:
+        head = utf8[:400_000]
+        if "href=" in head or "href =" in head.lower():
+            return utf8, "utf-8"
+
+    # UTF-16 LE without BOM: lots of NUL bytes in first KB of "ASCII" HTML
+    sample = raw[: min(10_000, len(raw))]
+    if sample.count(b"\x00") > 20 and len(raw) > 200:
+        try:
+            s16 = raw.decode("utf-16-le")
+            if "href=" in s16 or "<a " in s16.lower():
+                return s16, "utf-16-le (no BOM)"
+        except (UnicodeDecodeError, UnicodeError):
+            pass
+
+    if utf8 is not None:
+        return utf8, "utf-8 (may be mojibake if no href= found)"
+
+    try:
+        s16 = raw.decode("utf-16-le")
+        return s16, "utf-16-le (fallback)"
+    except (UnicodeDecodeError, UnicodeError):
+        pass
+
+    return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
 def infer_company_from_subject(subject: str | None) -> str | None:
@@ -507,30 +557,112 @@ def process_file(
     extracted_hrefs: list[str] = []
 
     try:
+        _trace(
+            "PIPELINE",
+            "=" * 55,
+        )
+        _trace(
+            "PIPELINE",
+            f"START process_file() — file={file_path.name}, "
+            f"subject={subject!r}, sender={sender_name!r}, email={email!r}",
+        )
         print(f"Processing: {file_path}")
 
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            raw_html = f.read()
+        # ── READ FILE FROM DISK (UTF-8 or UTF-16 from Outlook / Power Automate) ──
+        raw_html, html_encoding = read_email_html_file(file_path)
+        _trace(
+            "PIPELINE STEP 0  [read file]",
+            f"Decoded HTML as {html_encoding!r}",
+        )
 
-        # 1. Convert HTML to plain text for the LLM
+        href_count_raw = raw_html.lower().count('href=')
+        anchor_count = raw_html.lower().count('<a ')
+        _trace(
+            "PIPELINE STEP 0  [read file]",
+            f"Read {file_path.name} — {len(raw_html):,} chars, "
+            f"{len(raw_html.splitlines())} lines, "
+            f"raw 'href=' count={href_count_raw}, '<a ' count={anchor_count}",
+            raw_html[:300],
+        )
+        if len(raw_html) < 500:
+            _trace(
+                "PIPELINE STEP 0  [read file]",
+                "WARNING: HTML is suspiciously short! Full content below:",
+                raw_html,
+            )
+
+        # ── STEP 1: HTML -> plain text (convertHTMLToPlaintext) ──
+        _trace(
+            "PIPELINE STEP 1  [html_to_plaintext]",
+            f"Sending {len(raw_html):,} chars of raw HTML to convertHTMLToPlaintext.convert()",
+        )
         text_only = html_to_plaintext(raw_html)
+        _trace(
+            "PIPELINE STEP 1  [html_to_plaintext]",
+            f"Got back {len(text_only):,} chars of plain text ({len(text_only.splitlines())} lines)",
+            text_only[:300],
+        )
 
-        # 2. Extract every href value from the raw HTML (local logic)
+        # ── STEP 2: Extract hrefs (ValuesExtractionByAttribute) ──
+        _trace(
+            "PIPELINE STEP 2  [extract_attribute_values]",
+            f"Sending {len(raw_html):,} chars of raw HTML to extract_attribute_values(html, 'href')",
+        )
         extracted_hrefs = extract_attribute_values(raw_html, "href")
+        _trace(
+            "PIPELINE STEP 2  [extract_attribute_values]",
+            f"Got back {len(extracted_hrefs)} unique hrefs",
+        )
+        # Individual href logging disabled — tracking-link bug is resolved
+        if extracted_hrefs:
+            pass
+            # for i, h in enumerate(extracted_hrefs[:5]):
+            #     _trace("PIPELINE STEP 2  [extract_attribute_values]", f"  href[{i}]: {h}")
+            # if len(extracted_hrefs) > 5:
+            #     _trace(
+            #         "PIPELINE STEP 2  [extract_attribute_values]",
+            #         f"  ... and {len(extracted_hrefs) - 5} more",
+            #     )
+        else:
+            _trace(
+                "PIPELINE STEP 2  [extract_attribute_values]",
+                "WARNING: extracted_hrefs is EMPTY — this is the bug. "
+                "The regex found 0 matches even though raw 'href=' count "
+                f"was {href_count_raw}. Check the raw HTML sample above.",
+            )
 
-        # 3. Determine tracking link locally (no LLM needed)
+        # ── STEP 3: Determine tracking link (isHrefTrackingLink) ──
+        _trace(
+            "PIPELINE STEP 3  [determine_tracking_link]",
+            f"Sending {len(extracted_hrefs)} hrefs to determine_tracking_link()",
+        )
         tracking_link = determine_tracking_link(extracted_hrefs)
+        _trace(
+            "PIPELINE STEP 3  [determine_tracking_link]",
+            f"Got back tracking_link={tracking_link!r}",
+        )
 
-        # 4. Send only plain text to OpenAI for purchase details
+        # ── STEP 4: OpenAI extraction ────────────────────────────
         extracted = None
 
         if API_KEY:
+            _trace(
+                "PIPELINE STEP 4  [OpenAI]",
+                f"Sending {len(text_only):,} chars of plain text to extract_with_openai()",
+            )
             print("  Running OpenAI extraction...")
             try:
                 extracted = extract_with_openai(text_only, subject=subject)
+                _trace(
+                    "PIPELINE STEP 4  [OpenAI]",
+                    f"OpenAI returned: {json.dumps(extracted, default=str)[:400]}",
+                )
             except Exception as e:
+                _trace("PIPELINE STEP 4  [OpenAI]", f"FAILED: {e}")
                 print(f"  WARNING: OpenAI extraction failed: {e}")
                 extracted = None
+        else:
+            _trace("PIPELINE STEP 4  [OpenAI]", "SKIPPED — no API key")
 
         if extracted is None:
             if not API_KEY:
@@ -574,9 +706,22 @@ def process_file(
             "email_category_confidence": raw_confidence,
         }
 
+        # ── FINAL: what's going into the JSON ────────────────────
+        _trace(
+            "PIPELINE FINAL",
+            f"Record for JSON — extracted_links has {len(record['extracted_links'])} entries, "
+            f"tracking_link={record['tracking_link']!r}, "
+            f"company={record['company']!r}, "
+            f"order_number={record['order_number']!r}, "
+            f"category={record['email_category']!r}",
+        )
+        _trace("PIPELINE", f"END process_file() — {file_path.name}")
+        _trace("PIPELINE", "=" * 55)
+
         return record
 
     except Exception as e:
+        _trace("PIPELINE", f"EXCEPTION in process_file(): {e}")
         return {
             "source_file": clean_text(file_path),
             "source_file_link": None,
@@ -684,6 +829,13 @@ def _known_hashes(results: list[dict]) -> set[str]:
 def main(flow_started_at: datetime | None = None):
     args = parse_args()
 
+    _trace(
+        "MAIN",
+        f"main() called — base_dir={args.base_dir!r}, file={args.file!r}, "
+        f"subject={args.subject!r}, sender_name={args.sender_name!r}, "
+        f"email={args.email!r}",
+    )
+
     if os.getenv("DEMO_MODE") == "1":
         args.email = "johndoe123@gmail.com"
         args.sender_name = "John Doe"
@@ -736,16 +888,24 @@ def main(flow_started_at: datetime | None = None):
             return
 
         file_path = rename_single_file(file_path, html_folder)
+        _trace("MAIN", f"Renamed to {file_path.name}, file size = {file_path.stat().st_size:,} bytes")
 
         entry = process_file(file_path, args.subject, args.sender_name, args.email)
         entry["content_hash"] = file_hash
         entry["duplicate_on_last_run"] = 0
+
+        _trace(
+            "MAIN",
+            f"Writing JSON — extracted_links={len(entry.get('extracted_links', []))} entries, "
+            f"tracking_link={entry.get('tracking_link')!r}",
+        )
 
         results.append(entry)
 
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
+        _trace("MAIN", f"JSON written to {output_path} — {len(results)} total records")
         print(f"Appended result to: {output_path}")
         return
 

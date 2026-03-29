@@ -5,6 +5,10 @@ No LLM or external API needed — keyword and domain matching only.
 
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+from htmlHandler.admin_log import trace
+
+_SRC = "isHrefTrackingLink"
+
 TRACKING_DOMAINS = [
     "narvar.com",
     "aftership.com",
@@ -94,11 +98,18 @@ def determine_tracking_link(hrefs: list[str]) -> str | None:
     - ``"multiple tracking links found"`` — more than one unique tracking link
     - ``None`` — no tracking links found
     """
+    # Link-value logging disabled — tracking-link bug is resolved
+    # preview = ", ".join(hrefs[:2]) if hrefs else "(empty list)"
+    # trace(_SRC, f"determine_tracking_link() called — {len(hrefs)} hrefs, first 2: [{preview}]")
+
     seen_normalized: set[str] = set()
     unique_tracking: list[str] = []
 
     for href in hrefs:
-        if not _is_tracking_link(href):
+        is_match = _is_tracking_link(href)
+        # if is_match:
+        #     trace(_SRC, f"  TRACKING match: {href}")
+        if not is_match:
             continue
         normalized = _normalize_url(href)
         if normalized not in seen_normalized:
@@ -106,7 +117,11 @@ def determine_tracking_link(hrefs: list[str]) -> str | None:
             unique_tracking.append(href)
 
     if len(unique_tracking) == 0:
-        return None
-    if len(unique_tracking) == 1:
-        return unique_tracking[0]
-    return "multiple tracking links found"
+        result = None
+    elif len(unique_tracking) == 1:
+        result = unique_tracking[0]
+    else:
+        result = "multiple tracking links found"
+
+    # trace(_SRC, f"determine_tracking_link() result — {result!r}")
+    return result
