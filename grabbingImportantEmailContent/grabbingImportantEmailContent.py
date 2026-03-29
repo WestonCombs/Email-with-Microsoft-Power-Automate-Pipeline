@@ -5,14 +5,23 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI, RateLimitError
 
+# Ensure python_files/ is on sys.path so htmlHandler imports work
+_PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PYTHON_FILES_DIR))
+
+from htmlHandler.admin_log import trace as _trace
+from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
+from htmlHandler.htmlValuesExtractionByAttribute.ValuesExtractionByAttribute import extract_attribute_values
+from htmlHandler.isHrefTrackingLink import determine_tracking_link
+
 # Load .env from python_files/ (one level up from this script's subfolder)
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(_PYTHON_FILES_DIR / ".env")
 
 # =========================
 # CONFIG
@@ -46,6 +55,79 @@ EXIT_BAD_ARGS = 2
 
 client = OpenAI(api_key=API_KEY)
 
+OPENAI_USAGE_REL = Path("email_contents") / "openai usage"
+
+# Set once per process run when main() initializes the flow usage log (CLI entry).
+_flow_usage_log_path: Path | None = None
+
+
+def _next_flow_usage_index(usage_dir: Path) -> int:
+    """Next filename is <n>.txt where n is one greater than the highest existing N.txt."""
+    if not usage_dir.exists():
+        return 1
+    max_n = 0
+    pattern = re.compile(r"^(\d+)\.txt$", re.IGNORECASE)
+    for p in usage_dir.iterdir():
+        if p.is_file():
+            m = pattern.match(p.name)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+    return max_n + 1
+
+
+def init_flow_usage_log(base_dir: Path, flow_started_at: datetime) -> None:
+    """Create a new numbered file for this flow; first line is when the flow started."""
+    global _flow_usage_log_path
+    usage_dir = base_dir / OPENAI_USAGE_REL
+    usage_dir.mkdir(parents=True, exist_ok=True)
+    n = _next_flow_usage_index(usage_dir)
+    path = usage_dir / f"{n}.txt"
+    header = f"Flow started: {flow_started_at.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    path.write_text(header, encoding="utf-8")
+    _flow_usage_log_path = path
+
+
+def _read_last_cumulative_tokens(log_path: Path) -> int:
+    if not log_path.exists():
+        return 0
+    last = 0
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        m = re.search(r"cumulative_total=(\d+)", line)
+        if m:
+            last = int(m.group(1))
+    return last
+
+
+def append_openai_usage_log(
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+) -> int:
+    """Append one line for this flow's file; cumulative is for this flow only. Returns cumulative."""
+    global _flow_usage_log_path
+    if _flow_usage_log_path is None:
+        return 0
+    log_path = _flow_usage_log_path
+
+    prev = _read_last_cumulative_tokens(log_path)
+    cumulative = prev + total_tokens
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    line = (
+        f"{ts} | "
+        f"prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+        f"total_tokens={total_tokens} | cumulative_total={cumulative}\n"
+    )
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    return cumulative
+
 
 # =========================
 # UTILS
@@ -54,6 +136,55 @@ def clean_text(text) -> str | None:
     if text is None:
         return None
     return str(text).replace("\ufeff", "").strip() or None
+
+
+def read_email_html_file(file_path: Path) -> tuple[str, str]:
+    """Read HTML saved by Outlook / Power Automate.
+
+    Those tools often write **UTF-16 LE** (with or without BOM). Opening as UTF-8
+    produces mojibake: no ``href=`` substring, so link extraction returns [].
+    """
+    raw = file_path.read_bytes()
+    if not raw:
+        return "", "empty"
+
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig"), "utf-8-sig"
+    if raw.startswith(b"\xff\xfe"):
+        return raw.decode("utf-16-le"), "utf-16-le (BOM)"
+    if raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16-be"), "utf-16-be (BOM)"
+
+    try:
+        utf8 = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        utf8 = None
+
+    if utf8 is not None:
+        head = utf8[:400_000]
+        if "href=" in head or "href =" in head.lower():
+            return utf8, "utf-8"
+
+    # UTF-16 LE without BOM: lots of NUL bytes in first KB of "ASCII" HTML
+    sample = raw[: min(10_000, len(raw))]
+    if sample.count(b"\x00") > 20 and len(raw) > 200:
+        try:
+            s16 = raw.decode("utf-16-le")
+            if "href=" in s16 or "<a " in s16.lower():
+                return s16, "utf-16-le (no BOM)"
+        except (UnicodeDecodeError, UnicodeError):
+            pass
+
+    if utf8 is not None:
+        return utf8, "utf-8 (may be mojibake if no href= found)"
+
+    try:
+        s16 = raw.decode("utf-16-le")
+        return s16, "utf-16-le (fallback)"
+    except (UnicodeDecodeError, UnicodeError):
+        pass
+
+    return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
 def infer_company_from_subject(subject: str | None) -> str | None:
@@ -90,155 +221,6 @@ def strip_bom_from_argv(argv: list[str]) -> None:
     for i in range(len(argv)):
         if isinstance(argv[i], str):
             argv[i] = argv[i].replace("\ufeff", "")
-
-
-# =========================
-# HTML PARSING
-# =========================
-_TRACK_KEYWORD_RE = re.compile(r"track|shipment|delivery|carrier", re.IGNORECASE)
-_ALNUM_RE = re.compile(r"^[A-Z0-9]+$", re.IGNORECASE)
-_HAS_DIGIT_RE = re.compile(r"\d")
-
-
-def _remove_hidden_elements(soup: BeautifulSoup) -> None:
-    """Remove elements that are visually hidden in the rendered email."""
-    for el in soup.find_all(style=True):
-        style = el.get("style") or ""
-        if re.search(r"display\s*:\s*none", style, re.IGNORECASE) or \
-           re.search(r"visibility\s*:\s*hidden", style, re.IGNORECASE):
-            el.decompose()
-
-
-def _convert_tables_to_markdown(soup: BeautifulSoup) -> None:
-    """Convert multi-row, multi-column data tables to markdown so the LLM
-    sees row/column relationships (e.g. item-price pairings) that are lost
-    when BeautifulSoup flattens everything to plain text."""
-    for table in reversed(soup.find_all("table")):
-        rows: list[list[str]] = []
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(["td", "th"])
-            if cells:
-                rows.append([
-                    re.sub(r"\s+", " ", c.get_text(separator=" ")).strip().replace("|", "\\|")
-                    for c in cells
-                ])
-
-        if len(rows) < 2 or all(len(r) < 2 for r in rows):
-            continue
-
-        max_cols = max(len(r) for r in rows)
-        for r in rows:
-            r.extend([""] * (max_cols - len(r)))
-
-        lines: list[str] = []
-        for i, row in enumerate(rows):
-            lines.append("| " + " | ".join(row) + " |")
-            if i == 0:
-                lines.append("| " + " | ".join(["---"] * max_cols) + " |")
-
-        table.replace_with("\n" + "\n".join(lines) + "\n")
-
-
-def parse_email_html(file_path: Path) -> tuple[str, list[dict]]:
-    """Single-pass HTML parse returning (cleaned_text, all_links)."""
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        html = f.read()
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Extract links before modifying the DOM
-    seen: set[tuple[str, str]] = set()
-    links: list[dict] = []
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"].strip()
-        if not href:
-            continue
-        anchor_text = a_tag.get_text(separator=" ").strip()
-        key = (anchor_text, href)
-        if key not in seen:
-            seen.add(key)
-            links.append({"anchor_text": anchor_text, "href": href})
-
-    _remove_hidden_elements(soup)
-    _convert_tables_to_markdown(soup)
-
-    for tag in soup(["script", "style", "noscript", "svg", "meta", "head"]):
-        tag.decompose()
-
-    text = soup.get_text(separator="\n")
-    lines = [line.strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    cleaned = "\n".join(lines)
-
-    return cleaned, links
-
-
-def _score_tracking_candidate(seg: str, near_track_keyword: bool) -> float:
-    """Score how likely a URL/anchor segment is a tracking number (0.0–1.0).
-    Pure-letter strings never reach here — they're filtered out upstream."""
-    score = 0.5
-    digit_ratio = sum(c.isdigit() for c in seg) / len(seg)
-    score += digit_ratio * 0.2
-    if 10 <= len(seg) <= 22:
-        score += 0.15
-    elif len(seg) > 30:
-        score -= 0.2
-    if near_track_keyword:
-        score += 0.15
-    return round(min(max(score, 0.0), 1.0), 2)
-
-
-def extract_tracking_candidates(links: list[dict]) -> list[dict]:
-    """Scan link URLs and anchor text for alphanumeric segments that contain
-    digits (tracking numbers never contain real English words). Returns
-    deduplicated candidates sorted by confidence, highest first."""
-    seen: set[str] = set()
-    candidates: list[dict] = []
-
-    for link in links:
-        href = link.get("href", "")
-        anchor = link.get("anchor_text", "")
-        has_kw = bool(_TRACK_KEYWORD_RE.search(href + " " + anchor))
-
-        for seg in re.split(r"[/?&=\-_#]+", href):
-            seg = seg.strip()
-            if len(seg) < 7 or not _ALNUM_RE.match(seg) or not _HAS_DIGIT_RE.search(seg):
-                continue
-            key = seg.upper()
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append({
-                "value": seg,
-                "confidence": _score_tracking_candidate(seg, has_kw),
-                "source_url": href,
-                "context": anchor or None,
-            })
-
-        anchor_clean = anchor.strip()
-        if len(anchor_clean) >= 7 and _ALNUM_RE.match(anchor_clean) \
-           and _HAS_DIGIT_RE.search(anchor_clean):
-            key = anchor_clean.upper()
-            if key not in seen:
-                seen.add(key)
-                candidates.append({
-                    "value": anchor_clean,
-                    "confidence": _score_tracking_candidate(anchor_clean, has_kw),
-                    "source_url": href,
-                    "context": "anchor text",
-                })
-
-    candidates.sort(key=lambda c: c["confidence"], reverse=True)
-    return candidates
-
-
-# =========================
-# OPTIONAL: trim very long text
-# =========================
-def trim_text(text: str, max_chars: int = 50000) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars]
 
 
 # =========================
@@ -341,54 +323,42 @@ def _check_and_throttle(headers) -> float:
 # =========================
 def extract_with_openai(
     text_only: str,
-    candidates: list[dict],
     subject: str | None = None,
 ) -> dict:
-    """Extract purchase details using OpenAI."""
-    candidates_json_str = json.dumps(candidates, indent=2) if candidates else "[]"
+    """Extract purchase details using OpenAI (plain text only, no HTML)."""
     subject_section = f"\nEMAIL SUBJECT: {subject}" if subject else ""
 
     prompt = f"""You are extracting structured purchase information from text that came from an HTML email.
 
 Important rules:
-1. Use ONLY the provided text, tracking candidates, and subject line as the source of truth.
+1. Use ONLY the provided text and subject line as the source of truth.
 2. Find the PURCHASE date/time, NOT the email received date or shipment/delivery date.
-3. If a value is missing or unclear, return null for scalars and empty arrays for lists.
-4. Distinguish ORDER NUMBER from TRACKING NUMBER — they are different things.
-   An order number is the retailer's confirmation/order ID (e.g. "112-3456789-1234567").
-   A tracking number is assigned by a shipping carrier for package delivery.
+3. If a value is missing or unclear, return null.
+4. order_number is the retailer's confirmation/order ID (e.g. "112-3456789-1234567").
 5. total_amount_paid should be the exact total paid as a number if possible.
 6. tax_paid should be the tax dollar amount if present, or null if unknown.
 7. purchase_datetime should be "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD".
 8. company should be the retailer/store/merchant, not the recipient's name.
 9. order_number: check the subject line first, then the body. Strip any leading "#".
-10. Do NOT guess. If something is not clearly present, use null or an empty array.
-11. email_category: Classify this email into exactly ONE of these categories:
+10. Do NOT guess. If something is not clearly present, use null.
+11. tracking_number: The shipping carrier's tracking number (e.g. "1Z999AA10123456784",
+    "9400111899223456789012"). This is NOT the order number — it is the alphanumeric ID
+    assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
+    If not clearly present, return null.
+12. email_category: Classify this email into exactly ONE of these categories:
     - "Order Placed": Initial purchase email, typically no tracking info yet.
     - "Order Received": Merchant acknowledges receipt of the order.
     - "Order Confirmed": Explicit confirmation the order is being processed.
     - "Order Delayed": Notification that the order or shipment is delayed.
-    - "Order Shipped": Shipment notification, usually includes tracking number(s).
+    - "Order Shipped": Shipment notification, usually includes tracking info.
     - "Delivery Confirmation": Package was delivered successfully.
     - "Purchased Gift Card": A gift card purchase confirmation or delivery (digital or physical).
     - "Unknown": Does not clearly fit any of the above.
-    Contextual hints: "Order Placed" emails rarely have tracking numbers. "Order Shipped"
-    emails almost always have tracking info. "Delivery Confirmation" emails mention delivery
+    Contextual hints: "Order Placed" emails rarely mention tracking. "Order Shipped"
+    emails almost always mention tracking. "Delivery Confirmation" emails mention delivery
     completion. Gift card emails mention gift card value, redemption codes, or gift card delivery.
     Use these signals to guide your choice.
-12. email_category_confidence: Your confidence (0–100) in the chosen category.
-
-TRACKING CANDIDATES:
-Below are alphanumeric sequences pre-extracted from email link URLs and anchor
-text. Each has a confidence score (0.0–1.0). They were selected because they
-contain digits and are not English words — but some may be product IDs or
-session tokens rather than real tracking numbers.
-- Review each candidate against the email text to confirm or reject it.
-- For tracking_numbers: include only confirmed tracking number strings.
-- For tracking_links: include the source_url of any confirmed tracking candidate.
-- If no candidates are listed, check the email text for tracking numbers instead.
-
-{candidates_json_str}
+13. email_category_confidence: Your confidence (0–100) in the chosen category.
 {subject_section}
 
 EMAIL TEXT:
@@ -433,15 +403,13 @@ EMAIL TEXT:
                             "type": ["number", "null"],
                             "description": "Tax amount in dollars, or null if unknown.",
                         },
-                        "tracking_numbers": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of shipment tracking numbers.",
-                        },
-                        "tracking_links": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of tracking URLs.",
+                        "tracking_number": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Shipping carrier tracking number "
+                                "(e.g. UPS, FedEx, USPS, DHL). Not the order number. "
+                                "Null if not clearly present."
+                            ),
                         },
                         "email_category": {
                             "type": "string",
@@ -468,8 +436,7 @@ EMAIL TEXT:
                         "purchase_datetime",
                         "total_amount_paid",
                         "tax_paid",
-                        "tracking_numbers",
-                        "tracking_links",
+                        "tracking_number",
                         "email_category",
                         "email_category_confidence",
                     ],
@@ -500,14 +467,27 @@ EMAIL TEXT:
     if total_waited > 0:
         print(f"  Total rate-limit wait: {total_waited:.1f}s")
 
+    usage = getattr(response, "usage", None)
+    if usage is not None and _flow_usage_log_path is not None:
+        pt = getattr(usage, "prompt_tokens", None) or 0
+        ct = getattr(usage, "completion_tokens", None) or 0
+        tt = getattr(usage, "total_tokens", None)
+        if tt is None:
+            tt = int(pt) + int(ct)
+        try:
+            cumulative = append_openai_usage_log(
+                prompt_tokens=int(pt),
+                completion_tokens=int(ct),
+                total_tokens=int(tt),
+            )
+            print(
+                f"  OpenAI tokens this request: {tt} (cumulative this flow: {cumulative})"
+            )
+        except OSError as e:
+            print(f"  WARNING: Could not write OpenAI usage log: {e}")
+
     content = response.choices[0].message.content
     data = json.loads(content)
-
-    if not isinstance(data.get("tracking_numbers"), list):
-        data["tracking_numbers"] = []
-    if not isinstance(data.get("tracking_links"), list):
-        data["tracking_links"] = []
-
     return data
 
 
@@ -569,30 +549,120 @@ def process_file(
         "purchase_datetime": None,
         "total_amount_paid": None,
         "tax_paid": None,
-        "tracking_numbers": [],
-        "tracking_links": [],
+        "tracking_number": None,
         "email_category": "Unknown",
         "email_category_confidence": 0,
     }
 
+    extracted_hrefs: list[str] = []
+
     try:
+        _trace(
+            "PIPELINE",
+            "=" * 55,
+        )
+        _trace(
+            "PIPELINE",
+            f"START process_file() — file={file_path.name}, "
+            f"subject={subject!r}, sender={sender_name!r}, email={email!r}",
+        )
         print(f"Processing: {file_path}")
 
-        text_only, all_links = parse_email_html(file_path)
-        text_only = trim_text(text_only, max_chars=50000)
-        candidates = extract_tracking_candidates(all_links)
+        # ── READ FILE FROM DISK (UTF-8 or UTF-16 from Outlook / Power Automate) ──
+        raw_html, html_encoding = read_email_html_file(file_path)
+        _trace(
+            "PIPELINE STEP 0  [read file]",
+            f"Decoded HTML as {html_encoding!r}",
+        )
 
+        href_count_raw = raw_html.lower().count('href=')
+        anchor_count = raw_html.lower().count('<a ')
+        _trace(
+            "PIPELINE STEP 0  [read file]",
+            f"Read {file_path.name} — {len(raw_html):,} chars, "
+            f"{len(raw_html.splitlines())} lines, "
+            f"raw 'href=' count={href_count_raw}, '<a ' count={anchor_count}",
+            raw_html[:300],
+        )
+        if len(raw_html) < 500:
+            _trace(
+                "PIPELINE STEP 0  [read file]",
+                "WARNING: HTML is suspiciously short! Full content below:",
+                raw_html,
+            )
+
+        # ── STEP 1: HTML -> plain text (convertHTMLToPlaintext) ──
+        _trace(
+            "PIPELINE STEP 1  [html_to_plaintext]",
+            f"Sending {len(raw_html):,} chars of raw HTML to convertHTMLToPlaintext.convert()",
+        )
+        text_only = html_to_plaintext(raw_html)
+        _trace(
+            "PIPELINE STEP 1  [html_to_plaintext]",
+            f"Got back {len(text_only):,} chars of plain text ({len(text_only.splitlines())} lines)",
+            text_only[:300],
+        )
+
+        # ── STEP 2: Extract hrefs (ValuesExtractionByAttribute) ──
+        _trace(
+            "PIPELINE STEP 2  [extract_attribute_values]",
+            f"Sending {len(raw_html):,} chars of raw HTML to extract_attribute_values(html, 'href')",
+        )
+        extracted_hrefs = extract_attribute_values(raw_html, "href")
+        _trace(
+            "PIPELINE STEP 2  [extract_attribute_values]",
+            f"Got back {len(extracted_hrefs)} unique hrefs",
+        )
+        # Individual href logging disabled — tracking-link bug is resolved
+        if extracted_hrefs:
+            pass
+            # for i, h in enumerate(extracted_hrefs[:5]):
+            #     _trace("PIPELINE STEP 2  [extract_attribute_values]", f"  href[{i}]: {h}")
+            # if len(extracted_hrefs) > 5:
+            #     _trace(
+            #         "PIPELINE STEP 2  [extract_attribute_values]",
+            #         f"  ... and {len(extracted_hrefs) - 5} more",
+            #     )
+        else:
+            _trace(
+                "PIPELINE STEP 2  [extract_attribute_values]",
+                "WARNING: extracted_hrefs is EMPTY — this is the bug. "
+                "The regex found 0 matches even though raw 'href=' count "
+                f"was {href_count_raw}. Check the raw HTML sample above.",
+            )
+
+        # ── STEP 3: Determine tracking link (isHrefTrackingLink) ──
+        _trace(
+            "PIPELINE STEP 3  [determine_tracking_link]",
+            f"Sending {len(extracted_hrefs)} hrefs to determine_tracking_link()",
+        )
+        tracking_link = determine_tracking_link(extracted_hrefs)
+        _trace(
+            "PIPELINE STEP 3  [determine_tracking_link]",
+            f"Got back tracking_link={tracking_link!r}",
+        )
+
+        # ── STEP 4: OpenAI extraction ────────────────────────────
         extracted = None
 
         if API_KEY:
+            _trace(
+                "PIPELINE STEP 4  [OpenAI]",
+                f"Sending {len(text_only):,} chars of plain text to extract_with_openai()",
+            )
             print("  Running OpenAI extraction...")
             try:
-                extracted = extract_with_openai(
-                    text_only, candidates, subject=subject
+                extracted = extract_with_openai(text_only, subject=subject)
+                _trace(
+                    "PIPELINE STEP 4  [OpenAI]",
+                    f"OpenAI returned: {json.dumps(extracted, default=str)[:400]}",
                 )
             except Exception as e:
+                _trace("PIPELINE STEP 4  [OpenAI]", f"FAILED: {e}")
                 print(f"  WARNING: OpenAI extraction failed: {e}")
                 extracted = None
+        else:
+            _trace("PIPELINE STEP 4  [OpenAI]", "SKIPPED — no API key")
 
         if extracted is None:
             if not API_KEY:
@@ -629,20 +699,29 @@ def process_file(
             "purchase_datetime": clean_text(extracted.get("purchase_datetime")),
             "total_amount_paid": extracted.get("total_amount_paid"),
             "tax_paid": extracted.get("tax_paid"),
-            "tracking_numbers": extracted.get("tracking_numbers", []),
-            "tracking_links": extracted.get("tracking_links", []),
+            "tracking_number": clean_text(extracted.get("tracking_number")),
+            "tracking_link": tracking_link,
+            "extracted_links": extracted_hrefs,
             "email_category": raw_category,
             "email_category_confidence": raw_confidence,
         }
 
-        if not isinstance(record["tracking_numbers"], list):
-            record["tracking_numbers"] = []
-        if not isinstance(record["tracking_links"], list):
-            record["tracking_links"] = []
+        # ── FINAL: what's going into the JSON ────────────────────
+        _trace(
+            "PIPELINE FINAL",
+            f"Record for JSON — extracted_links has {len(record['extracted_links'])} entries, "
+            f"tracking_link={record['tracking_link']!r}, "
+            f"company={record['company']!r}, "
+            f"order_number={record['order_number']!r}, "
+            f"category={record['email_category']!r}",
+        )
+        _trace("PIPELINE", f"END process_file() — {file_path.name}")
+        _trace("PIPELINE", "=" * 55)
 
         return record
 
     except Exception as e:
+        _trace("PIPELINE", f"EXCEPTION in process_file(): {e}")
         return {
             "source_file": clean_text(file_path),
             "source_file_link": None,
@@ -655,8 +734,9 @@ def process_file(
             "purchase_datetime": None,
             "total_amount_paid": None,
             "tax_paid": None,
-            "tracking_numbers": [],
-            "tracking_links": [],
+            "tracking_number": None,
+            "tracking_link": None,
+            "extracted_links": extracted_hrefs,
             "email_category": "Unknown",
             "email_category_confidence": 0,
         }
@@ -746,8 +826,15 @@ def _known_hashes(results: list[dict]) -> set[str]:
 # =========================
 # MAIN
 # =========================
-def main():
+def main(flow_started_at: datetime | None = None):
     args = parse_args()
+
+    _trace(
+        "MAIN",
+        f"main() called — base_dir={args.base_dir!r}, file={args.file!r}, "
+        f"subject={args.subject!r}, sender_name={args.sender_name!r}, "
+        f"email={args.email!r}",
+    )
 
     if os.getenv("DEMO_MODE") == "1":
         args.email = "johndoe123@gmail.com"
@@ -762,6 +849,12 @@ def main():
     output_path = base / "email_contents" / "json" / "results.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    started = flow_started_at or datetime.now()
+    try:
+        init_flow_usage_log(base, started)
+    except OSError as e:
+        print(f"WARNING: Could not create OpenAI usage log file: {e}")
 
     if not API_KEY:
         print(
@@ -795,16 +888,24 @@ def main():
             return
 
         file_path = rename_single_file(file_path, html_folder)
+        _trace("MAIN", f"Renamed to {file_path.name}, file size = {file_path.stat().st_size:,} bytes")
 
         entry = process_file(file_path, args.subject, args.sender_name, args.email)
         entry["content_hash"] = file_hash
         entry["duplicate_on_last_run"] = 0
+
+        _trace(
+            "MAIN",
+            f"Writing JSON — extracted_links={len(entry.get('extracted_links', []))} entries, "
+            f"tracking_link={entry.get('tracking_link')!r}",
+        )
 
         results.append(entry)
 
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
+        _trace("MAIN", f"JSON written to {output_path} — {len(results)} total records")
         print(f"Appended result to: {output_path}")
         return
 
@@ -861,8 +962,6 @@ class _Tee:
 
 
 if __name__ == "__main__":
-    from datetime import datetime
-
     strip_bom_from_argv(sys.argv)
 
     _log_path = Path(os.getenv("BASE_DIR")) / "programFileOutput.txt"
@@ -871,9 +970,10 @@ if __name__ == "__main__":
     sys.stderr = _Tee(_log_path, sys.stderr)
 
     _start_time = time.time()
+    _flow_started_at = datetime.now()
 
     print(f"\n{'='*60}")
-    print(f"Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Run started: {_flow_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Args: {sys.argv[1:]}")
     print(f"{'='*60}")
 
@@ -881,7 +981,7 @@ if __name__ == "__main__":
     _original_stderr = sys.stderr._original
 
     try:
-        main()
+        main(flow_started_at=_flow_started_at)
         _elapsed = time.time() - _start_time
         print(f"Run finished successfully. Total operation time: {_elapsed:.2f}s")
     except SystemExit as e:

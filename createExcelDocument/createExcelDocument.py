@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -20,36 +20,41 @@ JSON_PATH  = str(Path(BASE_DIR) / "email_contents" / "json" / "results.json")
 EXCEL_PATH = str(Path(BASE_DIR) / "email_contents" / "orders.xlsx")
 LOG_PATH   = Path(BASE_DIR) / "programFileOutput.txt"
 
-# Fixed columns that always appear (in order).
-FIXED_COLUMNS = [
+# Column layout is split into three logical sections.
+# "source_file_link" appears at the end of each section as a "View Email" hyperlink.
+# A hairline vertical border is drawn after each section boundary.
+COLUMN_ORDER = [
+    # ── Section 1: order identity ──
     "email_category",
-    "purchase_datetime",
     "order_number",
-    "sender_name",
+    "purchase_datetime",
     "company",
     "email",
+    "source_file_link",      # View Email (1) — section boundary
+    # ── Section 2: financials ──
     "total_amount_paid",
     "tax_paid",
+    "source_file_link",      # View Email (2) — section boundary
+    # ── Section 3: shipping / misc ──
     "tracking_number",
+    "tracking_link",
     "duplicate_on_last_run",
+    "source_file_link",      # View Email (3)
 ]
 
-FIXED_HEADERS = {
-    "email_category":         "Email Category",
-    "purchase_datetime":      "Purchase Date",
-    "order_number":           "Order Number",
-    "sender_name":            "Sender Name",
-    "company":                "Company",
-    "email":                  "Email",
-    "total_amount_paid":      "Total Paid",
-    "tax_paid":               "Tax Paid",
-    "tracking_number":        "Tracking Number",
-    "duplicate_on_last_run":  "Duplicate On Last Run",
+COLUMN_HEADERS = {
+    "email_category":        "Email Category",
+    "order_number":          "Order Number",
+    "purchase_datetime":     "Purchase Date",
+    "company":               "Company",
+    "email":                 "Email",
+    "total_amount_paid":     "Total Paid",
+    "tax_paid":              "Tax Paid",
+    "tracking_number":       "Tracking Number",
+    "tracking_link":         "Tracking Link",
+    "duplicate_on_last_run": "Duplicate On Last Run",
+    "source_file_link":      "View Email",
 }
-
-# The final column is always source_file_link.
-LINK_COLUMN = "source_file_link"
-LINK_HEADER = "View Email"
 
 HYPERLINK_FONT = Font(name="Calibri", color="0563C1", underline="single")
 HEADER_FILL    = PatternFill("solid", fgColor="2F5597")
@@ -57,6 +62,16 @@ HEADER_FONT    = Font(bold=True, color="FFFFFF", name="Calibri")
 CELL_FONT      = Font(name="Calibri")
 CENTER_ALIGN   = Alignment(horizontal="center", vertical="center")
 LEFT_ALIGN     = Alignment(horizontal="left",   vertical="center")
+
+CATEGORY_FILLS = {
+    "Order Placed":          PatternFill("solid", fgColor="FCE4EC"),  # light rose
+    "Order Confirmed":       PatternFill("solid", fgColor="FFF3E0"),  # light peach
+    "Order Shipped":         PatternFill("solid", fgColor="E8F5E9"),  # light mint
+    "Delivery Confirmation": PatternFill("solid", fgColor="E3F2FD"),  # light sky
+}
+
+HAIR_SIDE  = Side(style="hair", color="000000")
+THICK_SIDE = Side(style="medium", color="000000")
 
 
 def load_json(path: str) -> list[dict]:
@@ -109,26 +124,9 @@ def get_company_value(record: dict):
     return infer_company_from_subject(record.get("subject"))
 
 
-def get_tracking_number_value(record: dict):
-    tracking_numbers = record.get("tracking_numbers", [])
-    if not isinstance(tracking_numbers, list):
-        return None
-
-    cleaned_numbers = [
-        str(value).strip()
-        for value in tracking_numbers
-        if value is not None and str(value).strip()
-    ]
-    return ", ".join(cleaned_numbers) if cleaned_numbers else None
-
-
 def _build_column_order() -> tuple[list[str], list[str]]:
-    keys: list[str] = list(FIXED_COLUMNS)
-    labels: list[str] = [FIXED_HEADERS[c] for c in FIXED_COLUMNS]
-
-    keys.append(LINK_COLUMN)
-    labels.append(LINK_HEADER)
-
+    keys = list(COLUMN_ORDER)
+    labels = [COLUMN_HEADERS[k] for k in keys]
     return keys, labels
 
 
@@ -138,8 +136,6 @@ def _record_to_row(record: dict, column_keys: list[str]) -> list:
     for key in column_keys:
         if key == "company":
             row.append(get_company_value(record))
-        elif key == "tracking_number":
-            row.append(get_tracking_number_value(record))
         else:
             row.append(clean_value(record.get(key)))
     return row
@@ -156,35 +152,64 @@ def style_header_row(ws, col_count: int):
 def set_column_widths(ws, column_keys: list[str]):
     width_map = {
         "email_category":        22,
-        "purchase_datetime":     22,
         "order_number":          18,
-        "sender_name":           20,
+        "purchase_datetime":     22,
         "company":               24,
         "email":                 30,
         "total_amount_paid":     14,
         "tax_paid":              12,
-        "tracking_number":       24,
+        "tracking_number":       28,
+        "tracking_link":         40,
         "duplicate_on_last_run": 24,
         "source_file_link":      14,
     }
     for col_idx, key in enumerate(column_keys, start=1):
-        if key in width_map:
-            w = width_map[key]
-        else:
-            w = 16
+        w = width_map.get(key, 16)
         ws.column_dimensions[get_column_letter(col_idx)].width = w
 
 
-def apply_hyperlink_column(ws, col_idx: int, start_row: int):
-    """Replace file URI values in a column with clickable 'Open' hyperlink cells."""
-    for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row, min_col=col_idx, max_col=col_idx):
-        cell = row[0]
-        uri = cell.value
-        if uri and isinstance(uri, str) and uri.startswith("file:///"):
-            cell.value = "Open"
-            cell.hyperlink = uri
-            cell.font = HYPERLINK_FONT
-            cell.alignment = CENTER_ALIGN
+def _col_indices(column_keys: list[str], key: str) -> list[int]:
+    """Return 1-based column indices for every occurrence of *key* in *column_keys*."""
+    return [i + 1 for i, k in enumerate(column_keys) if k == key]
+
+
+def apply_hyperlink_columns(ws, col_indices: list[int], start_row: int):
+    """Replace file URI values with clickable 'Open' hyperlinks in every View Email column."""
+    for col_idx in col_indices:
+        for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row,
+                                min_col=col_idx, max_col=col_idx):
+            cell = row[0]
+            uri = cell.value
+            if uri and isinstance(uri, str) and uri.startswith("file:///"):
+                cell.value = "Open"
+                cell.hyperlink = uri
+                cell.font = HYPERLINK_FONT
+                cell.alignment = CENTER_ALIGN
+
+
+def _merge_border(cell, top=None, bottom=None, left=None, right=None):
+    """Merge new sides into a cell's existing border without overwriting unset sides."""
+    old = cell.border
+    cell.border = Border(
+        top=top if top is not None else old.top,
+        bottom=bottom if bottom is not None else old.bottom,
+        left=left if left is not None else old.left,
+        right=right if right is not None else old.right,
+    )
+
+
+def apply_order_group_borders(ws, records: list[dict], start_row: int):
+    """Draw a bold bottom border on the last row of each order_number group."""
+    if not records:
+        return
+    for i, record in enumerate(records):
+        current = record.get("order_number")
+        nxt = records[i + 1].get("order_number") if i + 1 < len(records) else None
+        if current != nxt:
+            row_idx = start_row + i
+            for col_idx in range(1, ws.max_column + 1):
+                _merge_border(ws.cell(row=row_idx, column=col_idx),
+                              bottom=THICK_SIDE)
 
 
 def apply_cell_styles(ws, start_row: int):
@@ -192,6 +217,53 @@ def apply_cell_styles(ws, start_row: int):
         for cell in row:
             cell.font = CELL_FONT
             cell.alignment = LEFT_ALIGN
+
+
+def apply_category_colors(ws, start_row: int, category_col: int):
+    """Shade every cell in a row with a pastel fill based on its email_category."""
+    for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row):
+        category = ws.cell(row=row[0].row, column=category_col).value
+        fill = CATEGORY_FILLS.get(category)
+        if fill:
+            for cell in row:
+                cell.fill = fill
+
+
+def apply_row_borders(ws, start_row: int):
+    """Add a hairline bottom border on every row from the header through the last data row."""
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
+        for cell in row:
+            _merge_border(cell, bottom=HAIR_SIDE)
+
+
+def apply_section_dividers(ws, boundary_cols: list[int]):
+    """Draw a hairline right border on each section-boundary column (all rows)."""
+    for col_idx in boundary_cols:
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row,
+                                min_col=col_idx, max_col=col_idx):
+            _merge_border(row[0], right=HAIR_SIDE)
+
+
+def apply_table_outline(ws):
+    """Draw a hairline border around the entire table (header + data)."""
+    last_row = ws.max_row
+    last_col = ws.max_column
+
+    for col_idx in range(1, last_col + 1):
+        _merge_border(ws.cell(row=1, column=col_idx), top=HAIR_SIDE)
+        _merge_border(ws.cell(row=last_row, column=col_idx), bottom=HAIR_SIDE)
+
+    for row_idx in range(1, last_row + 1):
+        _merge_border(ws.cell(row=row_idx, column=1), left=HAIR_SIDE)
+        _merge_border(ws.cell(row=row_idx, column=last_col), right=HAIR_SIDE)
+
+
+def apply_header_border(ws):
+    """Draw a hairline top and bottom border on the header row (horizontal only)."""
+    last_col = ws.max_column
+    for col_idx in range(1, last_col + 1):
+        _merge_border(ws.cell(row=1, column=col_idx),
+                      top=HAIR_SIDE, bottom=HAIR_SIDE)
 
 
 def build_workbook(records: list[dict]) -> Workbook:
@@ -207,11 +279,22 @@ def build_workbook(records: list[dict]) -> Workbook:
     for record in records:
         ws.append(_record_to_row(record, column_keys))
 
+    link_cols = _col_indices(column_keys, "source_file_link")
+    section_boundary_cols = link_cols[:-1]
+
     apply_cell_styles(ws, start_row=2)
     set_column_widths(ws, column_keys)
 
-    link_col_idx = column_keys.index(LINK_COLUMN) + 1
-    apply_hyperlink_column(ws, link_col_idx, start_row=2)
+    category_col_idx = column_keys.index("email_category") + 1
+    apply_category_colors(ws, start_row=2, category_col=category_col_idx)
+
+    apply_row_borders(ws, start_row=2)
+    apply_header_border(ws)
+    apply_section_dividers(ws, section_boundary_cols)
+    apply_table_outline(ws)
+    apply_order_group_borders(ws, records, start_row=2)
+
+    apply_hyperlink_columns(ws, link_cols, start_row=2)
 
     ws.freeze_panes = "B2"
     return wb
@@ -246,8 +329,20 @@ def append_to_workbook(path: str, records: list[dict]):
             cell.font = CELL_FONT
             cell.alignment = LEFT_ALIGN
 
-    link_col_idx = desired_keys.index(LINK_COLUMN) + 1
-    apply_hyperlink_column(ws, link_col_idx, start_row=next_row)
+    link_cols = _col_indices(desired_keys, "source_file_link")
+    section_boundary_cols = link_cols[:-1]
+
+    category_col_idx = desired_keys.index("email_category") + 1
+    apply_category_colors(ws, start_row=next_row, category_col=category_col_idx)
+
+    apply_row_borders(ws, start_row=next_row)
+    apply_header_border(ws)
+    apply_section_dividers(ws, section_boundary_cols)
+    apply_table_outline(ws)
+    apply_order_group_borders(ws, records, start_row=next_row)
+
+    apply_hyperlink_columns(ws, link_cols, start_row=next_row)
+
     ws.freeze_panes = "B2"
 
     wb.save(path)

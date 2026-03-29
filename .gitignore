@@ -8,3 +8,4 @@ __pycache__/
 
 # Logs may contain emails, paths, names, and order details
 run_log.txt
+adminLog/
