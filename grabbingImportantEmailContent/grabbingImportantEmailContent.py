@@ -8,37 +8,37 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-from openai import OpenAI, RateLimitError
-
-# Ensure python_files/ is on sys.path so htmlHandler imports work
+# python_files/ — .env must load before htmlHandler (trace uses BASE_DIR from .env)
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PYTHON_FILES_DIR))
+
+from dotenv import load_dotenv
+
+load_dotenv(_PYTHON_FILES_DIR / ".env")
+
+from openai import OpenAI, RateLimitError
 
 from htmlHandler.admin_log import trace as _trace
 from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
 from htmlHandler.htmlValuesExtractionByAttribute.ValuesExtractionByAttribute import extract_attribute_values
 from htmlHandler.isHrefTrackingLink import determine_tracking_link
 
-# Load .env from python_files/ (one level up from this script's subfolder)
-load_dotenv(_PYTHON_FILES_DIR / ".env")
-
 # =========================
 # CONFIG
 # =========================
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+BASE_DIR_ENV = "BASE_DIR"
 API_KEY = os.getenv(OPENAI_API_KEY_ENV)
 
 MODEL = "gpt-4o-mini"
 
 VALID_CATEGORIES = [
-    "Order Placed",
-    "Order Received",
+    "Delivery Shipped From Sender",
+    "Delivery On The Way",
+    "Delivery Arrived",
+    "Order Received By Vendor",
     "Order Confirmed",
-    "Order Delayed",
-    "Order Shipped",
-    "Delivery Confirmation",
-    "Purchased Gift Card",
+    "Gift Card Purchase",
     "Unknown",
 ]
 CATEGORY_CONFIDENCE_THRESHOLD = 60
@@ -346,17 +346,16 @@ Important rules:
     assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
     If not clearly present, return null.
 12. email_category: Classify this email into exactly ONE of these categories:
-    - "Order Placed": Initial purchase email, typically no tracking info yet.
-    - "Order Received": Merchant acknowledges receipt of the order.
-    - "Order Confirmed": Explicit confirmation the order is being processed.
-    - "Order Delayed": Notification that the order or shipment is delayed.
-    - "Order Shipped": Shipment notification, usually includes tracking info.
-    - "Delivery Confirmation": Package was delivered successfully.
-    - "Purchased Gift Card": A gift card purchase confirmation or delivery (digital or physical).
+    - "Delivery Shipped From Sender": The seller/merchant has shipped the package (often includes carrier handoff or tracking).
+    - "Delivery On The Way": In-transit updates — package is moving toward the recipient (out for delivery, on the way, etc.).
+    - "Delivery Arrived": Delivered — the package has arrived or delivery is complete.
+    - "Order Received By Vendor": The store received the order (submitted/queued) but not yet fully confirmed or shipped.
+    - "Order Confirmed": The merchant explicitly confirms the order is accepted and being processed.
+    - "Gift Card Purchase": Gift card purchase, delivery, redemption code, or balance notification.
     - "Unknown": Does not clearly fit any of the above.
-    Contextual hints: "Order Placed" emails rarely mention tracking. "Order Shipped"
-    emails almost always mention tracking. "Delivery Confirmation" emails mention delivery
-    completion. Gift card emails mention gift card value, redemption codes, or gift card delivery.
+    Contextual hints: Shipped-from-sender and on-the-way emails often mention tracking or carrier movement;
+    arrived emails stress delivery completion. Vendor-received vs confirmed depends on wording (received vs
+    confirmed/processing). Gift card emails mention gift card value, codes, or digital delivery.
     Use these signals to guide your choice.
 13. email_category_confidence: Your confidence (0–100) in the chosen category.
 {subject_section}
@@ -414,13 +413,12 @@ EMAIL TEXT:
                         "email_category": {
                             "type": "string",
                             "enum": [
-                                "Order Placed",
-                                "Order Received",
+                                "Delivery Shipped From Sender",
+                                "Delivery On The Way",
+                                "Delivery Arrived",
+                                "Order Received By Vendor",
                                 "Order Confirmed",
-                                "Order Delayed",
-                                "Order Shipped",
-                                "Delivery Confirmation",
-                                "Purchased Gift Card",
+                                "Gift Card Purchase",
                                 "Unknown",
                             ],
                             "description": "Category of this email.",
@@ -499,18 +497,11 @@ def parse_args() -> argparse.Namespace:
         description="Extract structured purchase details from HTML emails."
     )
     parser.add_argument(
-        "--base-dir",
-        required=False,
-        default=os.getenv("BASE_DIR"),
-        dest="base_dir",
-        help="Root project folder. Defaults to BASE_DIR in .env if not provided.",
-    )
-    parser.add_argument(
         "--file",
         default=None,
         help=(
             "Filename (or full path) of a single HTML file to process. "
-            "A bare filename is resolved inside <base-dir>/email_contents/html/. "
+            "A bare filename is resolved under email_contents/html/ relative to BASE_DIR from .env. "
             "When provided, only that file is processed and the result is appended "
             "to the output JSON."
         ),
@@ -831,7 +822,7 @@ def main(flow_started_at: datetime | None = None):
 
     _trace(
         "MAIN",
-        f"main() called — base_dir={args.base_dir!r}, file={args.file!r}, "
+        f"main() called — base_dir={os.getenv(BASE_DIR_ENV)!r}, file={args.file!r}, "
         f"subject={args.subject!r}, sender_name={args.sender_name!r}, "
         f"email={args.email!r}",
     )
@@ -841,10 +832,14 @@ def main(flow_started_at: datetime | None = None):
         args.sender_name = "John Doe"
         print("DEMO MODE: sender overridden to John Doe <johndoe123@gmail.com>")
 
-    if not args.base_dir:
-        raise ValueError("BASE_DIR is not set. Add it to python_files/.env or pass --base-dir.")
+    base_dir = os.getenv(BASE_DIR_ENV)
+    if not base_dir:
+        raise ValueError(
+            f"{BASE_DIR_ENV} is not set. Add it to python_files/.env "
+            f"(e.g. BASE_DIR=C:\\path\\to\\project)."
+        )
 
-    base = Path(args.base_dir)
+    base = Path(base_dir).expanduser().resolve()
     html_folder = base / "email_contents" / "html"
     output_path = base / "email_contents" / "json" / "results.json"
 
@@ -964,7 +959,14 @@ class _Tee:
 if __name__ == "__main__":
     strip_bom_from_argv(sys.argv)
 
-    _log_path = Path(os.getenv("BASE_DIR")) / "programFileOutput.txt"
+    _base_for_log = os.getenv(BASE_DIR_ENV)
+    if not _base_for_log:
+        print(
+            f"ERROR: {BASE_DIR_ENV} is not set. Set it in {_PYTHON_FILES_DIR / '.env'}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    _log_path = Path(_base_for_log).expanduser().resolve() / "programFileOutput.txt"
     _tee = _Tee(_log_path, sys.stdout)
     sys.stdout = _tee
     sys.stderr = _Tee(_log_path, sys.stderr)
@@ -989,7 +991,7 @@ if __name__ == "__main__":
         print(f"Total operation time: {_elapsed:.2f}s")
         if e.code == EXIT_BAD_ARGS:
             print("\nERROR: Invalid or missing arguments.")
-            print("Set BASE_DIR and OPENAI_API_KEY in python_files/.env, or pass --base-dir as an argument.")
+            print("Set BASE_DIR and OPENAI_API_KEY in python_files/.env.")
             print("Optional args: --file, --subject, --sender-name, --email")
         sys.stdout = _original_stdout
         sys.stderr = _original_stderr

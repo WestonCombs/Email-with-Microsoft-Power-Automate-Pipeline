@@ -1,11 +1,25 @@
-"""Append-only trace log under python_files/adminLog/ (gitignored)."""
+"""Append-only trace log under {BASE_DIR}/adminLog/ (gitignored).
+
+Loads python_files/.env from this package's parent so BASE_DIR is available.
+If BASE_DIR is unset, logs fall back to python_files/adminLog/ (next to this package).
+"""
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
-_LOG_DIR = Path(__file__).resolve().parent.parent / "adminLog"
+from dotenv import load_dotenv
+
+_PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(_PYTHON_FILES_DIR / ".env")
+
+_base = os.getenv("BASE_DIR")
+if _base:
+    _LOG_DIR = Path(_base).expanduser().resolve() / "adminLog"
+else:
+    _LOG_DIR = _PYTHON_FILES_DIR / "adminLog"
 _LOG_FILE = _LOG_DIR / "htmlHandler_trace.txt"
 _MAX_INLINE = 500
 
