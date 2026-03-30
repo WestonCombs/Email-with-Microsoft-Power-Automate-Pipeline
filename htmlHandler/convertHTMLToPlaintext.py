@@ -4,6 +4,7 @@ Uses Python's built-in html.parser (via BeautifulSoup) to strip tags,
 remove hidden elements, and convert data tables to readable markdown.
 """
 
+import os
 import re
 
 from bs4 import BeautifulSoup
@@ -11,6 +12,19 @@ from bs4 import BeautifulSoup
 from htmlHandler.admin_log import trace
 
 _SRC = "convertHTMLToPlaintext"
+_OPENAI_MAX_CHARS_ENV = "openai_max_chars_per_prompting"
+_DEFAULT_MAX_CHARS = 50_000
+
+
+def _max_chars_from_env() -> int:
+    raw = os.getenv(_OPENAI_MAX_CHARS_ENV)
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_MAX_CHARS
+    try:
+        n = int(str(raw).strip(), 10)
+    except ValueError:
+        return _DEFAULT_MAX_CHARS
+    return n if n > 0 else _DEFAULT_MAX_CHARS
 
 
 def _remove_hidden_elements(soup: BeautifulSoup) -> int:
@@ -59,8 +73,14 @@ def _convert_tables_to_markdown(soup: BeautifulSoup) -> int:
     return converted
 
 
-def convert(html: str, max_chars: int = 50_000) -> str:
-    """Convert raw HTML to clean plain text, trimmed to *max_chars*."""
+def convert(html: str, max_chars: int | None = None) -> str:
+    """Convert raw HTML to clean plain text, trimmed to *max_chars*.
+
+    If *max_chars* is None, uses integer from env *openai_max_chars_per_prompting*
+    (see python_files/.env), or 50_000 if unset or invalid.
+    """
+    if max_chars is None:
+        max_chars = _max_chars_from_env()
     trace(_SRC, f"convert() called — raw HTML len={len(html):,} chars", html[:200])
 
     soup = BeautifulSoup(html, "html.parser")

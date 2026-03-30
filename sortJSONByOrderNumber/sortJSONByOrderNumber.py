@@ -8,13 +8,14 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-BASE_DIR = os.getenv("BASE_DIR")
-if not BASE_DIR:
+_base_dir_raw = os.getenv("BASE_DIR")
+if not _base_dir_raw:
     raise ValueError("BASE_DIR is not set in python_files/.env")
 
-INPUT_FILE  = Path(BASE_DIR) / "email_contents" / "json" / "results.json"
+PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
+INPUT_FILE  = PROJECT_ROOT / "email_contents" / "json" / "results.json"
 OUTPUT_FILE = INPUT_FILE
-LOG_PATH    = Path(BASE_DIR) / "programFileOutput.txt"
+LOG_PATH    = PROJECT_ROOT / "programFileOutput.txt"
 
 _DATE_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
 

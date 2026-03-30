@@ -12,13 +12,14 @@ from openpyxl.utils import get_column_letter
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-BASE_DIR = os.getenv("BASE_DIR")
-if not BASE_DIR:
+_base_dir_raw = os.getenv("BASE_DIR")
+if not _base_dir_raw:
     raise ValueError("BASE_DIR is not set in python_files/.env")
 
-JSON_PATH  = str(Path(BASE_DIR) / "email_contents" / "json" / "results.json")
-EXCEL_PATH = str(Path(BASE_DIR) / "email_contents" / "orders.xlsx")
-LOG_PATH   = Path(BASE_DIR) / "programFileOutput.txt"
+PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
+JSON_PATH  = str(PROJECT_ROOT / "email_contents" / "json" / "results.json")
+EXCEL_PATH = str(PROJECT_ROOT / "email_contents" / "orders.xlsx")
+LOG_PATH   = PROJECT_ROOT / "programFileOutput.txt"
 
 # Column layout is split into three logical sections.
 # "source_file_link" appears at the end of each section as a "View Email" hyperlink.
@@ -43,7 +44,7 @@ COLUMN_ORDER = [
 ]
 
 COLUMN_HEADERS = {
-    "email_category":        "Email Category",
+    "email_category":        "Category",
     "order_number":          "Order Number",
     "purchase_datetime":     "Purchase Date",
     "company":               "Company",
@@ -64,10 +65,12 @@ CENTER_ALIGN   = Alignment(horizontal="center", vertical="center")
 LEFT_ALIGN     = Alignment(horizontal="left",   vertical="center")
 
 CATEGORY_FILLS = {
-    "Order Placed":          PatternFill("solid", fgColor="FCE4EC"),  # light rose
-    "Order Confirmed":       PatternFill("solid", fgColor="FFF3E0"),  # light peach
-    "Order Shipped":         PatternFill("solid", fgColor="E8F5E9"),  # light mint
-    "Delivery Confirmation": PatternFill("solid", fgColor="E3F2FD"),  # light sky
+    "Delivery Shipped From Sender": PatternFill("solid", fgColor="FCE4EC"),  # light rose
+    "Delivery On The Way":          PatternFill("solid", fgColor="FFF3E0"),  # light peach
+    "Delivery Arrived":             PatternFill("solid", fgColor="E8F5E9"),  # light mint
+    "Order Received By Vendor":     PatternFill("solid", fgColor="E3F2FD"),  # light sky
+    "Order Confirmed":              PatternFill("solid", fgColor="F3E5F5"),  # light purple
+    "Gift Card Purchase":           PatternFill("solid", fgColor="FFF9C4"),  # light yellow
 }
 
 HAIR_SIDE  = Side(style="hair", color="000000")
