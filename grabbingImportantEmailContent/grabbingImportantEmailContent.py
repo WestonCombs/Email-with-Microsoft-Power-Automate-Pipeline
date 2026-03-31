@@ -1,8 +1,10 @@
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -23,6 +25,12 @@ from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
 from htmlHandler.htmlValuesExtractionByAttribute.ValuesExtractionByAttribute import extract_attribute_values
 from htmlHandler.isHrefTrackingLink import determine_tracking_link
 
+try:
+    from xhtml2pdf import pisa
+    _HAS_XHTML2PDF = True
+except ImportError:
+    _HAS_XHTML2PDF = False
+
 # =========================
 # CONFIG
 # =========================
@@ -33,12 +41,10 @@ API_KEY = os.getenv(OPENAI_API_KEY_ENV)
 MODEL = "gpt-4o-mini"
 
 VALID_CATEGORIES = [
-    "Delivery Shipped From Sender",
-    "Delivery On The Way",
-    "Delivery Arrived",
-    "Order Received By Vendor",
-    "Order Confirmed",
-    "Gift Card Purchase",
+    "Invoice",
+    "Shipped",
+    "Delivered",
+    "Gift Card",
     "Unknown",
 ]
 CATEGORY_CONFIDENCE_THRESHOLD = 60
@@ -196,6 +202,83 @@ def read_email_html_file(file_path: Path) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
+def _find_browser() -> Path | None:
+    """Find Edge or Chrome for headless PDF conversion (Edge ships with Win 10+)."""
+    candidates = []
+    for env_var in ("PROGRAMFILES(X86)", "PROGRAMFILES"):
+        base = os.environ.get(env_var, "")
+        if not base:
+            continue
+        candidates.append(Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+        candidates.append(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def convert_html_to_pdf(html_path: Path) -> Path:
+    """Convert an HTML file to PDF. Tries Edge/Chrome headless first (perfect
+    rendering), then xhtml2pdf as fallback. Returns the original path if all
+    methods fail."""
+    pdf_path = html_path.with_suffix(".pdf")
+    file_uri = html_path.resolve().as_uri()
+
+    # --- Strategy 1: Edge / Chrome headless (handles any email HTML) ---
+    browser = _find_browser()
+    if browser:
+        try:
+            result = subprocess.run(
+                [
+                    str(browser),
+                    "--headless",
+                    "--disable-gpu",
+                    "--no-pdf-header-footer",
+                    f"--print-to-pdf={pdf_path}",
+                    file_uri,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                html_path.unlink()
+                print(f"  Converted to PDF: {pdf_path.name}")
+                return pdf_path
+        except Exception as e:
+            print(f"  Browser PDF conversion failed: {e}")
+            if pdf_path.exists():
+                try:
+                    pdf_path.unlink()
+                except OSError:
+                    pass
+
+    # --- Strategy 2: xhtml2pdf (pure Python fallback) ---
+    if _HAS_XHTML2PDF:
+        try:
+            html_content, _ = read_email_html_file(html_path)
+            with open(pdf_path, "wb") as pdf_file:
+                pisa.CreatePDF(
+                    io.StringIO(html_content),
+                    dest=pdf_file,
+                    encoding="utf-8",
+                )
+            if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                html_path.unlink()
+                print(f"  Converted to PDF (xhtml2pdf): {pdf_path.name}")
+                return pdf_path
+        except Exception as e:
+            print(f"  xhtml2pdf conversion failed: {e}")
+
+    # --- Both failed ---
+    print(f"  WARNING: Could not convert {html_path.name} to PDF, keeping HTML")
+    if pdf_path.exists():
+        try:
+            pdf_path.unlink()
+        except OSError:
+            pass
+    return html_path
+
+
 def infer_company_from_subject(subject: str | None) -> str | None:
     """Best-effort fallback when the extractor does not return a merchant name."""
     subject = clean_text(subject)
@@ -330,11 +413,19 @@ def _check_and_throttle(headers) -> float:
 # =========================
 # EXTRACTION: OPENAI
 # =========================
+def _sanitize_for_api(text: str) -> str:
+    """Strip control characters (except newline/tab) that break JSON serialization."""
+    return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+
 def extract_with_openai(
     text_only: str,
     subject: str | None = None,
 ) -> dict:
     """Extract purchase details using OpenAI (plain text only, no HTML)."""
+    text_only = _sanitize_for_api(text_only)
+    if subject:
+        subject = _sanitize_for_api(subject)
     subject_section = f"\nEMAIL SUBJECT: {subject}" if subject else ""
 
     prompt = f"""You are extracting structured purchase information from text that came from an HTML email.
@@ -355,16 +446,14 @@ Important rules:
     assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
     If not clearly present, return null.
 12. email_category: Classify this email into exactly ONE of these categories:
-    - "Delivery Shipped From Sender": The seller/merchant has shipped the package (often includes carrier handoff or tracking).
-    - "Delivery On The Way": In-transit updates — package is moving toward the recipient (out for delivery, on the way, etc.).
-    - "Delivery Arrived": Delivered — the package has arrived or delivery is complete.
-    - "Order Received By Vendor": The store received the order (submitted/queued) but not yet fully confirmed or shipped.
-    - "Order Confirmed": The merchant explicitly confirms the order is accepted and being processed.
-    - "Gift Card Purchase": Gift card purchase, delivery, redemption code, or balance notification.
+    - "Invoice": The order has been placed, received, or confirmed by the merchant (covers order confirmations, receipts, and invoices).
+    - "Shipped": The package has been shipped or is in transit (covers carrier handoff, tracking updates, out for delivery, on the way).
+    - "Delivered": The package has arrived — delivery is complete.
+    - "Gift Card": Gift card purchase, delivery, redemption code, or balance notification.
     - "Unknown": Does not clearly fit any of the above.
-    Contextual hints: Shipped-from-sender and on-the-way emails often mention tracking or carrier movement;
-    arrived emails stress delivery completion. Vendor-received vs confirmed depends on wording (received vs
-    confirmed/processing). Gift card emails mention gift card value, codes, or digital delivery.
+    Contextual hints: Invoice emails contain order confirmations, receipts, or purchase acknowledgements.
+    Shipped emails mention tracking numbers, carrier movement, or shipment notifications.
+    Delivered emails stress delivery completion. Gift card emails mention gift card value, codes, or digital delivery.
     Use these signals to guide your choice.
 13. email_category_confidence: Your confidence (0–100) in the chosen category.
 {subject_section}
@@ -422,12 +511,10 @@ EMAIL TEXT:
                         "email_category": {
                             "type": "string",
                             "enum": [
-                                "Delivery Shipped From Sender",
-                                "Delivery On The Way",
-                                "Delivery Arrived",
-                                "Order Received By Vendor",
-                                "Order Confirmed",
-                                "Gift Card Purchase",
+                                "Invoice",
+                                "Shipped",
+                                "Delivered",
+                                "Gift Card",
                                 "Unknown",
                             ],
                             "description": "Category of this email.",
@@ -513,7 +600,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Filename (or full path) of a single HTML file to process. "
-            "A bare filename is resolved under email_contents/html/ relative to BASE_DIR from .env. "
+            "A bare filename is resolved under email_contents/pdf/ relative to BASE_DIR from .env. "
             "When provided, only that file is processed and the result is appended "
             "to the output JSON."
         ),
@@ -749,13 +836,14 @@ def process_file(
 # FILE RENAMING
 # =========================
 def _next_file_number(html_folder: Path) -> int:
-    """Find the highest existing fileN.html number and return N+1."""
-    pattern = re.compile(r"^file(\d+)\.html?$", re.IGNORECASE)
+    """Find the highest existing fileN.html/.pdf number (recursive) and return N+1."""
+    pattern = re.compile(r"^file(\d+)\.(?:html?|pdf)$", re.IGNORECASE)
     max_n = 0
-    for p in html_folder.iterdir():
-        m = pattern.match(p.name)
-        if m:
-            max_n = max(max_n, int(m.group(1)))
+    for p in html_folder.rglob("file*"):
+        if p.is_file():
+            m = pattern.match(p.name)
+            if m:
+                max_n = max(max_n, int(m.group(1)))
     return max_n + 1
 
 
@@ -792,6 +880,75 @@ def rename_html_files_sequential(html_folder: Path) -> list[Path]:
         print(f"  Renamed -> {final.name}")
 
     return new_paths
+
+
+# =========================
+# CONVENTION FILE NAMING
+# =========================
+_CATEGORY_SUFFIX_MAP = {
+    "Invoice":   "INVOICE",
+    "Shipped":   "SHIPPED",
+    "Delivered": "DELIVERED",
+    "Gift Card": None,
+}
+
+
+def _sanitize_for_filename(name: str) -> str:
+    """Remove characters invalid in Windows filenames and collapse whitespace."""
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', name)
+    sanitized = re.sub(r'\s+', ' ', sanitized).strip('. ')
+    return sanitized or "Unknown"
+
+
+def _extract_date_str(purchase_datetime: str | None) -> str:
+    """Pull a YYYY-MM-DD date from the extracted purchase_datetime, or today's date."""
+    if purchase_datetime:
+        m = re.match(r"(\d{4}-\d{2}-\d{2})", purchase_datetime.strip())
+        if m:
+            return m.group(1)
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
+    """Build a filename following the mom's naming convention.
+
+    Invoice    → DOC <store> <YYYY-MM-DD> INVOICE
+    Shipped    → DOC <store> <YYYY-MM-DD> SHIPPED
+    Delivered  → DOC <store> <YYYY-MM-DD> DELIVERED
+    Gift Card  → <store> <YYYY-MM-DD>
+    Unknown    → DOC <store> <YYYY-MM-DD>
+    """
+    category = record.get("email_category", "Unknown")
+    store = _sanitize_for_filename(record.get("company") or "Unknown")
+    date_str = _extract_date_str(record.get("purchase_datetime"))
+
+    suffix = _CATEGORY_SUFFIX_MAP.get(category)
+
+    if category == "Gift Card":
+        name = f"{store} {date_str}"
+    elif suffix:
+        name = f"DOC {store} {date_str} {suffix}"
+    else:
+        name = f"DOC {store} {date_str}"
+
+    return name + extension
+
+
+def rename_to_convention(file_path: Path, record: dict, target_folder: Path) -> Path:
+    """Rename *file_path* to the convention name inside *target_folder*.
+    Appends (2), (3), … if the name already exists."""
+    ext = file_path.suffix
+    base_name = build_convention_filename(record, extension="")
+    new_path = target_folder / f"{base_name}{ext}"
+
+    counter = 2
+    while new_path.exists():
+        new_path = target_folder / f"{base_name} ({counter}){ext}"
+        counter += 1
+
+    file_path.rename(new_path)
+    print(f"  Convention rename: {file_path.name} -> {new_path.name}")
+    return new_path
 
 
 # =========================
@@ -852,7 +1009,7 @@ def main(flow_started_at: datetime | None = None):
         )
 
     base = Path(base_dir).expanduser().resolve()
-    html_folder = base / "email_contents" / "html"
+    pdf_folder = base / "email_contents" / "pdf"
     output_path = base / "email_contents" / "json" / "results.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -878,7 +1035,7 @@ def main(flow_started_at: datetime | None = None):
     if args.file:
         candidate = Path(args.file)
         if not candidate.is_absolute() and candidate.parent == Path("."):
-            candidate = html_folder / candidate
+            candidate = pdf_folder / candidate
         file_path = candidate
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -899,12 +1056,19 @@ def main(flow_started_at: datetime | None = None):
                 json.dump(results, f, indent=2, ensure_ascii=False)
             return
 
-        file_path = rename_single_file(file_path, html_folder)
+        file_path = rename_single_file(file_path, pdf_folder)
         _trace("MAIN", f"Renamed to {file_path.name}, file size = {file_path.stat().st_size:,} bytes")
 
         entry = process_file(file_path, args.subject, args.sender_name, args.email)
         entry["content_hash"] = file_hash
         entry["duplicate_on_last_run"] = 0
+
+        pdf_path = convert_html_to_pdf(file_path)
+
+        pdf_path = rename_to_convention(pdf_path, entry, pdf_folder)
+        file_uri = "file:///" + str(pdf_path.resolve()).replace("\\", "/")
+        entry["source_file"] = clean_text(pdf_path)
+        entry["source_file_link"] = file_uri
 
         _trace(
             "MAIN",
@@ -921,15 +1085,15 @@ def main(flow_started_at: datetime | None = None):
         print(f"Appended result to: {output_path}")
         return
 
-    # Batch mode: process entire html folder
-    if not html_folder.exists():
-        raise FileNotFoundError(f"HTML input folder not found: {html_folder}")
+    # Batch mode: process entire pdf folder
+    if not pdf_folder.exists():
+        raise FileNotFoundError(f"PDF input folder not found: {pdf_folder}")
 
     print("Renaming HTML files to sequential format...")
-    html_files = rename_html_files_sequential(html_folder)
+    html_files = rename_html_files_sequential(pdf_folder)
 
     if not html_files:
-        print(f"No HTML files found in: {html_folder}")
+        print(f"No HTML files found in: {pdf_folder}")
         return
 
     results = _load_existing_results(output_path)
@@ -948,6 +1112,14 @@ def main(flow_started_at: datetime | None = None):
         entry = process_file(fp, args.subject, args.sender_name, args.email)
         entry["content_hash"] = file_hash
         entry["duplicate_on_last_run"] = 0
+
+        pdf_path = convert_html_to_pdf(fp)
+
+        pdf_path = rename_to_convention(pdf_path, entry, pdf_folder)
+        file_uri = "file:///" + str(pdf_path.resolve()).replace("\\", "/")
+        entry["source_file"] = clean_text(pdf_path)
+        entry["source_file_link"] = file_uri
+
         results.append(entry)
         hashes.add(file_hash)
         new_count += 1

@@ -65,13 +65,13 @@ CENTER_ALIGN   = Alignment(horizontal="center", vertical="center")
 LEFT_ALIGN     = Alignment(horizontal="left",   vertical="center")
 
 CATEGORY_FILLS = {
-    "Delivery Shipped From Sender": PatternFill("solid", fgColor="FCE4EC"),  # light rose
-    "Delivery On The Way":          PatternFill("solid", fgColor="FFF3E0"),  # light peach
-    "Delivery Arrived":             PatternFill("solid", fgColor="E8F5E9"),  # light mint
-    "Order Received By Vendor":     PatternFill("solid", fgColor="E3F2FD"),  # light sky
-    "Order Confirmed":              PatternFill("solid", fgColor="F3E5F5"),  # light purple
-    "Gift Card Purchase":           PatternFill("solid", fgColor="FFF9C4"),  # light yellow
+    "Invoice":   PatternFill("solid", fgColor="E3F2FD"),  # light sky
+    "Shipped":   PatternFill("solid", fgColor="FFF3E0"),  # light peach
+    "Delivered": PatternFill("solid", fgColor="E8F5E9"),  # light mint
+    "Gift Card": PatternFill("solid", fgColor="FFF9C4"),  # light yellow
+    "Unknown":   PatternFill("solid", fgColor="F3E5F5"),  # light purple
 }
+
 
 HAIR_SIDE  = Side(style="hair", color="000000")
 THICK_SIDE = Side(style="medium", color="000000")
