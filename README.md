@@ -1,6 +1,6 @@
 # Email Sorter (Python)
 
-Scripts that read HTML shopping emails, extract structured order data with the OpenAI API, store results as JSON, optionally sort them, and build an Excel workbook. Designed to be called from **Microsoft Power Automate** (or run manually).
+Fetches shopping emails via IMAP, extracts structured order data with the OpenAI API, stores results as JSON, sorts them, and builds an Excel workbook. Everything runs from a single entry point — `mainRunner.py`.
 
 ## Requirements
 
@@ -13,57 +13,45 @@ pip install beautifulsoup4 python-dotenv openpyxl openai
 
 ## Configuration
 
-Create or edit **`python_files/.env`** (same folder as this README):
+Copy **`.env.example`** to **`.env`** (same folder as this README) and fill in the values:
 
 | Variable | Purpose |
 |----------|---------|
-| `BASE_DIR` | Absolute path to your project data root (folders like `python_files/` live under here). |
+| `BASE_DIR` | Absolute path to your project data root (folders like `email_contents/` live under here). |
 | `OPENAI_API_KEY` | Your OpenAI API key (used by the email extraction script). |
+| `IMAP_SERVER` | IMAP server hostname (e.g. `imap.gmail.com`). |
+| `IMAP_PORT` | IMAP port (default `993`). |
+| `IMAP_USE_SSL` | `1` to use SSL (default), `0` for plain. |
+| `IMAP_USERNAME` | Email account username. |
+| `IMAP_PASSWORD` | Email account password (use an App Password for Gmail). |
+| `IMAP_MAIL_FOLDER` | Mailbox folder to fetch from (e.g. `INBOX`, `Test1`). |
 
 Optional: `DEMO_MODE=1` for demo behavior in the extractor; `openai_max_chars_per_prompting` to cap HTML size sent to the model (see `htmlHandler/convertHTMLToPlaintext.py`).
 
-## Typical run order
+## Running
 
-1. **Create expected folders** (from `EnvironmentInitialization/`):
+```bash
+python mainRunner.py
+```
 
-   ```bash
-   cd EnvironmentInitialization
-   python runner.py
-   ```
+This single command runs the full pipeline:
 
-2. **Place HTML** under `BASE_DIR/email_contents/html/` (or pass `--file`).
+1. **Environment initialization** — creates required folders under `BASE_DIR` (`email_contents/attachments`, `email_contents/html`, `email_contents/json`, etc.).
+2. **Email fetching** — connects to the IMAP server, fetches all emails from the configured folder, and saves attachments to `BASE_DIR/email_contents/attachments`.
+3. **Extraction** — for each email, writes the HTML body to disk and runs the OpenAI extraction pipeline to produce structured JSON in `email_contents/json/results.json`.
+4. **Sort** — sorts `results.json` by order number and purchase date.
+5. **Excel export** — builds `email_contents/orders.xlsx` from the JSON and resets duplicate flags.
 
-3. **Extract data to JSON** (from `grabbingImportantEmailContent/`):
+An OpenAI usage log (`usageN.txt`) is created per run in `BASE_DIR/email_contents/openai usage/`. A summary with total tokens, cost, and average time per email is printed at the end.
 
-   ```bash
-   cd grabbingImportantEmailContent
-   python grabbingImportantEmailContent.py --file yourfile.html --subject "..." --sender-name "..." --email "..."
-   ```
-
-   Omit `--file` to process all HTML files in `email_contents/html/`. Output is appended to `email_contents/json/results.json` under `BASE_DIR`.
-
-4. **Sort JSON by order** (optional, from `sortJSONByOrderNumber/`):
-
-   ```bash
-   cd sortJSONByOrderNumber
-   python sortJSONByOrderNumber.py
-   ```
-
-5. **Build Excel** (from `createExcelDocument/`):
-
-   ```bash
-   cd createExcelDocument
-   python createExcelDocument.py
-   ```
-
-   Reads `results.json`, writes `email_contents/orders.xlsx`, and resets duplicate flags in the JSON.
-
-Logs and admin traces may go to paths under `BASE_DIR` (e.g. `programFileOutput.txt`, `adminLog/`).
+Logs and admin traces go to paths under `BASE_DIR` (e.g. `programFileOutput.txt`, `adminLog/`).
 
 ## Project layout
 
-- `EnvironmentInitialization/` — folder checks for Power Automate / first run  
-- `grabbingImportantEmailContent/` — HTML → JSON (OpenAI)  
-- `sortJSONByOrderNumber/` — sort `results.json`  
-- `createExcelDocument/` — JSON → Excel  
-- `htmlHandler/` — HTML cleanup and helpers used by the extractor  
+- `mainRunner.py` — main entry point; orchestrates the full pipeline
+- `emailFetching/` — IMAP email fetching module
+- `EnvironmentInitialization/` — folder/file verification for first run
+- `grabbingImportantEmailContent/` — HTML → JSON (OpenAI)
+- `sortJSONByOrderNumber/` — sort `results.json`
+- `createExcelDocument/` — JSON → Excel
+- `htmlHandler/` — HTML cleanup and helpers used by the extractor

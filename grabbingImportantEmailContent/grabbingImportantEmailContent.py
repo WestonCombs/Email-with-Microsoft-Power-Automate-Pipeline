@@ -57,6 +57,10 @@ client = OpenAI(api_key=API_KEY)
 
 OPENAI_USAGE_REL = Path("email_contents") / "openai usage"
 
+# gpt-4o-mini pricing (per token)
+_COST_PER_INPUT_TOKEN = 0.15 / 1_000_000   # $0.15 per 1M input tokens
+_COST_PER_OUTPUT_TOKEN = 0.60 / 1_000_000  # $0.60 per 1M output tokens
+
 # Set once per process run when main() initializes the flow usage log (CLI entry).
 _flow_usage_log_path: Path | None = None
 
@@ -107,6 +111,7 @@ def append_openai_usage_log(
     prompt_tokens: int,
     completion_tokens: int,
     total_tokens: int,
+    elapsed_secs: float = 0.0,
 ) -> int:
     """Append one line for this flow's file; cumulative is for this flow only. Returns cumulative."""
     global _flow_usage_log_path
@@ -116,12 +121,16 @@ def append_openai_usage_log(
 
     prev = _read_last_cumulative_tokens(log_path)
     cumulative = prev + total_tokens
+    cost = (prompt_tokens * _COST_PER_INPUT_TOKEN) + (completion_tokens * _COST_PER_OUTPUT_TOKEN)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     line = (
         f"{ts} | "
         f"prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
-        f"total_tokens={total_tokens} | cumulative_total={cumulative}\n"
+        f"total_tokens={total_tokens} | "
+        f"cumulative_total={cumulative} | "
+        f"elapsed_secs={elapsed_secs:.2f} | "
+        f"cost=${cost:.6f}\n"
     )
 
     with open(log_path, "a", encoding="utf-8") as f:
@@ -446,6 +455,7 @@ EMAIL TEXT:
     )
 
     total_waited = 0.0
+    call_start = time.monotonic()
     for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
         try:
             raw = client.chat.completions.with_raw_response.create(**api_kwargs)
@@ -461,6 +471,7 @@ EMAIL TEXT:
             f"OpenAI rate limit not cleared after {RATE_LIMIT_MAX_RETRIES} retries "
             f"({total_waited:.0f}s total wait)"
         )
+    call_elapsed = time.monotonic() - call_start
 
     if total_waited > 0:
         print(f"  Total rate-limit wait: {total_waited:.1f}s")
@@ -477,6 +488,7 @@ EMAIL TEXT:
                 prompt_tokens=int(pt),
                 completion_tokens=int(ct),
                 total_tokens=int(tt),
+                elapsed_secs=call_elapsed,
             )
             print(
                 f"  OpenAI tokens this request: {tt} (cumulative this flow: {cumulative})"
@@ -559,17 +571,17 @@ def process_file(
         )
         print(f"Processing: {file_path}")
 
-        # ── READ FILE FROM DISK (UTF-8 or UTF-16 from Outlook / Power Automate) ──
+        # ── STEP 1: Read file from disk (UTF-8 or UTF-16) ──
         raw_html, html_encoding = read_email_html_file(file_path)
         _trace(
-            "PIPELINE STEP 0  [read file]",
+            "PIPELINE STEP 1  [read file]",
             f"Decoded HTML as {html_encoding!r}",
         )
 
         href_count_raw = raw_html.lower().count('href=')
         anchor_count = raw_html.lower().count('<a ')
         _trace(
-            "PIPELINE STEP 0  [read file]",
+            "PIPELINE STEP 1  [read file]",
             f"Read {file_path.name} — {len(raw_html):,} chars, "
             f"{len(raw_html.splitlines())} lines, "
             f"raw 'href=' count={href_count_raw}, '<a ' count={anchor_count}",
@@ -577,83 +589,83 @@ def process_file(
         )
         if len(raw_html) < 500:
             _trace(
-                "PIPELINE STEP 0  [read file]",
+                "PIPELINE STEP 1  [read file]",
                 "WARNING: HTML is suspiciously short! Full content below:",
                 raw_html,
             )
 
-        # ── STEP 1: HTML -> plain text (convertHTMLToPlaintext) ──
+        # ── STEP 2: HTML -> plain text (convertHTMLToPlaintext) ──
         _trace(
-            "PIPELINE STEP 1  [html_to_plaintext]",
+            "PIPELINE STEP 2  [html_to_plaintext]",
             f"Sending {len(raw_html):,} chars of raw HTML to convertHTMLToPlaintext.convert()",
         )
         text_only = html_to_plaintext(raw_html)
         _trace(
-            "PIPELINE STEP 1  [html_to_plaintext]",
+            "PIPELINE STEP 2  [html_to_plaintext]",
             f"Got back {len(text_only):,} chars of plain text ({len(text_only.splitlines())} lines)",
             text_only[:300],
         )
 
-        # ── STEP 2: Extract hrefs (ValuesExtractionByAttribute) ──
+        # ── STEP 3: Extract hrefs (ValuesExtractionByAttribute) ──
         _trace(
-            "PIPELINE STEP 2  [extract_attribute_values]",
+            "PIPELINE STEP 3  [extract_attribute_values]",
             f"Sending {len(raw_html):,} chars of raw HTML to extract_attribute_values(html, 'href')",
         )
         extracted_hrefs = extract_attribute_values(raw_html, "href")
         _trace(
-            "PIPELINE STEP 2  [extract_attribute_values]",
+            "PIPELINE STEP 3  [extract_attribute_values]",
             f"Got back {len(extracted_hrefs)} unique hrefs",
         )
         # Individual href logging disabled — tracking-link bug is resolved
         if extracted_hrefs:
             pass
             # for i, h in enumerate(extracted_hrefs[:5]):
-            #     _trace("PIPELINE STEP 2  [extract_attribute_values]", f"  href[{i}]: {h}")
+            #     _trace("PIPELINE STEP 3  [extract_attribute_values]", f"  href[{i}]: {h}")
             # if len(extracted_hrefs) > 5:
             #     _trace(
-            #         "PIPELINE STEP 2  [extract_attribute_values]",
+            #         "PIPELINE STEP 3  [extract_attribute_values]",
             #         f"  ... and {len(extracted_hrefs) - 5} more",
             #     )
         else:
             _trace(
-                "PIPELINE STEP 2  [extract_attribute_values]",
+                "PIPELINE STEP 3  [extract_attribute_values]",
                 "WARNING: extracted_hrefs is EMPTY — this is the bug. "
                 "The regex found 0 matches even though raw 'href=' count "
                 f"was {href_count_raw}. Check the raw HTML sample above.",
             )
 
-        # ── STEP 3: Determine tracking link (isHrefTrackingLink) ──
+        # ── STEP 4: Determine tracking link (isHrefTrackingLink) ──
         _trace(
-            "PIPELINE STEP 3  [determine_tracking_link]",
+            "PIPELINE STEP 4  [determine_tracking_link]",
             f"Sending {len(extracted_hrefs)} hrefs to determine_tracking_link()",
         )
         tracking_link = determine_tracking_link(extracted_hrefs)
         _trace(
-            "PIPELINE STEP 3  [determine_tracking_link]",
+            "PIPELINE STEP 4  [determine_tracking_link]",
             f"Got back tracking_link={tracking_link!r}",
         )
 
-        # ── STEP 4: OpenAI extraction ────────────────────────────
+        # ── STEP 5: OpenAI extraction ────────────────────────────
         extracted = None
 
         if API_KEY:
             _trace(
-                "PIPELINE STEP 4  [OpenAI]",
+                "PIPELINE STEP 5  [OpenAI]",
                 f"Sending {len(text_only):,} chars of plain text to extract_with_openai()",
             )
             print("  Running OpenAI extraction...")
             try:
                 extracted = extract_with_openai(text_only, subject=subject)
                 _trace(
-                    "PIPELINE STEP 4  [OpenAI]",
+                    "PIPELINE STEP 5  [OpenAI]",
                     f"OpenAI returned: {json.dumps(extracted, default=str)[:400]}",
                 )
             except Exception as e:
-                _trace("PIPELINE STEP 4  [OpenAI]", f"FAILED: {e}")
+                _trace("PIPELINE STEP 5  [OpenAI]", f"FAILED: {e}")
                 print(f"  WARNING: OpenAI extraction failed: {e}")
                 extracted = None
         else:
-            _trace("PIPELINE STEP 4  [OpenAI]", "SKIPPED — no API key")
+            _trace("PIPELINE STEP 5  [OpenAI]", "SKIPPED — no API key")
 
         if extracted is None:
             if not API_KEY:
@@ -846,10 +858,15 @@ def main(flow_started_at: datetime | None = None):
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     started = flow_started_at or datetime.now()
-    try:
-        init_flow_usage_log(base, started)
-    except OSError as e:
-        print(f"WARNING: Could not create OpenAI usage log file: {e}")
+    ext_log = os.getenv("OPENAI_USAGE_LOG_PATH")
+    if ext_log:
+        global _flow_usage_log_path
+        _flow_usage_log_path = Path(ext_log)
+    else:
+        try:
+            init_flow_usage_log(base, started)
+        except OSError as e:
+            print(f"WARNING: Could not create OpenAI usage log file: {e}")
 
     if not API_KEY:
         print(
