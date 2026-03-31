@@ -13,6 +13,7 @@ Reads IMAP credentials and BASE_DIR from python_files/.env, then:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -236,8 +237,8 @@ def main() -> None:
 
     # ── Step 2: Fetch emails via IMAP ───────────────────────────
     attachments_dir = base_dir / "email_contents" / "attachments"
-    html_dir = base_dir / "email_contents" / "html"
-    html_dir.mkdir(parents=True, exist_ok=True)
+    pdf_dir = base_dir / "email_contents" / "pdf"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[Step 2] Fetching emails from {imap_server}:{imap_port} as {imap_username} …")
     emails = fetch_emails(
@@ -264,7 +265,7 @@ def main() -> None:
         print(f"  Subject: {msg.subject}")
         print(f"  Sender:  {msg.sender_name} <{msg.sender_email}>")
 
-        incoming_html = html_dir / "incoming.html"
+        incoming_html = pdf_dir / "incoming.html"
         incoming_html.write_text(msg.body_html, encoding="utf-8")
 
         run_grabbing_important_content(

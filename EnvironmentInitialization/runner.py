@@ -18,13 +18,13 @@ def _run_verifications(root: Path) -> None:
 
     # Folders (repeat calls are safe; same path = idempotent)
     folder_verification(root, "email_contents/attachments", clear_if_exists=True)
-    folder_verification(root, "email_contents/html")
+    folder_verification(root, "email_contents/pdf")
     folder_verification(root, "email_contents/json")
     folder_verification(root, "email_contents/openai usage")
     folder_verification(root, "adminLog")
 
     # Files: parent dirs are created automatically; use overwrite=True only if you must truncate
-    # file_verification(root, "email_contents/html/incoming.html")
+    # file_verification(root, "email_contents/pdf/incoming.html")
     # file_verification(root, "email_contents/json/results.json")
     # file_verification(root, "programFileOutput.txt")
 
