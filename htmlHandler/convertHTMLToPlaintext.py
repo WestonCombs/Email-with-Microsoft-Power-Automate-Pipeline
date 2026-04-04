@@ -81,7 +81,7 @@ def convert(html: str, max_chars: int | None = None) -> str:
     """
     if max_chars is None:
         max_chars = _max_chars_from_env()
-    trace(_SRC, f"convert() called — raw HTML len={len(html):,} chars", html[:200])
+    trace(_SRC, f"convert() called — raw HTML len={len(html):,} chars")
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -107,6 +107,5 @@ def convert(html: str, max_chars: int | None = None) -> str:
         _SRC,
         f"convert() result — plain text len={len(cleaned):,} chars, "
         f"lines={len(cleaned.splitlines())}, truncated={was_truncated}",
-        cleaned[:200],
     )
     return cleaned

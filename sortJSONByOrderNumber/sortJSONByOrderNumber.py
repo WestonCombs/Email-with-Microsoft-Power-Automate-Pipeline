@@ -1,12 +1,16 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import runLogger as RL
 
 _base_dir_raw = os.getenv("BASE_DIR")
 if not _base_dir_raw:
@@ -48,6 +52,7 @@ def _parse_datetime(value):
 
 
 def main():
+    t = time.perf_counter()
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -61,7 +66,11 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    print(f"Sorted {len(data)} records by order_number then purchase_datetime and saved to:\n{OUTPUT_FILE}")
+    elapsed = time.perf_counter() - t
+    print(f"  Sorted {len(data)} records  ({elapsed:.2f}s)")
+    RL.log("sortJSONByOrderNumber",
+        f"{RL.ts()}  sorted {len(data)} records in {elapsed:.2f}s  →  {OUTPUT_FILE}"
+    )
 
 
 if __name__ == "__main__":

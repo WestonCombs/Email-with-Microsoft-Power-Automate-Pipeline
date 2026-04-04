@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 
+# MSAL delegated token cache (do not commit)
+.graph_token_cache.bin
+
 # Python
 __pycache__/
 *.py[cod]
