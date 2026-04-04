@@ -257,12 +257,12 @@ def href_final_pairs(hrefs: list[str]) -> list[tuple[str, str]]:
     return [(h, resolve_final_url(h)) for h in hrefs]
 
 
-def pick_tracking_link_from_pairs(
+def list_tracking_links_from_pairs(
     pairs: list[tuple[str, str]],
-) -> str | None:
-    """Same as :func:`pick_tracking_link`, but uses pre-resolved ``(href, final)`` pairs (one HTTP pass)."""
+) -> list[str]:
+    """Distinct tracking destinations from pre-resolved ``(href, final)`` pairs (UTM-normalized dedupe)."""
     if not pairs:
-        return None
+        return []
 
     seen_final: set[str] = set()
     finals_unique: list[str] = []
@@ -285,7 +285,15 @@ def pick_tracking_link_from_pairs(
             seen_norm.add(norm)
             tracking_finals.append(final)
 
-    result: str | None
+    _dbg(f"list_tracking_links: {len(tracking_finals)} distinct tracking URL(s)")
+    return tracking_finals
+
+
+def pick_tracking_link_from_pairs(
+    pairs: list[tuple[str, str]],
+) -> str | None:
+    """Same as :func:`pick_tracking_link`, but uses pre-resolved ``(href, final)`` pairs (one HTTP pass)."""
+    tracking_finals = list_tracking_links_from_pairs(pairs)
     if len(tracking_finals) == 0:
         result = None
     elif len(tracking_finals) == 1:

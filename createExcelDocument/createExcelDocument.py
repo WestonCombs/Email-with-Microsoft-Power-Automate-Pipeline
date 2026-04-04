@@ -5,7 +5,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+_PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
+if str(_PYTHON_FILES_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_FILES_DIR))
+
 from dotenv import load_dotenv
+from htmlHandler.tracking_hrefs import MULTIPLE_TRACKING_LINKS
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -52,7 +57,7 @@ COLUMN_HEADERS = {
     "total_amount_paid":     "Total Paid",
     "tax_paid":              "Tax Paid",
     "tracking_number":       "Tracking Number",
-    "tracking_link":         "Tracking Link",
+    "tracking_link":         "Tracking Link (Unstable)",
     "duplicate_on_last_run": "Duplicate On Last Run",
     "source_file_link":      "View Email",
 }
@@ -162,7 +167,7 @@ def set_column_widths(ws, column_keys: list[str]):
         "total_amount_paid":     14,
         "tax_paid":              12,
         "tracking_number":       28,
-        "tracking_link":         40,
+        "tracking_link":         44,
         "duplicate_on_last_run": 24,
         "source_file_link":      14,
     }
@@ -188,6 +193,62 @@ def apply_hyperlink_columns(ws, col_indices: list[int], start_row: int):
                 cell.hyperlink = uri
                 cell.font = HYPERLINK_FONT
                 cell.alignment = CENTER_ALIGN
+
+
+def _tracking_urls_for_record(record: dict) -> list[str]:
+    """Prefer ``tracking_links``; fall back to legacy ``tracking_link`` string."""
+    raw = record.get("tracking_links")
+    if isinstance(raw, list) and raw:
+        return [str(u).strip() for u in raw if isinstance(u, str) and str(u).strip()]
+    tl = clean_value(record.get("tracking_link"))
+    if not isinstance(tl, str) or not tl.strip():
+        return []
+    s = tl.strip()
+    if s == MULTIPLE_TRACKING_LINKS:
+        return []
+    low = s.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return [s]
+    return []
+
+
+def _escape_excel_hyperlink_url(url: str) -> str:
+    """Double embedded double-quotes for use inside Excel HYPERLINK("...")."""
+    return (url or "").replace('"', '""')
+
+
+def apply_tracking_link_column(
+    ws,
+    column_keys: list[str],
+    records: list[dict],
+    start_row: int,
+):
+    """Show tracking URLs as ``tracking1``, ``tracking2``, … (clickable)."""
+    cols = _col_indices(column_keys, "tracking_link")
+    if not cols or not records:
+        return
+    col_idx = cols[0]
+
+    for i, record in enumerate(records):
+        row_idx = start_row + i
+        cell = ws.cell(row=row_idx, column=col_idx)
+        urls = _tracking_urls_for_record(record)
+        cell.hyperlink = None
+        if not urls:
+            continue
+        if len(urls) == 1:
+            cell.value = "tracking1"
+            cell.hyperlink = urls[0]
+            cell.font = HYPERLINK_FONT
+            cell.alignment = LEFT_ALIGN
+            continue
+        parts: list[str] = []
+        for j, u in enumerate(urls, 1):
+            esc = _escape_excel_hyperlink_url(u)
+            parts.append(f'HYPERLINK("{esc}","tracking{j}")')
+        cell.value = "=" + ' & ", " & '.join(parts)
+        cell.font = CELL_FONT
+        cell.alignment = LEFT_ALIGN
 
 
 def _merge_border(cell, top=None, bottom=None, left=None, right=None):
@@ -298,6 +359,7 @@ def build_workbook(records: list[dict]) -> Workbook:
     apply_order_group_borders(ws, records, start_row=2)
 
     apply_hyperlink_columns(ws, link_cols, start_row=2)
+    apply_tracking_link_column(ws, column_keys, records, start_row=2)
 
     ws.freeze_panes = "B2"
     return wb
@@ -345,6 +407,7 @@ def append_to_workbook(path: str, records: list[dict]):
     apply_order_group_borders(ws, records, start_row=next_row)
 
     apply_hyperlink_columns(ws, link_cols, start_row=next_row)
+    apply_tracking_link_column(ws, desired_keys, records, start_row=next_row)
 
     ws.freeze_panes = "B2"
 

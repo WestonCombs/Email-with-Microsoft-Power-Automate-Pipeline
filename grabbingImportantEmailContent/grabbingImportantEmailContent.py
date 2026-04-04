@@ -29,11 +29,10 @@ import time as _time
 
 import runLogger as RL
 from htmlHandler.tracking_hrefs import (
-    MULTIPLE_TRACKING_LINKS,
     extract_hrefs_from_html,
     href_final_pairs,
+    list_tracking_links_from_pairs,
     normalize_href_for_http_fetch,
-    pick_tracking_link_from_pairs,
     url_classifies_as_tracking,
 )
 
@@ -120,7 +119,7 @@ def _write_tracking_log(
     sender_name: str | None,
     sender_email: str | None,
     href_pairs: list[tuple[str, str]],
-    pick_result: str | None,
+    tracking_links: list[str],
 ) -> None:
     """Write per-email href/tracking section to logs/tracking_hrefs.txt (accumulates)."""
     redirected = sum(1 for h, f in href_pairs if h.strip() != f.strip())
@@ -142,12 +141,14 @@ def _write_tracking_log(
         for i, (href, final) in enumerate(href_pairs, 1):
             verdict = "TRACKING    " if url_classifies_as_tracking(final) else "not-tracking"
             lines.append(f"  {i:3}. [{verdict}]  {final}")
-    if pick_result is None:
+    if not tracking_links:
         lines.append("\n  pick_tracking_link: none found")
-    elif pick_result == MULTIPLE_TRACKING_LINKS:
-        lines.append(f'\n  pick_tracking_link: "{MULTIPLE_TRACKING_LINKS}"')
+    elif len(tracking_links) == 1:
+        lines.append(f"\n  pick_tracking_link: {tracking_links[0]}")
     else:
-        lines.append(f"\n  pick_tracking_link: {pick_result}")
+        lines.append(f"\n  pick_tracking_link: {len(tracking_links)} distinct tracking URLs:")
+        for i, u in enumerate(tracking_links, 1):
+            lines.append(f"    {i}. {u}")
     lines.append("")
     RL.log("tracking_hrefs", "\n".join(lines))
 
@@ -877,24 +878,26 @@ def process_file(
         t = _time.perf_counter()
         print("  » Resolving redirects & classifying tracking links...", end=" ", flush=True)
         href_pairs = href_final_pairs(extracted_hrefs)
-        tracking_link = pick_tracking_link_from_pairs(href_pairs)
+        tracking_links = list_tracking_links_from_pairs(href_pairs)
+        # Primary URL for legacy single-field consumers; full list is ``tracking_links``.
+        tracking_link = tracking_links[0] if tracking_links else None
         redirected = sum(1 for h, f in href_pairs if h.strip() != f.strip())
         tracking_cands = sum(1 for _, f in href_pairs if url_classifies_as_tracking(f))
         timings["step4_s"] = round(_time.perf_counter() - t, 3)
         timings["hrefs_redirected"] = redirected
         timings["tracking_candidates"] = tracking_cands
+        n_track = len(tracking_links)
         timings["tracking_result"] = (
-            "none" if tracking_link is None
-            else ("multiple" if tracking_link == MULTIPLE_TRACKING_LINKS else "single")
+            "none" if n_track == 0 else ("multiple" if n_track > 1 else "single")
         )
         ts_label = (
-            "none found" if tracking_link is None
-            else ("multiple found" if tracking_link == MULTIPLE_TRACKING_LINKS else "1 link found")
+            "none found" if n_track == 0
+            else (f"{n_track} tracking links" if n_track > 1 else "1 link found")
         )
         print(f"done  ({timings['step4_s']:.2f}s, {redirected} redirected, {ts_label})")
-        _write_tracking_log(file_path.name, subject, sender_name, email, href_pairs, tracking_link)
+        _write_tracking_log(file_path.name, subject, sender_name, email, href_pairs, tracking_links)
         RL.debug("grabbingImportantEmailContent",
-            f"  [step4] tracking: candidates={tracking_cands}, result={tracking_link!r}"
+            f"  [step4] tracking: candidates={tracking_cands}, count={n_track}, links={tracking_links!r}"
         )
 
         # ── STEP 5: OpenAI extraction ────────────────────────────
@@ -986,7 +989,7 @@ def process_file(
             f"  [final] category={final_category}, confidence={raw_confidence}, "
             f"company={extracted.get('company')!r}, order={extracted.get('order_number')!r}, "
             f"amount={extracted.get('total_amount_paid')!r}, "
-            f"tracking_link={tracking_link!r}\n"
+            f"tracking_links={tracking_links!r}\n"
         )
 
         record: dict = {
@@ -1002,6 +1005,7 @@ def process_file(
             "tax_paid": extracted.get("tax_paid"),
             "tracking_number": clean_text(extracted.get("tracking_number")),
             "tracking_link": tracking_link,
+            "tracking_links": tracking_links,
             "extracted_links": extracted_hrefs,
             "email_category": final_category,
             "email_category_confidence": raw_confidence,
@@ -1030,6 +1034,7 @@ def process_file(
             "tax_paid": None,
             "tracking_number": None,
             "tracking_link": None,
+            "tracking_links": [],
             "extracted_links": extracted_hrefs,
             "email_category": "Unknown",
             "email_category_confidence": 0,
