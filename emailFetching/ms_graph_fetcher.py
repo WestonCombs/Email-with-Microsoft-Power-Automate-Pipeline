@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import sys
 import urllib.error
@@ -15,6 +16,12 @@ import msal
 from .emailFetcher import EmailMessage, save_attachments
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
+# Silent MSAL refresh can block indefinitely; cap it so stale/expired sessions fail fast.
+SILENT_AUTH_TIMEOUT_S = 30.0
+# JSON list/detail calls — keep attachment downloads separate (can be large).
+GRAPH_JSON_TIMEOUT_S = 30.0
+# MSAL uses requests for authority/instance discovery; default timeout=None can hang forever.
+MSAL_HTTP_TIMEOUT_S = 30.0
 
 
 def _graph_get(url: str, access_token: str) -> dict:
@@ -27,11 +34,17 @@ def _graph_get(url: str, access_token: str) -> dict:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=GRAPH_JSON_TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Graph HTTP {e.code} for {url}: {detail}") from e
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise RuntimeError(
+                f"Graph request timed out after {GRAPH_JSON_TIMEOUT_S:.0f}s: {url}"
+            ) from e
+        raise
     if not raw:
         return {}
     return json.loads(raw.decode("utf-8"))
@@ -70,13 +83,44 @@ def _acquire_token(
         client_id,
         authority=authority,
         token_cache=cache,
+        timeout=MSAL_HTTP_TIMEOUT_S,
     )
     scopes = ["Mail.Read"]
 
     if not force_interactive:
         accounts = app.get_accounts()
         if accounts:
-            result = app.acquire_token_silent(scopes, account=accounts[0])
+            result: dict | None
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                fut = executor.submit(
+                    app.acquire_token_silent, scopes, account=accounts[0]
+                )
+                result = fut.result(timeout=SILENT_AUTH_TIMEOUT_S)
+            except concurrent.futures.TimeoutError:
+                print(
+                    f"WARNING: Silent Microsoft login/token refresh took longer than "
+                    f"{SILENT_AUTH_TIMEOUT_S:.0f}s (often expired or stuck credentials). "
+                    f"Removing {cache_path} so the next sign-in can rebuild the cache.\n"
+                    "Opening interactive or device-code sign-in …",
+                    file=sys.stderr,
+                )
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                cache = msal.SerializableTokenCache()
+                app = msal.PublicClientApplication(
+                    client_id,
+                    authority=authority,
+                    token_cache=cache,
+                    timeout=MSAL_HTTP_TIMEOUT_S,
+                )
+                result = None
+            finally:
+                # Do not wait for a stuck acquire_token_silent worker (with-block would).
+                executor.shutdown(wait=False)
+
             if result and result.get("access_token"):
                 if cache.has_state_changed:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,7 +331,6 @@ def fetch_emails(
         f"&$top=50"
     )
     summaries = _graph_get_all_pages(list_url, token)
-    print(f"  Found {len(summaries)} email(s) in '{mail_folder}'")
 
     messages: list[EmailMessage] = []
     for summary in summaries:

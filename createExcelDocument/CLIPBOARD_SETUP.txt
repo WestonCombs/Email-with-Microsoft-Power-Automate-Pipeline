@@ -1,0 +1,100 @@
+Copy Path -> clipboard (automated on Windows)
+=============================================
+
+Minimal test workbook
+----------------------
+
+To verify VBA + ini + Python without the full orders sheet, run (from python_files):
+
+  python createExcelDocument/create_clipboard_test_xlsm.py
+
+That writes `email_contents/clipboard_test.xlsm`. Copy Path uses an in-workbook `#` link
+so Excel does not open a file; the real `file:///…` URI is in hidden column **AB** (28).
+Enable macros, click the blue **Copy Path** in B2; the clipboard should hold the ini’s
+Windows path (decoded), and Notepad should not open.
+
+What runs automatically
+-----------------------
+
+On **Windows**, when you run createExcelDocument (or the full pipeline):
+
+1. If `orders_template.xlsm` is missing, the script tries to **create it** using Excel
+   in the background (COM automation). Default location:
+
+     <python_files>/orders_template.xlsm
+
+   (Override with `EXCEL_TEMPLATE_PATH` in `.env` if needed.)
+
+2. Each run writes **`excel_clipboard_launch.ini`** under **python_files** by default:
+
+     <python_files>/excel_clipboard_launch.ini
+
+   It lists `python.exe` and `copy_email_path_to_clipboard.py`. The workbook stores the
+   **full path** to that ini in hidden cell **AA1**, so the macro finds it even though
+   `orders.xlsm` lives under `email_contents`.
+
+   Override with `EXCEL_CLIPBOARD_INI_PATH` in `.env`.
+
+3. The workbook is saved as **`orders.xlsm`** (under `email_contents` by default) when
+   the template exists. Copy Path cells use **in-workbook `#` hyperlinks** only; the real
+   `file:///…` path is in hidden column **AB** (28).
+
+You do **not** need to paste VBA by hand for normal use.
+
+Requirements for auto-build
+---------------------------
+
+- **Microsoft Excel** (desktop) installed.
+- **`pip install -r requirements.txt`** so **pywin32** is installed on Windows.
+- The script briefly sets registry **AccessVBOM=1** (Trust access to the VBA project
+  object model) while creating the template, then restores your previous setting.
+
+If auto-build fails (Excel missing, COM error, Group Policy blocks VBOM), the script
+still writes **`orders.xlsx`**. See "Manual fallback" below.
+
+Clipboard helper
+----------------
+
+Install **pyperclip** (included in `requirements.txt`):
+
+  pip install pyperclip
+
+Trust macros when you open `orders.xlsm` the first time (or use a Trusted Location).
+
+Updating the embedded macro after a code change
+------------------------------------------------
+
+The VBA lives inside `orders_template.xlsm`. After pulling a fix, delete
+`python_files/orders_template.xlsm` once and run createExcelDocument so Excel
+automation rebuilds it from `macro_template.py` (or paste the latest `THISWORKBOOK_VBA`
+into ThisWorkbook).
+
+Manual fallback (only if automation failed)
+--------------------------------------------
+
+1. Create `orders_template.xlsm` in Excel (macro-enabled), sheet named **Orders**.
+2. Alt+F11 -> **ThisWorkbook** -> paste the VBA from `macro_template.py` constant
+   `THISWORKBOOK_VBA` (or copy from an older backup).
+3. Save as `<python_files>/orders_template.xlsm` (or your `EXCEL_TEMPLATE_PATH`).
+4. Run createExcelDocument again.
+
+Optional .env
+-------------
+
+  EXCEL_TEMPLATE_PATH=C:\full\path\to\orders_template.xlsm
+  EXCEL_CLIPBOARD_INI_PATH=C:\full\path\to\excel_clipboard_launch.ini
+  EXCEL_OUTPUT_PATH=C:\full\path\to\orders.xlsm
+
+One-off: rebuild template only
+-------------------------------
+
+  python createExcelDocument/macro_template.py
+
+(Loads `.env`; default template path is `python_files/orders_template.xlsm`.)
+
+Moving from email_contents
+--------------------------
+
+If you still have `email_contents/orders_template.xlsm` or
+`email_contents/excel_clipboard_launch.ini`, you can delete them after the new defaults
+are in place; the next run recreates them under **python_files** (or your `.env` paths).

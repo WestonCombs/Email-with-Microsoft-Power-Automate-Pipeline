@@ -9,7 +9,7 @@ import re
 
 from bs4 import BeautifulSoup
 
-from htmlHandler.admin_log import trace
+import runLogger as RL
 
 _SRC = "convertHTMLToPlaintext"
 _OPENAI_MAX_CHARS_ENV = "openai_max_chars_per_prompting"
@@ -81,15 +81,15 @@ def convert(html: str, max_chars: int | None = None) -> str:
     """
     if max_chars is None:
         max_chars = _max_chars_from_env()
-    trace(_SRC, f"convert() called — raw HTML len={len(html):,} chars")
+    RL.trace(_SRC, f"convert() called — raw HTML len={len(html):,} chars")
 
     soup = BeautifulSoup(html, "html.parser")
 
     hidden_count = _remove_hidden_elements(soup)
-    trace(_SRC, f"removed {hidden_count} hidden elements")
+    RL.trace(_SRC, f"removed {hidden_count} hidden elements")
 
     table_count = _convert_tables_to_markdown(soup)
-    trace(_SRC, f"converted {table_count} data tables to markdown")
+    RL.trace(_SRC, f"converted {table_count} data tables to markdown")
 
     for tag in soup(["script", "style", "noscript", "svg", "meta", "head"]):
         tag.decompose()
@@ -103,7 +103,7 @@ def convert(html: str, max_chars: int | None = None) -> str:
     if was_truncated:
         cleaned = cleaned[:max_chars]
 
-    trace(
+    RL.trace(
         _SRC,
         f"convert() result — plain text len={len(cleaned):,} chars, "
         f"lines={len(cleaned.splitlines())}, truncated={was_truncated}",

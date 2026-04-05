@@ -23,7 +23,6 @@ load_dotenv(_PYTHON_FILES_DIR / ".env")
 
 from openai import OpenAI, RateLimitError
 
-from htmlHandler.admin_log import trace as _trace
 from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
 import time as _time
 
@@ -103,7 +102,7 @@ EXIT_BAD_ARGS = 2
 
 client = OpenAI(api_key=API_KEY)
 
-OPENAI_USAGE_REL = Path("email_contents") / "openai usage"
+OPENAI_USAGE_REL = Path("logs") / "openai usage"
 
 # gpt-4o-mini pricing (per token)
 _COST_PER_INPUT_TOKEN = 0.15 / 1_000_000   # $0.15 per 1M input tokens
@@ -1239,7 +1238,7 @@ def _known_hashes(results: list[dict]) -> set[str]:
 def main(flow_started_at: datetime | None = None):
     args = parse_args()
 
-    _trace(
+    RL.trace(
         "MAIN",
         f"main() called — base_dir={os.getenv(BASE_DIR_ENV)!r}, file={args.file!r}, "
         f"subject={args.subject!r}, sender_name={args.sender_name!r}, "
@@ -1399,21 +1398,6 @@ def main(flow_started_at: datetime | None = None):
     print(f"\n  Done. {new_count} new + {len(results) - new_count} existing = {len(results)} total records → {output_path}")
 
 
-class _Tee:
-    """Writes to both an original stream and a log file simultaneously."""
-    def __init__(self, log_path: Path, original_stream):
-        self._file = open(log_path, "a", encoding="utf-8")
-        self._original = original_stream
-    def write(self, msg):
-        self._original.write(msg)
-        self._file.write(msg.replace("\ufeff", "") if isinstance(msg, str) else msg)
-    def flush(self):
-        self._original.flush()
-        self._file.flush()
-    def close(self):
-        self._file.close()
-
-
 if __name__ == "__main__":
     strip_bom_from_argv(sys.argv)
 
@@ -1424,10 +1408,6 @@ if __name__ == "__main__":
             file=sys.stderr,
         )
         sys.exit(1)
-    _log_path = Path(_base_for_log).expanduser().resolve() / "programFileOutput.txt"
-    _tee = _Tee(_log_path, sys.stdout)
-    sys.stdout = _tee
-    sys.stderr = _Tee(_log_path, sys.stderr)
 
     _start_time = time.time()
     _flow_started_at = datetime.now()
@@ -1436,9 +1416,6 @@ if __name__ == "__main__":
     print(f"Run started: {_flow_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Args: {sys.argv[1:]}")
     print(f"{'='*60}")
-
-    _original_stdout = _tee._original
-    _original_stderr = sys.stderr._original
 
     try:
         main(flow_started_at=_flow_started_at)
@@ -1451,19 +1428,9 @@ if __name__ == "__main__":
             print("\nERROR: Invalid or missing arguments.")
             print("Set BASE_DIR and OPENAI_API_KEY in python_files/.env.")
             print("Optional args: --file, --subject, --sender-name, --email")
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
         sys.exit(e.code)
     except Exception as e:
         _elapsed = time.time() - _start_time
         print(f"\nERROR: {e}")
         print(f"Total operation time: {_elapsed:.2f}s")
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
         sys.exit(1)
-
-    sys.stdout = _original_stdout
-    sys.stderr = _original_stderr
-    _tee.close()

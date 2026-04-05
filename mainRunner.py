@@ -174,26 +174,7 @@ import runLogger as RL
 from emailFetching.emailFetcher import fetch_emails
 
 BASE_DIR_ENV = "BASE_DIR"
-OPENAI_USAGE_REL = Path("email_contents") / "openai usage"
-
-
-class _Tee:
-    """Writes to both an original stream and a log file simultaneously."""
-
-    def __init__(self, log_path: Path, original_stream):
-        self._file = open(log_path, "a", encoding="utf-8")
-        self._original = original_stream
-
-    def write(self, msg):
-        self._original.write(msg)
-        self._file.write(msg.replace("\ufeff", "") if isinstance(msg, str) else msg)
-
-    def flush(self):
-        self._original.flush()
-        self._file.flush()
-
-    def close(self):
-        self._file.close()
+OPENAI_USAGE_REL = Path("logs") / "openai usage"
 
 
 # ──────────────────────────────────────────────
@@ -283,12 +264,12 @@ def _rebuild_email_html_archive_folder(html_dir: Path) -> None:
 
 
 # ──────────────────────────────────────────────
-# Step runners (each invokes its script as a subprocess so their own
-# _Tee / sys.path setup works identically to standalone execution)
+# Step runners (each invokes its script as a subprocess so cwd and __main__
+# match standalone execution)
 # ──────────────────────────────────────────────
 def run_environment_init() -> float:
     """Returns elapsed seconds."""
-    script = _PYTHON_FILES_DIR / "EnvironmentInitialization" / "runner.py"
+    script = _PYTHON_FILES_DIR / "environmentInitialization" / "runner.py"
     print("[Step 1] Environment initialization ...")
     t = time.perf_counter()
     result = subprocess.run([sys.executable, str(script)], cwd=str(script.parent))
@@ -623,30 +604,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    _base_for_log = os.getenv(BASE_DIR_ENV)
-
-    if _base_for_log:
-        _log_path = Path(_base_for_log).expanduser().resolve() / "programFileOutput.txt"
-        _log_path.parent.mkdir(parents=True, exist_ok=True)
-        _tee = _Tee(_log_path, sys.stdout)
-        sys.stdout = _tee
-        sys.stderr = _Tee(_log_path, sys.stderr)
-        _original_stdout = _tee._original
-        _original_stderr = sys.stderr._original
-
-        try:
-            main()
-        except Exception as e:
-            print(f"\nFATAL ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.stdout = _original_stdout
-            sys.stderr = _original_stderr
-            _tee.close()
-            sys.exit(1)
-
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
-    else:
+    try:
         main()
+    except Exception as e:
+        print(f"\nFATAL ERROR: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

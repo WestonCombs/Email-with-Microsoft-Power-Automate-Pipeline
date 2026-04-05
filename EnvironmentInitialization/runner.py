@@ -23,13 +23,11 @@ def _run_verifications(root: Path) -> None:
     folder_verification(root, "email_contents/pdf")
     folder_verification(root, "email_contents/html")
     folder_verification(root, "email_contents/json")
-    folder_verification(root, "email_contents/openai usage")
-    folder_verification(root, "adminLog")
+    folder_verification(root, "logs/openai usage")
 
     # Files: parent dirs are created automatically; use overwrite=True only if you must truncate
     # file_verification(root, "email_contents/pdf/file1.html")
     # file_verification(root, "email_contents/json/results.json")
-    # file_verification(root, "programFileOutput.txt")
 
 
 def main() -> int:
@@ -55,12 +53,12 @@ def main() -> int:
         _run_verifications(root)
     except (OSError, ValueError, NotADirectoryError, IsADirectoryError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        RL.log("EnvironmentInitialization", f"{RL.ts()}  ERROR: {e}")
+        RL.log("environmentInitialization", f"{RL.ts()}  ERROR: {e}")
         return 1
 
     elapsed = time.perf_counter() - t
     print(f"  Environment checks OK  ({elapsed:.2f}s)")
-    RL.log("EnvironmentInitialization",
+    RL.log("environmentInitialization",
         f"{RL.ts()}  BASE_DIR={root}  checks OK  ({elapsed:.2f}s)"
     )
     return 0

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import re
@@ -23,29 +24,84 @@ if not _base_dir_raw:
 
 PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
 JSON_PATH  = str(PROJECT_ROOT / "email_contents" / "json" / "results.json")
-EXCEL_PATH = str(PROJECT_ROOT / "email_contents" / "orders.xlsx")
-LOG_PATH   = PROJECT_ROOT / "programFileOutput.txt"
 
-# Column layout is split into three logical sections.
-# "source_file_link" appears at the end of each section as a "View Email" hyperlink.
-# A hairline vertical border is drawn after each section boundary.
+# Hidden on Orders; VBA reads this before ThisWorkbook.Path (works if Path is empty).
+CLIPBOARD_INI_CELL = "AA1"
+# Hidden: plain-text file:/// URI per row. Copy Path cells use internal # links only
+# (Excel hyperlink events cannot cancel file:// navigation).
+COPY_PATH_URI_COL = 28  # column AB — keep equal to COL_FILE_URI in macro_template.py
+
+# Optional .env overrides (absolute or relative paths expand from user / cwd).
+def _optional_path(env_name: str, default: Path) -> Path:
+    raw = os.getenv(env_name)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return default
+
+
+ORDERS_TEMPLATE_PATH = _optional_path(
+    "EXCEL_TEMPLATE_PATH", _PYTHON_FILES_DIR / "orders_template.xlsm"
+)
+# VBA reads absolute path from cell AA1; ini can live outside email_contents.
+CLIPBOARD_LAUNCH_INI_PATH = _optional_path(
+    "EXCEL_CLIPBOARD_INI_PATH", _PYTHON_FILES_DIR / "excel_clipboard_launch.ini"
+)
+EXCEL_PATH = str(
+    _optional_path("EXCEL_OUTPUT_PATH", PROJECT_ROOT / "email_contents" / "orders.xlsx")
+)
+
+
+def _resolve_excel_output_path(using_template: bool) -> str:
+    """Use .xlsx unless we loaded a real .xlsm template (VBA). Plain openpyxl .xlsm saves break Excel."""
+    p = Path(EXCEL_PATH)
+    if using_template:
+        if p.suffix.lower() != ".xlsm":
+            out = str(p.with_suffix(".xlsm"))
+            print(
+                f"Note: Macro template in use - saving to '{out}' (.xlsm) instead of '{p.name}'."
+            )
+            return out
+        return str(p)
+    if p.suffix.lower() == ".xlsm":
+        out = str(p.with_suffix(".xlsx"))
+        print(
+            f"Note: No orders_template.xlsm — saving to '{out}' (.xlsx). "
+            "Saving plain openpyxl output as .xlsm is invalid and Excel will not open it."
+        )
+        return out
+    return str(p)
+
+
+def _macro_template_module():
+    """Load sibling macro_template.py without treating this folder as a package."""
+    mpath = Path(__file__).resolve().parent / "macro_template.py"
+    spec = importlib.util.spec_from_file_location("_email_sorter_macro_template", mpath)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load macro helper: {mpath}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Column layout: order identity, then Copy Path + View Email (adjacent, right after Email),
+# then financials and shipping. Copy Path uses in-sheet # links; hidden column AB holds the
+# file URI for VBA. View Email is the file "Open" hyperlink.
+# Hairline vertical borders after View Email and after Tax Paid (section breaks).
+SECTION_BOUNDARY_KEYS = ("source_file_link", "tax_paid")
+
 COLUMN_ORDER = [
-    # ── Section 1: order identity ──
     "email_category",
     "order_number",
     "purchase_datetime",
     "company",
     "email",
-    "source_file_link",      # View Email (1) — section boundary
-    # ── Section 2: financials ──
+    "copy_file_path",
+    "source_file_link",
     "total_amount_paid",
     "tax_paid",
-    "source_file_link",      # View Email (2) — section boundary
-    # ── Section 3: shipping / misc ──
     "tracking_number",
     "tracking_link",
     "duplicate_on_last_run",
-    "source_file_link",      # View Email (3)
 ]
 
 COLUMN_HEADERS = {
@@ -59,6 +115,7 @@ COLUMN_HEADERS = {
     "tracking_number":       "Tracking Number",
     "tracking_link":         "Tracking Link (Unstable)",
     "duplicate_on_last_run": "Duplicate On Last Run",
+    "copy_file_path":        "Copy Path",
     "source_file_link":      "View Email",
 }
 
@@ -144,6 +201,8 @@ def _record_to_row(record: dict, column_keys: list[str]) -> list:
     for key in column_keys:
         if key == "company":
             row.append(get_company_value(record))
+        elif key == "copy_file_path":
+            row.append(clean_value(record.get("source_file_link")))
         else:
             row.append(clean_value(record.get(key)))
     return row
@@ -169,6 +228,7 @@ def set_column_widths(ws, column_keys: list[str]):
         "tracking_number":       28,
         "tracking_link":         44,
         "duplicate_on_last_run": 24,
+        "copy_file_path":        12,
         "source_file_link":      14,
     }
     for col_idx, key in enumerate(column_keys, start=1):
@@ -182,7 +242,7 @@ def _col_indices(column_keys: list[str], key: str) -> list[int]:
 
 
 def apply_hyperlink_columns(ws, col_indices: list[int], start_row: int):
-    """Replace file URI values with clickable 'Open' hyperlinks in every View Email column."""
+    """Replace file URI values with clickable 'Open' hyperlinks (View Email / source column)."""
     for col_idx in col_indices:
         for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row,
                                 min_col=col_idx, max_col=col_idx):
@@ -193,6 +253,45 @@ def apply_hyperlink_columns(ws, col_indices: list[int], start_row: int):
                 cell.hyperlink = uri
                 cell.font = HYPERLINK_FONT
                 cell.alignment = CENTER_ALIGN
+
+
+def _sheet_name_for_excel_ref(name: str) -> str:
+    """Build sheet name token for #'Name'!$A$1 style hyperlinks."""
+    if "'" in name:
+        return "'" + name.replace("'", "''") + "'"
+    if " " in name or not name.replace("_", "").isalnum():
+        return "'" + name + "'"
+    return name
+
+
+def apply_copy_path_hyperlink_columns(
+    ws, col_indices: list[int], start_row: int, records: list[dict]
+):
+    """Copy Path: in-workbook # links only; real file URI in hidden column COPY_PATH_URI_COL."""
+    col_uri = COPY_PATH_URI_COL
+    sn = _sheet_name_for_excel_ref(ws.title)
+
+    for i, record in enumerate(records):
+        row_idx = start_row + i
+        uri = clean_value(record.get("source_file_link"))
+        if uri and isinstance(uri, str) and uri.startswith("file:///"):
+            ws.cell(row=row_idx, column=col_uri, value=uri)
+
+    ws.column_dimensions[get_column_letter(col_uri)].hidden = True
+
+    for col_idx in col_indices:
+        for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row,
+                                min_col=col_idx, max_col=col_idx):
+            cell = row[0]
+            row_num = cell.row
+            stored = ws.cell(row=row_num, column=col_uri).value
+            if not stored or not isinstance(stored, str) or not stored.startswith("file:///"):
+                continue
+            col_letter = get_column_letter(col_idx)
+            cell.value = "Copy Path"
+            cell.hyperlink = f"#{sn}!${col_letter}${row_num}"
+            cell.font = HYPERLINK_FONT
+            cell.alignment = CENTER_ALIGN
 
 
 def _tracking_urls_for_record(record: dict) -> list[str]:
@@ -301,7 +400,7 @@ def apply_row_borders(ws, start_row: int):
 
 
 def apply_section_dividers(ws, boundary_cols: list[int]):
-    """Draw a hairline right border on each section-boundary column (all rows)."""
+    """Draw a hairline right border on each listed column (all rows)."""
     for col_idx in boundary_cols:
         for row in ws.iter_rows(min_row=1, max_row=ws.max_row,
                                 min_col=col_idx, max_col=col_idx):
@@ -330,12 +429,18 @@ def apply_header_border(ws):
                       top=HAIR_SIDE, bottom=HAIR_SIDE)
 
 
-def build_workbook(records: list[dict]) -> Workbook:
+def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
+    """Rebuild the Orders sheet from scratch (headers + rows + styling + hyperlinks)."""
     column_keys, header_labels = _build_column_order()
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Orders"
+    if "Orders" in wb.sheetnames:
+        ws = wb["Orders"]
+    else:
+        ws = wb.active
+        ws.title = "Orders"
+
+    if ws.max_row >= 1:
+        ws.delete_rows(1, ws.max_row)
 
     ws.append(header_labels)
     style_header_row(ws, len(column_keys))
@@ -343,8 +448,11 @@ def build_workbook(records: list[dict]) -> Workbook:
     for record in records:
         ws.append(_record_to_row(record, column_keys))
 
-    link_cols = _col_indices(column_keys, "source_file_link")
-    section_boundary_cols = link_cols[:-1]
+    copy_cols = _col_indices(column_keys, "copy_file_path")
+    source_cols = _col_indices(column_keys, "source_file_link")
+    section_boundary_cols = [
+        idx for key in SECTION_BOUNDARY_KEYS for idx in _col_indices(column_keys, key)
+    ]
 
     apply_cell_styles(ws, start_row=2)
     set_column_widths(ws, column_keys)
@@ -358,15 +466,35 @@ def build_workbook(records: list[dict]) -> Workbook:
     apply_table_outline(ws)
     apply_order_group_borders(ws, records, start_row=2)
 
-    apply_hyperlink_columns(ws, link_cols, start_row=2)
+    apply_copy_path_hyperlink_columns(ws, copy_cols, start_row=2, records=records)
+    apply_hyperlink_columns(ws, source_cols, start_row=2)
     apply_tracking_link_column(ws, column_keys, records, start_row=2)
 
     ws.freeze_panes = "B2"
+
+
+def set_clipboard_ini_cell(wb: Workbook, ini_path: Path) -> None:
+    """Write absolute ini path for Workbook_SheetFollowHyperlink; hide column AA."""
+    ws = wb["Orders"]
+    ws[CLIPBOARD_INI_CELL] = str(ini_path.resolve())
+    ws.column_dimensions["AA"].hidden = True
+
+
+def build_workbook(records: list[dict]) -> Workbook:
+    wb = Workbook()
+    populate_orders_sheet(wb, records)
     return wb
 
 
+def _load_workbook_editable(path: str) -> Workbook:
+    """Preserve VBA when editing macro-enabled workbooks."""
+    if Path(path).suffix.lower() == ".xlsm":
+        return load_workbook(path, keep_vba=True)
+    return load_workbook(path)
+
+
 def append_to_workbook(path: str, records: list[dict]):
-    wb = load_workbook(path)
+    wb = _load_workbook_editable(path)
     ws = wb.active
 
     existing_headers = [
@@ -394,8 +522,11 @@ def append_to_workbook(path: str, records: list[dict]):
             cell.font = CELL_FONT
             cell.alignment = LEFT_ALIGN
 
-    link_cols = _col_indices(desired_keys, "source_file_link")
-    section_boundary_cols = link_cols[:-1]
+    copy_cols = _col_indices(desired_keys, "copy_file_path")
+    source_cols = _col_indices(desired_keys, "source_file_link")
+    section_boundary_cols = [
+        idx for key in SECTION_BOUNDARY_KEYS for idx in _col_indices(desired_keys, key)
+    ]
 
     category_col_idx = desired_keys.index("email_category") + 1
     apply_category_colors(ws, start_row=next_row, category_col=category_col_idx)
@@ -406,10 +537,20 @@ def append_to_workbook(path: str, records: list[dict]):
     apply_table_outline(ws)
     apply_order_group_borders(ws, records, start_row=next_row)
 
-    apply_hyperlink_columns(ws, link_cols, start_row=next_row)
+    apply_copy_path_hyperlink_columns(ws, copy_cols, start_row=next_row, records=records)
+    apply_hyperlink_columns(ws, source_cols, start_row=next_row)
     apply_tracking_link_column(ws, desired_keys, records, start_row=next_row)
 
     ws.freeze_panes = "B2"
+
+    if Path(path).suffix.lower() == ".xlsm" and "Orders" in wb.sheetnames:
+        macro_mod = _macro_template_module() if sys.platform == "win32" else None
+        if macro_mod is not None:
+            script_path = Path(__file__).resolve().parent / "copy_email_path_to_clipboard.py"
+            ini_written = macro_mod.write_clipboard_launch_ini(
+                CLIPBOARD_LAUNCH_INI_PATH, sys.executable, script_path
+            )
+            set_clipboard_ini_cell(wb, ini_written)
 
     wb.save(path)
     print(f"Appended {len(records)} row(s) to '{path}'.")
@@ -432,35 +573,43 @@ def reset_duplicate_flags(json_path: str):
 def main():
     records = load_json(JSON_PATH)
 
-    wb = build_workbook(records)
-    wb.save(EXCEL_PATH)
-    print(f"Created '{EXCEL_PATH}' with {len(records)} row(s).")
+    using_template = ORDERS_TEMPLATE_PATH.is_file()
+    macro_mod = None
+    if sys.platform == "win32":
+        macro_mod = _macro_template_module()
+    if not using_template and macro_mod is not None:
+        if macro_mod.ensure_macro_template(ORDERS_TEMPLATE_PATH):
+            using_template = ORDERS_TEMPLATE_PATH.is_file()
+
+    if using_template:
+        wb = load_workbook(str(ORDERS_TEMPLATE_PATH), keep_vba=True)
+        populate_orders_sheet(wb, records)
+    else:
+        wb = build_workbook(records)
+
+    out_path = _resolve_excel_output_path(using_template)
+    if using_template:
+        m = macro_mod if macro_mod is not None else _macro_template_module()
+        script_path = Path(__file__).resolve().parent / "copy_email_path_to_clipboard.py"
+        ini_written = m.write_clipboard_launch_ini(
+            CLIPBOARD_LAUNCH_INI_PATH, sys.executable, script_path
+        )
+        set_clipboard_ini_cell(wb, ini_written)
+        print(f"Wrote clipboard launcher config: {ini_written}")
+
+    wb.save(out_path)
+    print(f"Wrote '{out_path}' with {len(records)} row(s).")
+    if not using_template:
+        print(
+            "Note: No macro template - output is .xlsx; Copy Path cells open the file. "
+            "On Windows, install pywin32 + Excel so the program can auto-create "
+            f"'{ORDERS_TEMPLATE_PATH}', or add that file manually (CLIPBOARD_SETUP.txt)."
+        )
 
     reset_duplicate_flags(JSON_PATH)
 
 
-class _Tee:
-    """Writes to both an original stream and a log file simultaneously."""
-    def __init__(self, log_path: Path, original_stream):
-        self._file = open(log_path, "a", encoding="utf-8")
-        self._original = original_stream
-    def write(self, msg):
-        self._original.write(msg)
-        self._file.write(msg.replace("\ufeff", "") if isinstance(msg, str) else msg)
-    def flush(self):
-        self._original.flush()
-        self._file.flush()
-    def close(self):
-        self._file.close()
-
-
 if __name__ == "__main__":
-    _tee = _Tee(LOG_PATH, sys.stdout)
-    sys.stdout = _tee
-    sys.stderr = _Tee(LOG_PATH, sys.stderr)
-    _original_stdout = _tee._original
-    _original_stderr = sys.stderr._original
-
     print(f"\n{'='*60}")
     print(f"[createExcelDocument] Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
@@ -470,11 +619,4 @@ if __name__ == "__main__":
         print("Excel creation finished successfully.")
     except Exception as e:
         print(f"\nERROR: {e}")
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
         sys.exit(1)
-
-    sys.stdout = _original_stdout
-    sys.stderr = _original_stderr
-    _tee.close()

@@ -9,9 +9,10 @@
 __pycache__/
 *.py[cod]
 
+# Excel clipboard launcher (local python.exe paths)
+excel_clipboard_launch.ini
+
 # Logs may contain emails, paths, names, and order details
 run_log.txt
 trackingLinkConsoleOutput.txt
-adminLog/
-
-EnvironmentInitialization/console_log
+environmentInitialization/console_log

@@ -5,14 +5,16 @@ All logic lives here (regex scan, urllib redirects, domain/keyword heuristics).
 
 from __future__ import annotations
 
+import os
 import re
+import threading
 import urllib.error
 import urllib.request
-import os
-
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse, urljoin
 
-from htmlHandler.admin_log import trace
+import runLogger as RL
 
 _DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
 
@@ -22,7 +24,6 @@ def _dbg(msg: str) -> None:
     if not _DEBUG_MODE:
         return
     try:
-        import runLogger as RL
         RL.debug("tracking_hrefs", f"  {msg}")
     except Exception:
         pass
@@ -100,6 +101,19 @@ _NON_WEB_PREFIXES = (
     "about:",
 )
 
+# Process-wide: same href string reuses one redirect resolution across all emails in a run.
+_final_url_cache: dict[tuple[str, int, float], str] = {}
+_cache_lock = threading.Lock()
+
+
+def _href_resolve_max_workers() -> int:
+    raw = os.getenv("HREF_RESOLVE_MAX_WORKERS", "12").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        return 12
+    return max(1, min(n, 64))
+
 
 def normalize_href_for_http_fetch(href: str) -> tuple[str, bool]:
     """Return ``(url_for_requests, should_fetch)``.
@@ -169,7 +183,7 @@ def _http_status_and_location(
 def extract_hrefs_from_html(html: str) -> list[str]:
     """Return unique ``href`` values from raw HTML (double- or single-quoted)."""
     raw_occurrences = html.lower().count("href=")
-    trace(
+    RL.trace(
         _SRC,
         f"extract_hrefs_from_html() — html len={len(html):,}, raw 'href=' count={raw_occurrences}",
     )
@@ -180,7 +194,7 @@ def extract_hrefs_from_html(html: str) -> list[str]:
         if value and value not in seen:
             seen.add(value)
             out.append(value)
-    trace(_SRC, f"extract_hrefs_from_html() — {len(out)} unique hrefs")
+    RL.trace(_SRC, f"extract_hrefs_from_html() — {len(out)} unique hrefs")
     return out
 
 
@@ -235,26 +249,80 @@ def resolve_final_url(
     return current
 
 
+def resolve_final_url_cached(
+    url: str,
+    *,
+    max_hops: int = 15,
+    timeout: float = 12.0,
+) -> str:
+    """Like :func:`resolve_final_url`, but memoized per process for identical inputs.
+
+    Reused across emails so repeated marketing/tracking URLs are not resolved twice.
+    Thread-safe for parallel resolvers.
+    """
+    key = ((url or "").strip(), max_hops, timeout)
+    with _cache_lock:
+        hit = _final_url_cache.get(key)
+    if hit is not None:
+        return hit
+    resolved = resolve_final_url(url, max_hops=max_hops, timeout=timeout)
+    with _cache_lock:
+        _final_url_cache[key] = resolved
+    return resolved
+
+
+def _href_to_final_pair(
+    href: str,
+    *,
+    max_hops: int,
+    timeout: float,
+) -> tuple[str, str]:
+    return href, resolve_final_url_cached(href, max_hops=max_hops, timeout=timeout)
+
+
 def unique_final_urls(
     urls: list[str],
     *,
+    max_workers: int | None = None,
     max_hops: int = 15,
     timeout: float = 12.0,
 ) -> list[str]:
     """Resolve each URL to its final destination; drop duplicate finals (first-seen order)."""
+    if not urls:
+        return []
+    workers = max_workers if max_workers is not None else _href_resolve_max_workers()
+    workers = min(workers, len(urls))
+    pair_fn = partial(_href_to_final_pair, max_hops=max_hops, timeout=timeout)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        finals = [f for _, f in ex.map(pair_fn, urls)]
     seen: set[str] = set()
     out: list[str] = []
-    for u in urls:
-        final = resolve_final_url(u, max_hops=max_hops, timeout=timeout)
+    for final in finals:
         if final not in seen:
             seen.add(final)
             out.append(final)
     return out
 
 
-def href_final_pairs(hrefs: list[str]) -> list[tuple[str, str]]:
-    """For each raw ``href``, the URL after the full redirect chain ``(href, final_url)``."""
-    return [(h, resolve_final_url(h)) for h in hrefs]
+def href_final_pairs(
+    hrefs: list[str],
+    *,
+    max_workers: int | None = None,
+    max_hops: int = 15,
+    timeout: float = 12.0,
+) -> list[tuple[str, str]]:
+    """For each raw ``href``, the URL after the full redirect chain ``(href, final_url)``.
+
+    Resolves distinct href strings in parallel (I/O bound). Results stay in the same order
+    as *hrefs*. Repeated URLs across the whole program reuse :func:`resolve_final_url_cached`.
+    """
+    if not hrefs:
+        return []
+    workers = max_workers if max_workers is not None else _href_resolve_max_workers()
+    workers = min(workers, len(hrefs))
+    pair_fn = partial(_href_to_final_pair, max_hops=max_hops, timeout=timeout)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(pair_fn, hrefs))
 
 
 def list_tracking_links_from_pairs(

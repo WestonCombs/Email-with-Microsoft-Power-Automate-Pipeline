@@ -11,7 +11,7 @@ Fetches shopping emails via **Microsoft Graph** (OAuth 2.0), extracts structured
 pip install -r requirements.txt
 ```
 
-(or: `pip install beautifulsoup4 python-dotenv openpyxl openai msal`)
+(or: `pip install beautifulsoup4 python-dotenv openpyxl pyperclip openai msal`; on Windows add **`pywin32`** for automated Excel macros)
 
 ## Azure app registration (one-time)
 
@@ -69,17 +69,17 @@ This single command runs the full pipeline:
 2. **Email fetching** — signs in with Microsoft Graph (if needed), lists all messages in the configured folder, downloads bodies and file attachments to `BASE_DIR/email_contents/attachments` where applicable.
 3. **Extraction** — for each email, writes the HTML body to disk and runs the OpenAI extraction pipeline to produce structured JSON in `email_contents/json/results.json`.
 4. **Sort** — sorts `results.json` by order number and purchase date.
-5. **Excel export** — builds `email_contents/orders.xlsx` from the JSON and resets duplicate flags.
+5. **Excel export** — builds `email_contents/orders.xlsx` or `orders.xlsm` from the JSON. Macro template (`orders_template.xlsm`) and `excel_clipboard_launch.ini` default to **`python_files/`**; the workbook stores the ini’s full path so Copy Path works (see `createExcelDocument/CLIPBOARD_SETUP.txt`).
 
-An OpenAI usage log (`usageN.txt`) is created per run in `BASE_DIR/email_contents/openai usage/`. A summary with total tokens, cost, and average time per email is printed at the end.
+An OpenAI usage log (`usageN.txt`) is created per run in `BASE_DIR/logs/openai usage/`. A summary with total tokens, cost, and average time per email is printed at the end.
 
-Logs and admin traces go to paths under `BASE_DIR` (e.g. `programFileOutput.txt`, `adminLog/`).
+Logs and admin traces go under `BASE_DIR/logs/` (see `runLogger.py`) and `BASE_DIR/adminLog/` as applicable.
 
 ## Project layout
 
 - `mainRunner.py` — main entry point; orchestrates the full pipeline
 - `emailFetching/` — Microsoft Graph mail fetch (`ms_graph_fetcher.py`, shared models in `emailFetcher.py`)
-- `EnvironmentInitialization/` — folder/file verification for first run
+- `environmentInitialization/` — folder/file verification for first run
 - `grabbingImportantEmailContent/` — HTML → JSON (OpenAI)
 - `sortJSONByOrderNumber/` — sort `results.json`
 - `createExcelDocument/` — JSON → Excel
