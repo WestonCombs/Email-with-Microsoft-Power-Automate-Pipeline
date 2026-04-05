@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +14,8 @@ from pathlib import Path
 # python_files/ — .env must load before htmlHandler (trace uses BASE_DIR from .env)
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PYTHON_FILES_DIR))
+# Same folder as this script (sibling modules: isGiftCard, grabTrackingLinks, …)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dotenv import load_dotenv
 
@@ -20,16 +23,52 @@ load_dotenv(_PYTHON_FILES_DIR / ".env")
 
 from openai import OpenAI, RateLimitError
 
-from htmlHandler.admin_log import trace as _trace
 from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
-from htmlHandler.htmlValuesExtractionByAttribute.ValuesExtractionByAttribute import extract_attribute_values
-from htmlHandler.isHrefTrackingLink import determine_tracking_link
+import time as _time
+
+import runLogger as RL
+from htmlHandler.tracking_hrefs import (
+    extract_hrefs_from_html,
+    href_final_pairs,
+    list_tracking_links_from_pairs,
+    normalize_href_for_http_fetch,
+    url_classifies_as_tracking,
+)
 
 try:
     from xhtml2pdf import pisa
     _HAS_XHTML2PDF = True
 except ImportError:
     _HAS_XHTML2PDF = False
+
+from isGiftCard import UNKNOWN as IS_GIFT_CARD_UNKNOWN, is_gift_card, should_run_is_gift_card
+
+
+def _openai_fields_log_line(extracted: dict) -> str:
+    """Short field summary for logs (not full JSON / body text)."""
+    keys = (
+        "company",
+        "order_number",
+        "purchase_datetime",
+        "email_category",
+        "tracking_number",
+        "total_amount_paid",
+        "tax_paid",
+    )
+    parts: list[str] = []
+    for k in keys:
+        v = extracted.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        s = re.sub(r"\s+", " ", s)
+        if len(s) > 100:
+            s = s[:97] + "..."
+        parts.append(f"{k}={s!r}")
+    return "OpenAI — " + (", ".join(parts) if parts else "no structured fields")
+
 
 # =========================
 # CONFIG
@@ -47,6 +86,8 @@ VALID_CATEGORIES = [
     "Gift Card",
     "Unknown",
 ]
+# Categories the LLM returns directly (Gift Card is set only after the invoice refine call).
+LLM_EMAIL_CATEGORIES = frozenset({"Invoice", "Shipped", "Delivered", "Unknown"})
 CATEGORY_CONFIDENCE_THRESHOLD = 60
 
 RATE_LIMIT_RETRY_WAIT = 3
@@ -61,7 +102,7 @@ EXIT_BAD_ARGS = 2
 
 client = OpenAI(api_key=API_KEY)
 
-OPENAI_USAGE_REL = Path("email_contents") / "openai usage"
+OPENAI_USAGE_REL = Path("logs") / "openai usage"
 
 # gpt-4o-mini pricing (per token)
 _COST_PER_INPUT_TOKEN = 0.15 / 1_000_000   # $0.15 per 1M input tokens
@@ -69,6 +110,109 @@ _COST_PER_OUTPUT_TOKEN = 0.60 / 1_000_000  # $0.60 per 1M output tokens
 
 # Set once per process run when main() initializes the flow usage log (CLI entry).
 _flow_usage_log_path: Path | None = None
+
+
+def _write_tracking_log(
+    file_name: str,
+    subject: str | None,
+    sender_name: str | None,
+    sender_email: str | None,
+    href_pairs: list[tuple[str, str]],
+    tracking_links: list[str],
+) -> None:
+    """Write per-email href/tracking section to logs/tracking_hrefs.txt (accumulates)."""
+    redirected = sum(1 for h, f in href_pairs if h.strip() != f.strip())
+    tracking_count = sum(1 for _, f in href_pairs if url_classifies_as_tracking(f))
+    ts = RL.ts()
+
+    # Normal log: resolved finals with verdict
+    lines: list[str] = [
+        f"\n{'-' * 72}",
+        f"{ts}  |  {file_name}",
+        f'  subject: "{(subject or "")[:70]}"',
+        f"  sender:  {sender_name} <{sender_email}>",
+        f"  hrefs: {len(href_pairs)} unique  |  redirected: {redirected}  |  tracking candidates: {tracking_count}",
+        "",
+    ]
+    if not href_pairs:
+        lines.append("  (no hrefs extracted)")
+    else:
+        for i, (href, final) in enumerate(href_pairs, 1):
+            verdict = "TRACKING    " if url_classifies_as_tracking(final) else "not-tracking"
+            lines.append(f"  {i:3}. [{verdict}]  {final}")
+    if not tracking_links:
+        lines.append("\n  pick_tracking_link: none found")
+    elif len(tracking_links) == 1:
+        lines.append(f"\n  pick_tracking_link: {tracking_links[0]}")
+    else:
+        lines.append(f"\n  pick_tracking_link: {len(tracking_links)} distinct tracking URLs:")
+        for i, u in enumerate(tracking_links, 1):
+            lines.append(f"    {i}. {u}")
+    lines.append("")
+    RL.log("tracking_hrefs", "\n".join(lines))
+
+    # Debug log: also shows original href when it differs from final
+    debug_lines: list[str] = [
+        f"\n{ts}  |  {file_name}  [debug]",
+        "  href  →  final (redirect chain):",
+    ]
+    for i, (href, final) in enumerate(href_pairs, 1):
+        verdict = "TRACKING    " if url_classifies_as_tracking(final) else "not-tracking"
+        _, fetchable = normalize_href_for_http_fetch(href)
+        skipped = "" if fetchable else " [non-http, not fetched]"
+        if href.strip() != final.strip():
+            debug_lines.append(f"  {i:3}. [{verdict}]  {href}")
+            debug_lines.append(f"            →  {final}")
+        else:
+            debug_lines.append(f"  {i:3}. [{verdict}]  {final}{skipped}")
+    debug_lines.append("")
+    RL.debug("tracking_hrefs", "\n".join(debug_lines))
+
+
+def _write_openai_log(
+    file_name: str,
+    subject: str | None,
+    sender_name: str | None,
+    sender_email: str | None,
+    extracted: dict,
+    final_category: str,
+    confidence: int,
+    gift_verdict,
+    timings: dict,
+) -> None:
+    """Write per-email OpenAI extraction result to logs/openai_extraction.txt."""
+    ts = RL.ts()
+    gv = (
+        "gift card" if gift_verdict is True
+        else "items invoice" if gift_verdict is False
+        else "n/a"
+    )
+    lines: list[str] = [
+        f"\n{ts}  |  {file_name}",
+        f'  "{(subject or "")[:70]}"  —  {sender_name} <{sender_email}>',
+        f"  Category: {final_category} (conf={confidence}) | Gift card check: {gv}",
+        f"  company={extracted.get('company') or 'n/a'}  |  "
+        f"order={extracted.get('order_number') or 'n/a'}  |  "
+        f"date={extracted.get('purchase_datetime') or 'n/a'}  |  "
+        f"amount={extracted.get('total_amount_paid') or 'n/a'}",
+        f"  tracking_number={extracted.get('tracking_number') or 'n/a'}",
+        f"  OpenAI: {'ran' if timings.get('step5_ran') else 'skipped'}  "
+        f"{timings.get('step5_s', 0.0):.2f}s  |  "
+        f"GiftCard check: {'ran' if timings.get('step5b_ran') else 'skipped'}  "
+        f"{timings.get('step5b_s', 0.0):.2f}s",
+        "",
+    ]
+    RL.log("openai_extraction", "\n".join(lines))
+    RL.debug("openai_extraction",
+        f"\n{ts}  |  {file_name}  [debug]\n"
+        f"  raw extracted: company={extracted.get('company')!r}, "
+        f"order={extracted.get('order_number')!r}, "
+        f"date={extracted.get('purchase_datetime')!r}, "
+        f"amount={extracted.get('total_amount_paid')!r}, "
+        f"tracking_number={extracted.get('tracking_number')!r}, "
+        f"category_raw={extracted.get('email_category')!r}, "
+        f"confidence_raw={extracted.get('email_category_confidence')!r}\n"
+    )
 
 
 def _next_flow_usage_index(usage_dir: Path) -> int:
@@ -418,6 +562,73 @@ def _sanitize_for_api(text: str) -> str:
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
 
 
+def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
+    """Run chat completion with JSON response; rate-limit retry and usage logging."""
+    total_waited = 0.0
+    call_start = time.monotonic()
+    for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            raw_resp = client.chat.completions.with_raw_response.create(**api_kwargs)
+            response = raw_resp.parse()
+            total_waited += _check_and_throttle(raw_resp.headers)
+            break
+        except RateLimitError:
+            print(f"  Rate limit hit (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}) — waiting {RATE_LIMIT_RETRY_WAIT}s...")
+            time.sleep(RATE_LIMIT_RETRY_WAIT)
+            total_waited += RATE_LIMIT_RETRY_WAIT
+    else:
+        raise RuntimeError(
+            f"OpenAI rate limit not cleared after {RATE_LIMIT_MAX_RETRIES} retries "
+            f"({total_waited:.0f}s total wait)"
+        )
+    call_elapsed = time.monotonic() - call_start
+
+    if total_waited > 0:
+        print(f"  Total rate-limit wait: {total_waited:.1f}s")
+
+    usage = getattr(response, "usage", None)
+    if usage is not None and _flow_usage_log_path is not None:
+        pt = getattr(usage, "prompt_tokens", None) or 0
+        ct = getattr(usage, "completion_tokens", None) or 0
+        tt = getattr(usage, "total_tokens", None)
+        if tt is None:
+            tt = int(pt) + int(ct)
+        try:
+            cumulative = append_openai_usage_log(
+                prompt_tokens=int(pt),
+                completion_tokens=int(ct),
+                total_tokens=int(tt),
+                elapsed_secs=call_elapsed,
+            )
+            print(
+                f"  OpenAI tokens this request: {tt} (cumulative this flow: {cumulative})"
+            )
+        except OSError as e:
+            print(f"  WARNING: Could not write OpenAI usage log: {e}")
+
+    content = response.choices[0].message.content
+    return json.loads(content)
+
+
+def resolve_base_email_category(extracted: dict) -> tuple[str, float]:
+    """Map first-pass LLM output to category (Invoice / Shipped / Delivered / Unknown).
+
+    Gift Card is not produced here; it is applied later only after is_gift_card().
+    """
+    raw = extracted.get("email_category", "Unknown")
+    if raw not in LLM_EMAIL_CATEGORIES:
+        raw = "Unknown"
+    try:
+        conf = float(extracted.get("email_category_confidence", 0))
+    except (TypeError, ValueError):
+        conf = 0.0
+
+    if conf < CATEGORY_CONFIDENCE_THRESHOLD:
+        return ("Unknown", conf)
+
+    return (raw, conf)
+
+
 def extract_with_openai(
     text_only: str,
     subject: str | None = None,
@@ -445,17 +656,12 @@ Important rules:
     "9400111899223456789012"). This is NOT the order number — it is the alphanumeric ID
     assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
     If not clearly present, return null.
-12. email_category: Classify this email into exactly ONE of these categories:
-    - "Invoice": The order has been placed, received, or confirmed by the merchant (covers order confirmations, receipts, and invoices).
-    - "Shipped": The package has been shipped or is in transit (covers carrier handoff, tracking updates, out for delivery, on the way).
+12. email_category: Classify into exactly ONE of these categories (do NOT use "Gift Card" here):
+    - "Invoice": Order placed, confirmed, or receipt for a purchase (merchandise, services, or a gift card purchase — any order/receipt email).
+    - "Shipped": The package has been shipped or is in transit (carrier handoff, tracking, out for delivery).
     - "Delivered": The package has arrived — delivery is complete.
-    - "Gift Card": Gift card purchase, delivery, redemption code, or balance notification.
-    - "Unknown": Does not clearly fit any of the above.
-    Contextual hints: Invoice emails contain order confirmations, receipts, or purchase acknowledgements.
-    Shipped emails mention tracking numbers, carrier movement, or shipment notifications.
-    Delivered emails stress delivery completion. Gift card emails mention gift card value, codes, or digital delivery.
-    Use these signals to guide your choice.
-13. email_category_confidence: Your confidence (0–100) in the chosen category.
+    - "Unknown": Does not clearly fit Invoice, Shipped, or Delivered.
+13. email_category_confidence: Your confidence (0–100) in email_category.
 {subject_section}
 
 EMAIL TEXT:
@@ -514,10 +720,12 @@ EMAIL TEXT:
                                 "Invoice",
                                 "Shipped",
                                 "Delivered",
-                                "Gift Card",
                                 "Unknown",
                             ],
-                            "description": "Category of this email.",
+                            "description": (
+                                "Invoice = any order confirmation or purchase receipt. "
+                                "Do not use Gift Card here."
+                            ),
                         },
                         "email_category_confidence": {
                             "type": "number",
@@ -541,51 +749,7 @@ EMAIL TEXT:
         temperature=0,
     )
 
-    total_waited = 0.0
-    call_start = time.monotonic()
-    for attempt in range(1, RATE_LIMIT_MAX_RETRIES + 1):
-        try:
-            raw = client.chat.completions.with_raw_response.create(**api_kwargs)
-            response = raw.parse()
-            total_waited += _check_and_throttle(raw.headers)
-            break
-        except RateLimitError:
-            print(f"  Rate limit hit (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}) — waiting {RATE_LIMIT_RETRY_WAIT}s...")
-            time.sleep(RATE_LIMIT_RETRY_WAIT)
-            total_waited += RATE_LIMIT_RETRY_WAIT
-    else:
-        raise RuntimeError(
-            f"OpenAI rate limit not cleared after {RATE_LIMIT_MAX_RETRIES} retries "
-            f"({total_waited:.0f}s total wait)"
-        )
-    call_elapsed = time.monotonic() - call_start
-
-    if total_waited > 0:
-        print(f"  Total rate-limit wait: {total_waited:.1f}s")
-
-    usage = getattr(response, "usage", None)
-    if usage is not None and _flow_usage_log_path is not None:
-        pt = getattr(usage, "prompt_tokens", None) or 0
-        ct = getattr(usage, "completion_tokens", None) or 0
-        tt = getattr(usage, "total_tokens", None)
-        if tt is None:
-            tt = int(pt) + int(ct)
-        try:
-            cumulative = append_openai_usage_log(
-                prompt_tokens=int(pt),
-                completion_tokens=int(ct),
-                total_tokens=int(tt),
-                elapsed_secs=call_elapsed,
-            )
-            print(
-                f"  OpenAI tokens this request: {tt} (cumulative this flow: {cumulative})"
-            )
-        except OSError as e:
-            print(f"  WARNING: Could not write OpenAI usage log: {e}")
-
-    content = response.choices[0].message.content
-    data = json.loads(content)
-    return data
+    return _chat_completion_json_parsed(api_kwargs)
 
 
 # =========================
@@ -600,8 +764,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Filename (or full path) of a single HTML file to process. "
-            "A bare filename is resolved under email_contents/pdf/ relative to BASE_DIR from .env. "
-            "When provided, only that file is processed and the result is appended "
+            "A bare filename is resolved under email_contents/pdf/ relative to BASE_DIR from .env "
+            "(e.g. file1.html). When provided, only that file is processed and the result is appended "
             "to the output JSON."
         ),
     )
@@ -633,6 +797,13 @@ def process_file(
     sender_name: str | None,
     email: str | None,
 ) -> dict:
+    """Run the full extraction pipeline for one HTML email file.
+
+    Returns the record dict. Always includes a ``_timings`` key that ``main()``
+    pops before writing to JSON.
+    """
+    t_overall = _time.perf_counter()
+
     empty_extraction = {
         "company": None,
         "order_number": None,
@@ -645,138 +816,180 @@ def process_file(
     }
 
     extracted_hrefs: list[str] = []
+    timings: dict = {}
 
     try:
-        _trace(
-            "PIPELINE",
-            "=" * 55,
-        )
-        _trace(
-            "PIPELINE",
-            f"START process_file() — file={file_path.name}, "
-            f"subject={subject!r}, sender={sender_name!r}, email={email!r}",
-        )
-        print(f"Processing: {file_path}")
-
-        # ── STEP 1: Read file from disk (UTF-8 or UTF-16) ──
+        # ── STEP 1: Read HTML from disk ──────────────────────────
+        t = _time.perf_counter()
+        print("  » Reading email HTML...", end=" ", flush=True)
         raw_html, html_encoding = read_email_html_file(file_path)
-        _trace(
-            "PIPELINE STEP 1  [read file]",
-            f"Decoded HTML as {html_encoding!r}",
-        )
-
         href_count_raw = raw_html.lower().count('href=')
-        anchor_count = raw_html.lower().count('<a ')
-        _trace(
-            "PIPELINE STEP 1  [read file]",
-            f"Read {file_path.name} — {len(raw_html):,} chars, "
-            f"{len(raw_html.splitlines())} lines, "
-            f"raw 'href=' count={href_count_raw}, '<a ' count={anchor_count}",
-            raw_html[:300],
-        )
+        timings["step1_s"] = round(_time.perf_counter() - t, 3)
+        timings["html_chars"] = len(raw_html)
+        print(f"done  ({timings['step1_s']:.2f}s, {len(raw_html):,} chars)")
         if len(raw_html) < 500:
-            _trace(
-                "PIPELINE STEP 1  [read file]",
-                "WARNING: HTML is suspiciously short! Full content below:",
-                raw_html,
-            )
-
-        # ── STEP 2: HTML -> plain text (convertHTMLToPlaintext) ──
-        _trace(
-            "PIPELINE STEP 2  [html_to_plaintext]",
-            f"Sending {len(raw_html):,} chars of raw HTML to convertHTMLToPlaintext.convert()",
+            print(f"  WARNING: HTML is very short ({len(raw_html)} chars) — check source email.")
+        RL.debug("grabbingImportantEmailContent",
+            f"  [step1] {file_path.name}: {len(raw_html):,} chars ({html_encoding}), "
+            f"href_tokens={href_count_raw}, anchor_tags={raw_html.lower().count('<a ')}"
         )
+        RL.debug("htmlHandler",
+            f"  {RL.ts()}  {file_path.name}: html_in={len(raw_html):,} chars"
+        )
+
+        # ── STEP 2: HTML → plain text ────────────────────────────
+        t = _time.perf_counter()
+        print("  » Converting to plain text...", end=" ", flush=True)
         text_only = html_to_plaintext(raw_html)
-        _trace(
-            "PIPELINE STEP 2  [html_to_plaintext]",
-            f"Got back {len(text_only):,} chars of plain text ({len(text_only.splitlines())} lines)",
-            text_only[:300],
+        timings["step2_s"] = round(_time.perf_counter() - t, 3)
+        timings["text_chars"] = len(text_only)
+        print(f"done  ({timings['step2_s']:.2f}s, {len(text_only):,} chars)")
+        RL.debug("grabbingImportantEmailContent",
+            f"  [step2] plaintext: {len(text_only):,} chars, {len(text_only.splitlines())} lines"
+        )
+        RL.debug("htmlHandler",
+            f"         text_out={len(text_only):,} chars, "
+            f"truncated={'yes' if len(text_only) >= 50_000 else 'no'}"
+        )
+        RL.log("htmlHandler",
+            f"{RL.ts()}  {file_path.name}:  "
+            f"html={len(raw_html):,}  text={len(text_only):,}  "
+            f"ratio={len(text_only)/max(len(raw_html),1):.0%}"
         )
 
-        # ── STEP 3: Extract hrefs (ValuesExtractionByAttribute) ──
-        _trace(
-            "PIPELINE STEP 3  [extract_attribute_values]",
-            f"Sending {len(raw_html):,} chars of raw HTML to extract_attribute_values(html, 'href')",
+        # ── STEP 3: Extract hrefs ────────────────────────────────
+        t = _time.perf_counter()
+        print("  » Extracting hrefs...", end=" ", flush=True)
+        extracted_hrefs = extract_hrefs_from_html(raw_html)
+        fetchable = sum(1 for h in extracted_hrefs if normalize_href_for_http_fetch(h)[1])
+        timings["step3_s"] = round(_time.perf_counter() - t, 3)
+        timings["hrefs_found"] = len(extracted_hrefs)
+        timings["hrefs_fetchable"] = fetchable
+        print(f"done  ({timings['step3_s']:.2f}s, {len(extracted_hrefs)} unique, {fetchable} http/https)")
+        if not extracted_hrefs:
+            print(f"  WARNING: 0 hrefs extracted (HTML had {href_count_raw} href= tokens)")
+        RL.debug("grabbingImportantEmailContent",
+            f"  [step3] hrefs: found={len(extracted_hrefs)}, http/https={fetchable}, "
+            f"non-web={len(extracted_hrefs)-fetchable}"
         )
-        extracted_hrefs = extract_attribute_values(raw_html, "href")
-        _trace(
-            "PIPELINE STEP 3  [extract_attribute_values]",
-            f"Got back {len(extracted_hrefs)} unique hrefs",
-        )
-        # Individual href logging disabled — tracking-link bug is resolved
-        if extracted_hrefs:
-            pass
-            # for i, h in enumerate(extracted_hrefs[:5]):
-            #     _trace("PIPELINE STEP 3  [extract_attribute_values]", f"  href[{i}]: {h}")
-            # if len(extracted_hrefs) > 5:
-            #     _trace(
-            #         "PIPELINE STEP 3  [extract_attribute_values]",
-            #         f"  ... and {len(extracted_hrefs) - 5} more",
-            #     )
-        else:
-            _trace(
-                "PIPELINE STEP 3  [extract_attribute_values]",
-                "WARNING: extracted_hrefs is EMPTY — this is the bug. "
-                "The regex found 0 matches even though raw 'href=' count "
-                f"was {href_count_raw}. Check the raw HTML sample above.",
-            )
 
-        # ── STEP 4: Determine tracking link (isHrefTrackingLink) ──
-        _trace(
-            "PIPELINE STEP 4  [determine_tracking_link]",
-            f"Sending {len(extracted_hrefs)} hrefs to determine_tracking_link()",
+        # ── STEP 4: Resolve redirects + pick tracking link ───────
+        t = _time.perf_counter()
+        print("  » Resolving redirects & classifying tracking links...", end=" ", flush=True)
+        href_pairs = href_final_pairs(extracted_hrefs)
+        tracking_links = list_tracking_links_from_pairs(href_pairs)
+        # Primary URL for legacy single-field consumers; full list is ``tracking_links``.
+        tracking_link = tracking_links[0] if tracking_links else None
+        redirected = sum(1 for h, f in href_pairs if h.strip() != f.strip())
+        tracking_cands = sum(1 for _, f in href_pairs if url_classifies_as_tracking(f))
+        timings["step4_s"] = round(_time.perf_counter() - t, 3)
+        timings["hrefs_redirected"] = redirected
+        timings["tracking_candidates"] = tracking_cands
+        n_track = len(tracking_links)
+        timings["tracking_result"] = (
+            "none" if n_track == 0 else ("multiple" if n_track > 1 else "single")
         )
-        tracking_link = determine_tracking_link(extracted_hrefs)
-        _trace(
-            "PIPELINE STEP 4  [determine_tracking_link]",
-            f"Got back tracking_link={tracking_link!r}",
+        ts_label = (
+            "none found" if n_track == 0
+            else (f"{n_track} tracking links" if n_track > 1 else "1 link found")
+        )
+        print(f"done  ({timings['step4_s']:.2f}s, {redirected} redirected, {ts_label})")
+        _write_tracking_log(file_path.name, subject, sender_name, email, href_pairs, tracking_links)
+        RL.debug("grabbingImportantEmailContent",
+            f"  [step4] tracking: candidates={tracking_cands}, count={n_track}, links={tracking_links!r}"
         )
 
         # ── STEP 5: OpenAI extraction ────────────────────────────
         extracted = None
+        t5 = _time.perf_counter()
+        timings["step5_ran"] = bool(API_KEY)
 
         if API_KEY:
-            _trace(
-                "PIPELINE STEP 5  [OpenAI]",
-                f"Sending {len(text_only):,} chars of plain text to extract_with_openai()",
-            )
-            print("  Running OpenAI extraction...")
+            print("  » OpenAI extraction...", end=" ", flush=True)
             try:
                 extracted = extract_with_openai(text_only, subject=subject)
-                _trace(
-                    "PIPELINE STEP 5  [OpenAI]",
-                    f"OpenAI returned: {json.dumps(extracted, default=str)[:400]}",
+                timings["step5_s"] = round(_time.perf_counter() - t5, 3)
+                print(f"done  ({timings['step5_s']:.2f}s)")
+                RL.debug("grabbingImportantEmailContent",
+                    f"  [step5] {_openai_fields_log_line(extracted)}"
                 )
             except Exception as e:
-                _trace("PIPELINE STEP 5  [OpenAI]", f"FAILED: {e}")
-                print(f"  WARNING: OpenAI extraction failed: {e}")
+                timings["step5_s"] = round(_time.perf_counter() - t5, 3)
+                print(f"FAILED  ({timings['step5_s']:.2f}s, {e})")
                 extracted = None
         else:
-            _trace("PIPELINE STEP 5  [OpenAI]", "SKIPPED — no API key")
+            timings["step5_s"] = 0.0
+            print("  » OpenAI extraction...  skipped (no API key set)")
 
         if extracted is None:
             if not API_KEY:
-                print("  WARNING: No OpenAI API key; using empty/default fields.")
-            else:
-                print("  WARNING: Using empty/default fields (OpenAI unavailable or failed).")
+                print("  WARNING: No API key — empty fields only.")
             extracted = empty_extraction
 
         if not clean_text(extracted.get("company")):
             extracted["company"] = infer_company_from_subject(subject)
 
         file_uri = "file:///" + str(file_path.resolve()).replace("\\", "/")
+        final_category, raw_confidence = resolve_base_email_category(extracted)
 
-        raw_category = extracted.get("email_category", "Unknown")
-        raw_confidence = extracted.get("email_category_confidence", 0)
-        try:
-            raw_confidence = float(raw_confidence)
-        except (TypeError, ValueError):
-            raw_confidence = 0.0
+        # ── STEP 5b: Gift card check ─────────────────────────────
+        gift_verdict: bool | int | None = None
+        t5b = _time.perf_counter()
+        timings["step5b_ran"] = False
 
-        if raw_category not in VALID_CATEGORIES:
-            raw_category = "Unknown"
-        if raw_confidence < CATEGORY_CONFIDENCE_THRESHOLD:
-            raw_category = "Unknown"
+        if API_KEY and should_run_is_gift_card(extracted):
+            timings["step5b_ran"] = True
+            print("  » Gift card check...", end=" ", flush=True)
+            try:
+                gift_verdict = is_gift_card(text_only, subject=subject)
+                timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
+                gv_label = (
+                    "gift card" if gift_verdict is True
+                    else ("items invoice" if gift_verdict is False else "inconclusive")
+                )
+                print(f"done  ({timings['step5b_s']:.2f}s, {gv_label})")
+            except Exception as e:
+                timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
+                print(f"FAILED  ({timings['step5b_s']:.2f}s, {e})")
+                gift_verdict = None
+        else:
+            timings["step5b_s"] = 0.0
+
+        if gift_verdict is not None:
+            if gift_verdict is True:
+                final_category = "Gift Card"
+            elif gift_verdict is False:
+                final_category = "Invoice"
+            elif gift_verdict == IS_GIFT_CARD_UNKNOWN:
+                final_category = "Invoice"
+
+        if final_category not in VALID_CATEGORIES:
+            final_category = "Unknown"
+
+        timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
+        timings["category"] = final_category
+        timings["category_confidence"] = raw_confidence
+
+        # Write openai_extraction log
+        _write_openai_log(
+            file_path.name, subject, sender_name, email,
+            extracted, final_category, raw_confidence, gift_verdict, timings,
+        )
+
+        # Write one-line summary to grabbingImportantEmailContent log
+        RL.log("grabbingImportantEmailContent",
+            f"{RL.ts()}  {file_path.name}  |  "
+            f"\"{(subject or '')[:50]}\"  |  "
+            f"{final_category} (conf={raw_confidence})  |  "
+            f"order={extracted.get('order_number') or 'n/a'}  |  "
+            f"total={timings['total_s']:.2f}s"
+        )
+        RL.debug("grabbingImportantEmailContent",
+            f"  [final] category={final_category}, confidence={raw_confidence}, "
+            f"company={extracted.get('company')!r}, order={extracted.get('order_number')!r}, "
+            f"amount={extracted.get('total_amount_paid')!r}, "
+            f"tracking_links={tracking_links!r}\n"
+        )
 
         record: dict = {
             "source_file": clean_text(file_path),
@@ -791,27 +1004,21 @@ def process_file(
             "tax_paid": extracted.get("tax_paid"),
             "tracking_number": clean_text(extracted.get("tracking_number")),
             "tracking_link": tracking_link,
+            "tracking_links": tracking_links,
             "extracted_links": extracted_hrefs,
-            "email_category": raw_category,
+            "email_category": final_category,
             "email_category_confidence": raw_confidence,
+            "_timings": timings,
         }
-
-        # ── FINAL: what's going into the JSON ────────────────────
-        _trace(
-            "PIPELINE FINAL",
-            f"Record for JSON — extracted_links has {len(record['extracted_links'])} entries, "
-            f"tracking_link={record['tracking_link']!r}, "
-            f"company={record['company']!r}, "
-            f"order_number={record['order_number']!r}, "
-            f"category={record['email_category']!r}",
-        )
-        _trace("PIPELINE", f"END process_file() — {file_path.name}")
-        _trace("PIPELINE", "=" * 55)
-
         return record
 
     except Exception as e:
-        _trace("PIPELINE", f"EXCEPTION in process_file(): {e}")
+        timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
+        timings["error"] = str(e)
+        print(f"  ERROR in pipeline: {e}")
+        RL.log("grabbingImportantEmailContent",
+            f"{RL.ts()}  {file_path.name}  |  ERROR: {e}"
+        )
         return {
             "source_file": clean_text(file_path),
             "source_file_link": None,
@@ -826,15 +1033,20 @@ def process_file(
             "tax_paid": None,
             "tracking_number": None,
             "tracking_link": None,
+            "tracking_links": [],
             "extracted_links": extracted_hrefs,
             "email_category": "Unknown",
             "email_category_confidence": 0,
+            "_timings": timings,
         }
 
 
 # =========================
 # FILE RENAMING
 # =========================
+_SEQUENTIAL_HTML = re.compile(r"^file(\d+)\.(?:html|htm)$", re.IGNORECASE)
+
+
 def _next_file_number(html_folder: Path) -> int:
     """Find the highest existing fileN.html/.pdf number (recursive) and return N+1."""
     pattern = re.compile(r"^file(\d+)\.(?:html?|pdf)$", re.IGNORECASE)
@@ -848,7 +1060,13 @@ def _next_file_number(html_folder: Path) -> int:
 
 
 def rename_single_file(file_path: Path, html_folder: Path) -> Path:
-    """Rename an incoming HTML file to the next sequential fileN.html name."""
+    """Assign ``fileN.html`` to a drop-in HTML file.
+
+    If the basename is already ``fileN.html`` / ``fileN.htm`` (e.g. from mainRunner),
+    return it unchanged. Otherwise rename to the next free ``fileN.html``.
+    """
+    if _SEQUENTIAL_HTML.match(file_path.name):
+        return file_path
     n = _next_file_number(html_folder)
     new_name = f"file{n}.html"
     new_path = html_folder / new_name
@@ -951,6 +1169,37 @@ def rename_to_convention(file_path: Path, record: dict, target_folder: Path) -> 
     return new_path
 
 
+def rebuild_email_html_archive_folder(html_dir: Path) -> None:
+    """Empty *html_dir* (create if missing). Call once per program run before saving archived HTML."""
+    html_dir.mkdir(parents=True, exist_ok=True)
+    for child in list(html_dir.iterdir()):
+        try:
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+        except OSError as e:
+            print(f"WARNING: could not remove {child}: {e}")
+
+
+def archive_html_before_pdf(source_html: Path, record: dict, html_folder: Path) -> Path:
+    """Copy *source_html* into *html_folder* using the same convention basename as the PDF (``.html``).
+
+    Must run **before** :func:`convert_html_to_pdf`, which may delete *source_html*.
+    """
+    html_folder.mkdir(parents=True, exist_ok=True)
+    ext = ".html"
+    base_name = build_convention_filename(record, extension="")
+    new_path = html_folder / f"{base_name}{ext}"
+    counter = 2
+    while new_path.exists():
+        new_path = html_folder / f"{base_name} ({counter}){ext}"
+        counter += 1
+    shutil.copy2(source_html, new_path)
+    print(f"  Archived HTML: {new_path.name}")
+    return new_path
+
+
 # =========================
 # DEDUPLICATION
 # =========================
@@ -989,7 +1238,7 @@ def _known_hashes(results: list[dict]) -> set[str]:
 def main(flow_started_at: datetime | None = None):
     args = parse_args()
 
-    _trace(
+    RL.trace(
         "MAIN",
         f"main() called — base_dir={os.getenv(BASE_DIR_ENV)!r}, file={args.file!r}, "
         f"subject={args.subject!r}, sender_name={args.sender_name!r}, "
@@ -1010,6 +1259,7 @@ def main(flow_started_at: datetime | None = None):
 
     base = Path(base_dir).expanduser().resolve()
     pdf_folder = base / "email_contents" / "pdf"
+    html_archive_folder = base / "email_contents" / "html"
     output_path = base / "email_contents" / "json" / "results.json"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1030,6 +1280,11 @@ def main(flow_started_at: datetime | None = None):
             f"WARNING: {OPENAI_API_KEY_ENV} is not set. "
             "Structured extraction will be skipped (empty fields only)."
         )
+
+    _timing_buffer_path: Path | None = None
+    _buf_raw = os.getenv("TIMING_BUFFER_PATH", "").strip()
+    if _buf_raw:
+        _timing_buffer_path = Path(_buf_raw)
 
     # Single-file mode
     if args.file:
@@ -1057,32 +1312,33 @@ def main(flow_started_at: datetime | None = None):
             return
 
         file_path = rename_single_file(file_path, pdf_folder)
-        _trace("MAIN", f"Renamed to {file_path.name}, file size = {file_path.stat().st_size:,} bytes")
 
         entry = process_file(file_path, args.subject, args.sender_name, args.email)
+        timings = entry.pop("_timings", {})
+        if _timing_buffer_path:
+            RL.write_timing_entry(_timing_buffer_path, {
+                "file": file_path.name,
+                "subject": args.subject,
+                "is_duplicate": False,
+                **timings,
+            })
+
         entry["content_hash"] = file_hash
         entry["duplicate_on_last_run"] = 0
 
+        archive_html_before_pdf(file_path, entry, html_archive_folder)
         pdf_path = convert_html_to_pdf(file_path)
-
         pdf_path = rename_to_convention(pdf_path, entry, pdf_folder)
         file_uri = "file:///" + str(pdf_path.resolve()).replace("\\", "/")
         entry["source_file"] = clean_text(pdf_path)
         entry["source_file_link"] = file_uri
-
-        _trace(
-            "MAIN",
-            f"Writing JSON — extracted_links={len(entry.get('extracted_links', []))} entries, "
-            f"tracking_link={entry.get('tracking_link')!r}",
-        )
 
         results.append(entry)
 
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 
-        _trace("MAIN", f"JSON written to {output_path} — {len(results)} total records")
-        print(f"Appended result to: {output_path}")
+        print(f"  Result saved to: {output_path} ({len(results)} total records)")
         return
 
     # Batch mode: process entire pdf folder
@@ -1100,21 +1356,33 @@ def main(flow_started_at: datetime | None = None):
     hashes = _known_hashes(results)
     new_count = 0
 
+    rebuild_email_html_archive_folder(html_archive_folder)
+
     for fp in html_files:
         file_hash = compute_file_hash(fp)
         if file_hash in hashes:
-            print(f"  SKIPPED (duplicate content): {fp.name}")
+            print(f"  » Duplicate — already in results, skipped: {fp.name}")
+            if _timing_buffer_path:
+                RL.write_timing_entry(_timing_buffer_path, {
+                    "file": fp.name, "subject": args.subject, "is_duplicate": True, "total_s": 0.0
+                })
             for r in results:
                 if r.get("content_hash") == file_hash:
                     r["duplicate_on_last_run"] = 1
                     break
             continue
         entry = process_file(fp, args.subject, args.sender_name, args.email)
+        timings = entry.pop("_timings", {})
+        if _timing_buffer_path:
+            RL.write_timing_entry(_timing_buffer_path, {
+                "file": fp.name, "subject": args.subject, "is_duplicate": False, **timings
+            })
+
         entry["content_hash"] = file_hash
         entry["duplicate_on_last_run"] = 0
 
+        archive_html_before_pdf(fp, entry, html_archive_folder)
         pdf_path = convert_html_to_pdf(fp)
-
         pdf_path = rename_to_convention(pdf_path, entry, pdf_folder)
         file_uri = "file:///" + str(pdf_path.resolve()).replace("\\", "/")
         entry["source_file"] = clean_text(pdf_path)
@@ -1127,22 +1395,7 @@ def main(flow_started_at: datetime | None = None):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
-    print(f"\nDone. {new_count} new + {len(results) - new_count} existing = {len(results)} total in: {output_path}")
-
-
-class _Tee:
-    """Writes to both an original stream and a log file simultaneously."""
-    def __init__(self, log_path: Path, original_stream):
-        self._file = open(log_path, "a", encoding="utf-8")
-        self._original = original_stream
-    def write(self, msg):
-        self._original.write(msg)
-        self._file.write(msg.replace("\ufeff", "") if isinstance(msg, str) else msg)
-    def flush(self):
-        self._original.flush()
-        self._file.flush()
-    def close(self):
-        self._file.close()
+    print(f"\n  Done. {new_count} new + {len(results) - new_count} existing = {len(results)} total records → {output_path}")
 
 
 if __name__ == "__main__":
@@ -1155,10 +1408,6 @@ if __name__ == "__main__":
             file=sys.stderr,
         )
         sys.exit(1)
-    _log_path = Path(_base_for_log).expanduser().resolve() / "programFileOutput.txt"
-    _tee = _Tee(_log_path, sys.stdout)
-    sys.stdout = _tee
-    sys.stderr = _Tee(_log_path, sys.stderr)
 
     _start_time = time.time()
     _flow_started_at = datetime.now()
@@ -1167,9 +1416,6 @@ if __name__ == "__main__":
     print(f"Run started: {_flow_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Args: {sys.argv[1:]}")
     print(f"{'='*60}")
-
-    _original_stdout = _tee._original
-    _original_stderr = sys.stderr._original
 
     try:
         main(flow_started_at=_flow_started_at)
@@ -1182,19 +1428,9 @@ if __name__ == "__main__":
             print("\nERROR: Invalid or missing arguments.")
             print("Set BASE_DIR and OPENAI_API_KEY in python_files/.env.")
             print("Optional args: --file, --subject, --sender-name, --email")
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
         sys.exit(e.code)
     except Exception as e:
         _elapsed = time.time() - _start_time
         print(f"\nERROR: {e}")
         print(f"Total operation time: {_elapsed:.2f}s")
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
         sys.exit(1)
-
-    sys.stdout = _original_stdout
-    sys.stderr = _original_stderr
-    _tee.close()

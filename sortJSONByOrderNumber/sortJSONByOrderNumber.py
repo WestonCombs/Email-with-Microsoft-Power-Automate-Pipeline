@@ -1,12 +1,16 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import runLogger as RL
 
 _base_dir_raw = os.getenv("BASE_DIR")
 if not _base_dir_raw:
@@ -15,24 +19,8 @@ if not _base_dir_raw:
 PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
 INPUT_FILE  = PROJECT_ROOT / "email_contents" / "json" / "results.json"
 OUTPUT_FILE = INPUT_FILE
-LOG_PATH    = PROJECT_ROOT / "programFileOutput.txt"
 
 _DATE_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
-
-
-class _Tee:
-    """Writes to both an original stream and a log file simultaneously."""
-    def __init__(self, log_path: Path, original_stream):
-        self._file = open(log_path, "a", encoding="utf-8")
-        self._original = original_stream
-    def write(self, msg):
-        self._original.write(msg)
-        self._file.write(msg.replace("\ufeff", "") if isinstance(msg, str) else msg)
-    def flush(self):
-        self._original.flush()
-        self._file.flush()
-    def close(self):
-        self._file.close()
 
 
 def _parse_datetime(value):
@@ -48,6 +36,7 @@ def _parse_datetime(value):
 
 
 def main():
+    t = time.perf_counter()
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -61,16 +50,14 @@ def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    print(f"Sorted {len(data)} records by order_number then purchase_datetime and saved to:\n{OUTPUT_FILE}")
+    elapsed = time.perf_counter() - t
+    print(f"  Sorted {len(data)} records  ({elapsed:.2f}s)")
+    RL.log("sortJSONByOrderNumber",
+        f"{RL.ts()}  sorted {len(data)} records in {elapsed:.2f}s  →  {OUTPUT_FILE}"
+    )
 
 
 if __name__ == "__main__":
-    _tee = _Tee(LOG_PATH, sys.stdout)
-    sys.stdout = _tee
-    sys.stderr = _Tee(LOG_PATH, sys.stderr)
-    _original_stdout = _tee._original
-    _original_stderr = sys.stderr._original
-
     print(f"\n{'='*60}")
     print(f"[sortJSONByOrderNumber] Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*60}")
@@ -80,11 +67,4 @@ if __name__ == "__main__":
         print("Sort finished successfully.")
     except Exception as e:
         print(f"\nERROR: {e}")
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
-        _tee.close()
         sys.exit(1)
-
-    sys.stdout = _original_stdout
-    sys.stderr = _original_stderr
-    _tee.close()

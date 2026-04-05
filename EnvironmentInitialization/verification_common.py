@@ -1,4 +1,4 @@
-"""Shared path safety and logging for folder/file verification (EnvironmentInitialization)."""
+"""Shared path safety and logging for folder/file verification (environmentInitialization)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ _CONSOLE_LOG = Path(__file__).resolve().parent / "console_log"
 
 
 def verification_log(message: str) -> None:
-    """Append one line to ``EnvironmentInitialization/console_log`` and print to stdout."""
+    """Append one line to ``environmentInitialization/console_log`` and print to stdout."""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {message}\n"
     try:

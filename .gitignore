@@ -2,12 +2,17 @@
 .env.*
 !.env.example
 
+# MSAL delegated token cache (do not commit)
+.graph_token_cache.bin
+
 # Python
 __pycache__/
 *.py[cod]
 
+# Excel clipboard launcher (local python.exe paths)
+excel_clipboard_launch.ini
+
 # Logs may contain emails, paths, names, and order details
 run_log.txt
-adminLog/
-
-EnvironmentInitialization/console_log
+trackingLinkConsoleOutput.txt
+environmentInitialization/console_log
