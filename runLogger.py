@@ -43,7 +43,7 @@ except ImportError:
     pass
 
 
-# Evaluated once at import time — subprocess inherits env vars from parent.
+# Import-time snapshot (for non-debug code paths that only need a hint).
 _DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
 _MASTER_FILE = "master.txt"
 _MAX_TRACE_SAMPLE = 500
@@ -66,8 +66,12 @@ def _logs_dir() -> Path:
 
 
 def is_debug() -> bool:
-    """Return True when DEBUG_MODE=1 is set in the environment."""
-    return _DEBUG_MODE
+    """Return True when DEBUG_MODE=1 is set in the environment (read at call time).
+
+    Subprocesses and ``load_dotenv`` can set this after some modules import; using the
+    current value keeps ``debug_*`` logs aligned with ``python_files/.env``.
+    """
+    return os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
 
 
 def ts() -> str:
@@ -109,7 +113,7 @@ def write_run_header(segment: str, label: str = "") -> None:
     )
     _append(_logs_dir() / f"{segment}.txt", header)
     _append_master(segment, header, nl=True)
-    if _DEBUG_MODE:
+    if is_debug():
         _append(_logs_dir() / f"debug_{segment}.txt", header)
 
 
@@ -122,7 +126,7 @@ def log(segment: str, text: str, *, nl: bool = True) -> None:
 
 def debug(segment: str, text: str, *, nl: bool = True) -> None:
     """Append *text* to BASE_DIR/logs/debug_<segment>.txt — only when DEBUG_MODE=1."""
-    if not _DEBUG_MODE:
+    if not is_debug():
         return
     line = text + ("\n" if nl else "")
     _append(_logs_dir() / f"debug_{segment}.txt", line)

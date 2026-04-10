@@ -19,9 +19,15 @@ else:
 
 CLIPBOARD_INI_NAME = "excel_clipboard_launch.ini"
 
-# Workbook_SheetFollowHyperlink: Copy Path uses # in-sheet links; file URI in column 28 (AB).
-# Reads UTF-8 ini (PY= and SCRIPT=) from AA1 / excel_clipboard_launch.ini.
+# Workbook_SheetFollowHyperlink: Copy Path uses # in-sheet links; file URI in column 29 (AC).
+# Tracking URLs for each row live in hidden columns 30…44 (AD…AR). "View tracking links" collects them,
+# writes a temp UTF-8 .txt plus optional .ctx.tsv (company, order, … from row headers),
+# and runs VIEWER hidden (window style 0) from ini (Python + tkinter grid).
+# Reads UTF-8 ini (PY=, SCRIPT=, VIEWER=) from AA1 / excel_clipboard_launch.ini.
 THISWORKBOOK_VBA = r'''Option Explicit
+
+Private Const COL_TRACK_URI_START As Long = 30
+Private Const COL_TRACK_URI_END As Long = 44
 
 Private Function ReadUtf8File(ByVal path As String) As String
     Dim stm As Object
@@ -40,6 +46,137 @@ CleanFail:
     If Not stm Is Nothing Then stm.Close
 End Function
 
+Private Sub WriteUtf8File(ByVal path As String, ByVal content As String)
+    Dim stm As Object
+    On Error GoTo CleanFail
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText content
+    stm.SaveToFile path, 2
+    stm.Close
+    Exit Sub
+CleanFail:
+    On Error Resume Next
+    If Not stm Is Nothing Then stm.Close
+End Sub
+
+Private Function CollectTrackingUrlsForRow(ByVal Sh As Object, ByVal rowNum As Long) As String
+    Dim c As Long
+    Dim v As Variant
+    Dim s As String
+    Dim body As String
+    body = ""
+    For c = COL_TRACK_URI_START To COL_TRACK_URI_END
+        v = Sh.Cells(rowNum, c).Value
+        If Not IsError(v) And Not IsEmpty(v) Then
+            s = Trim(CStr(v))
+            If Len(s) > 0 Then
+                body = body & s & vbLf
+            End If
+        End If
+    Next c
+    CollectTrackingUrlsForRow = body
+End Function
+
+Private Function HeaderColumn(ByVal Sh As Object, ByVal want As String) As Long
+    Dim c As Long
+    Dim lastCol As Long
+    Dim h As String
+    On Error Resume Next
+    lastCol = Sh.Cells(1, Sh.Columns.Count).End(xlToLeft).Column
+    On Error GoTo 0
+    If lastCol < 1 Then lastCol = 1
+    For c = 1 To lastCol
+        h = Trim(CStr(Sh.Cells(1, c).Value))
+        If StrComp(h, want, vbTextCompare) = 0 Then
+            HeaderColumn = c
+            Exit Function
+        End If
+    Next c
+    HeaderColumn = 0
+End Function
+
+Private Function CtxLine(ByVal key As String, ByVal v As Variant) As String
+    Dim s As String
+    If IsError(v) Then
+        CtxLine = ""
+        Exit Function
+    End If
+    If IsEmpty(v) Then
+        CtxLine = ""
+        Exit Function
+    End If
+    s = Trim(CStr(v))
+    If Len(s) = 0 Then
+        CtxLine = ""
+        Exit Function
+    End If
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    s = Replace(s, Chr(9), " ")
+    CtxLine = key & Chr(9) & s & vbLf
+End Function
+
+Private Sub WriteTrackingContextTsv(ByVal Sh As Object, ByVal rowNum As Long, ByVal path As String)
+    Dim c As Long
+    Dim body As String
+    body = ""
+    c = HeaderColumn(Sh, "Company")
+    If c > 0 Then body = body & CtxLine("company", Sh.Cells(rowNum, c).Value)
+    c = HeaderColumn(Sh, "Order Number")
+    If c > 0 Then body = body & CtxLine("order_number", Sh.Cells(rowNum, c).Value)
+    c = HeaderColumn(Sh, "Category")
+    If c > 0 Then body = body & CtxLine("category", Sh.Cells(rowNum, c).Value)
+    c = HeaderColumn(Sh, "Purchase Date")
+    If c > 0 Then body = body & CtxLine("purchase_datetime", Sh.Cells(rowNum, c).Value)
+    c = HeaderColumn(Sh, "Email")
+    If c > 0 Then body = body & CtxLine("email", Sh.Cells(rowNum, c).Value)
+    If Len(body) > 0 Then
+        Call WriteUtf8File(path, body)
+    End If
+End Sub
+
+Private Sub LaunchTrackingLinkViewerForRow(ByVal Sh As Object, ByVal rowNum As Long)
+    Dim body As String
+    Dim tempPath As String
+    Dim fso As Object
+    Dim iniPath As String
+    Dim allText As String
+    Dim py As String
+    Dim viewer As String
+    Dim cmd As String
+    Dim shell As Object
+
+    body = CollectTrackingUrlsForRow(Sh, rowNum)
+    If Len(Trim(body)) = 0 Then Exit Sub
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    tempPath = fso.GetSpecialFolder(2) & "\email_sorter_tracking_r" & rowNum & "_t" & CLng(Timer * 10000) & ".txt"
+    Call WriteUtf8File(tempPath, body)
+    Call WriteTrackingContextTsv(Sh, rowNum, Replace(tempPath, ".txt", ".ctx.tsv"))
+
+    iniPath = Trim(CStr(Sh.Range("AA1").Value))
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        If Len(ThisWorkbook.Path) > 0 Then
+            iniPath = ThisWorkbook.Path & Application.PathSeparator & "excel_clipboard_launch.ini"
+        End If
+    End If
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then Exit Sub
+
+    allText = ReadUtf8File(iniPath)
+    py = IniValue(allText, "PY")
+    viewer = IniValue(allText, "VIEWER")
+    If Len(py) = 0 Or Len(viewer) = 0 Then Exit Sub
+    If Not fso.FileExists(py) Then Exit Sub
+    If Not fso.FileExists(viewer) Then Exit Sub
+
+    cmd = Chr(34) & py & Chr(34) & " " & Chr(34) & viewer & Chr(34) & " " & Chr(34) & tempPath & Chr(34)
+    Set shell = CreateObject("WScript.Shell")
+    shell.Run cmd, 0, False
+End Sub
+
 Private Function IniValue(ByVal allText As String, ByVal key As String) As String
     Dim lines As Variant
     Dim i As Long
@@ -57,8 +194,45 @@ Private Function IniValue(ByVal allText As String, ByVal key As String) As Strin
     IniValue = ""
 End Function
 
+Private Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Long)
+    Dim iniPath As String
+    Dim allText As String
+    Dim py As String
+    Dim linkScript As String
+    Dim fso As Object
+    Dim cmd As String
+    Dim shell As Object
+
+    On Error GoTo CleanFail
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    iniPath = Trim(CStr(Sh.Range("AA1").Value))
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        If Len(ThisWorkbook.Path) > 0 Then
+            iniPath = ThisWorkbook.Path & Application.PathSeparator & "excel_clipboard_launch.ini"
+        End If
+    End If
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then Exit Sub
+
+    allText = ReadUtf8File(iniPath)
+    If Len(allText) = 0 Then Exit Sub
+
+    py = IniValue(allText, "PY")
+    linkScript = IniValue(allText, "GIFTCARD_LINK")
+    If Len(py) = 0 Or Len(linkScript) = 0 Then Exit Sub
+    If Not fso.FileExists(py) Then Exit Sub
+    If Not fso.FileExists(linkScript) Then Exit Sub
+
+    cmd = Chr(34) & py & Chr(34) & " " & Chr(34) & linkScript & Chr(34) & " " & Chr(34) & ThisWorkbook.FullName & Chr(34) & " " & CStr(rowNum)
+    Set shell = CreateObject("WScript.Shell")
+    shell.Run cmd, 1, False
+    Exit Sub
+
+CleanFail:
+End Sub
+
 Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hyperlink)
-    Const COL_FILE_URI As Long = 28
+    Const COL_FILE_URI As Long = 29
     Dim header As String
     Dim uri As String
     Dim py As String
@@ -71,7 +245,18 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
 
     On Error GoTo CleanFail
 
-    header = CStr(Sh.Cells(1, Target.Range.Column).Value)
+    header = Trim(CStr(Sh.Cells(1, Target.Range.Column).Value))
+
+    If StrComp(header, "View tracking links", vbTextCompare) = 0 Or StrComp(header, "View Link List", vbTextCompare) = 0 Then
+        Call LaunchTrackingLinkViewerForRow(Sh, Target.Range.Row)
+        Exit Sub
+    End If
+
+    If StrComp(header, "Invoice link", vbTextCompare) = 0 Then
+        Call LaunchGiftInvoiceLinkWorkflow(Sh, Target.Range.Row)
+        Exit Sub
+    End If
+
     If StrComp(header, "Copy Path", vbTextCompare) <> 0 Then Exit Sub
 
     uri = CStr(Sh.Cells(Target.Range.Row, COL_FILE_URI).Value)
@@ -145,12 +330,23 @@ def _write_access_vbom(value: int) -> None:
         winreg.SetValueEx(k, "AccessVBOM", 0, winreg.REG_DWORD, int(value))
 
 
-def write_clipboard_launch_ini(dest_file: Path, py_exe: str, script_path: Path) -> Path:
-    """Write PY=/SCRIPT= lines (UTF-8) to dest_file (full path, e.g. python_files/excel_clipboard_launch.ini)."""
+def write_clipboard_launch_ini(
+    dest_file: Path,
+    py_exe: str,
+    script_path: Path,
+    *,
+    viewer_script: Path | None = None,
+    giftcard_link_script: Path | None = None,
+) -> Path:
+    """Write PY=/SCRIPT=/VIEWER=/GIFTCARD_LINK= (UTF-8) to dest_file."""
     dest_file = dest_file.resolve()
     dest_file.parent.mkdir(parents=True, exist_ok=True)
-    text = f"PY={py_exe}\nSCRIPT={script_path.resolve()}\n"
-    dest_file.write_text(text, encoding="utf-8")
+    lines = [f"PY={py_exe}\n", f"SCRIPT={script_path.resolve()}\n"]
+    if viewer_script is not None:
+        lines.append(f"VIEWER={viewer_script.resolve()}\n")
+    if giftcard_link_script is not None:
+        lines.append(f"GIFTCARD_LINK={giftcard_link_script.resolve()}\n")
+    dest_file.write_text("".join(lines), encoding="utf-8")
     return dest_file
 
 

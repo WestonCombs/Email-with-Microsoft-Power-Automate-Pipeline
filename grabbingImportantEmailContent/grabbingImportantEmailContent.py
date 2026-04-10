@@ -874,6 +874,8 @@ def process_file(
         )
 
         # ── STEP 4: Resolve redirects + pick tracking link ───────
+        # Uses htmlHandler.tracking_hrefs: href_final_pairs → list_tracking_links_from_pairs
+        # (BeautifulSoup hrefs, redirect resolution, tracking heuristics, dedupe).
         t = _time.perf_counter()
         print("  » Resolving redirects & classifying tracking links...", end=" ", flush=True)
         href_pairs = href_final_pairs(extracted_hrefs)
@@ -1010,6 +1012,8 @@ def process_file(
             "email_category_confidence": raw_confidence,
             "_timings": timings,
         }
+        for idx, u in enumerate(tracking_links, 1):
+            record[f"trackingNumber{idx}"] = u
         return record
 
     except Exception as e:
