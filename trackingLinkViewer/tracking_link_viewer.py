@@ -12,7 +12,7 @@ Links in the workbook come from JSON ``tracking_links``, filled by
 ``grabbingImportantEmailContent`` using ``htmlHandler.tracking_hrefs`` (``href_final_pairs`` →
 ``list_tracking_links_from_pairs``) after anchor extraction and redirect resolution.
 
-Launched from Excel via **View Link List**: VBA writes a temp UTF-8 ``.txt`` (one URL per line)
+Launched from Excel via **View tracking links**: VBA writes a temp UTF-8 ``.txt`` (one URL per line)
 and an optional ``.ctx.tsv``. State is keyed by URL list + order context (not the temp path), so it
 survives each launch.
 
@@ -38,6 +38,11 @@ import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
+
+if str(_PYTHON_FILES_DIR) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_FILES_DIR))
+
+from gui_aux_singleton import detach_console_win32, register_current_aux_gui
 
 # Per-viewer JSON files: ``BASE_DIR/email_contents/tracking_link_viewer_state/<sha256>.json``
 _TRACKING_STATE_SUBDIR = "tracking_link_viewer_state"
@@ -123,18 +128,6 @@ def _open_url(url: str) -> None:
             webbrowser.open(u)
     else:
         webbrowser.open(u)
-
-
-def _detach_console_win32() -> None:
-    """Drop the attached console so ``python.exe`` does not leave a black window behind tk."""
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-
-        ctypes.windll.kernel32.FreeConsole()
-    except OSError:
-        pass
 
 
 def _load_urls(path: Path) -> list[str]:
@@ -618,7 +611,8 @@ class TrackingLinkViewerApp:
 
 
 def main() -> int:
-    _detach_console_win32()
+    detach_console_win32()
+    register_current_aux_gui()
 
     # Match project .env location when launched from Excel (cwd may be System32).
     try:

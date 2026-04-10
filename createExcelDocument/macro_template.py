@@ -19,15 +19,15 @@ else:
 
 CLIPBOARD_INI_NAME = "excel_clipboard_launch.ini"
 
-# Workbook_SheetFollowHyperlink: Copy Path uses # in-sheet links; file URI in column 28 (AB).
-# Tracking URLs for each row live in hidden columns 29…43 (AC…AQ). "View Link List" collects them,
+# Workbook_SheetFollowHyperlink: Copy Path uses # in-sheet links; file URI in column 29 (AC).
+# Tracking URLs for each row live in hidden columns 30…44 (AD…AR). "View tracking links" collects them,
 # writes a temp UTF-8 .txt plus optional .ctx.tsv (company, order, … from row headers),
 # and runs VIEWER hidden (window style 0) from ini (Python + tkinter grid).
 # Reads UTF-8 ini (PY=, SCRIPT=, VIEWER=) from AA1 / excel_clipboard_launch.ini.
 THISWORKBOOK_VBA = r'''Option Explicit
 
-Private Const COL_TRACK_URI_START As Long = 29
-Private Const COL_TRACK_URI_END As Long = 43
+Private Const COL_TRACK_URI_START As Long = 30
+Private Const COL_TRACK_URI_END As Long = 44
 
 Private Function ReadUtf8File(ByVal path As String) As String
     Dim stm As Object
@@ -194,8 +194,45 @@ Private Function IniValue(ByVal allText As String, ByVal key As String) As Strin
     IniValue = ""
 End Function
 
+Private Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Long)
+    Dim iniPath As String
+    Dim allText As String
+    Dim py As String
+    Dim linkScript As String
+    Dim fso As Object
+    Dim cmd As String
+    Dim shell As Object
+
+    On Error GoTo CleanFail
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    iniPath = Trim(CStr(Sh.Range("AA1").Value))
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        If Len(ThisWorkbook.Path) > 0 Then
+            iniPath = ThisWorkbook.Path & Application.PathSeparator & "excel_clipboard_launch.ini"
+        End If
+    End If
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then Exit Sub
+
+    allText = ReadUtf8File(iniPath)
+    If Len(allText) = 0 Then Exit Sub
+
+    py = IniValue(allText, "PY")
+    linkScript = IniValue(allText, "GIFTCARD_LINK")
+    If Len(py) = 0 Or Len(linkScript) = 0 Then Exit Sub
+    If Not fso.FileExists(py) Then Exit Sub
+    If Not fso.FileExists(linkScript) Then Exit Sub
+
+    cmd = Chr(34) & py & Chr(34) & " " & Chr(34) & linkScript & Chr(34) & " " & Chr(34) & ThisWorkbook.FullName & Chr(34) & " " & CStr(rowNum)
+    Set shell = CreateObject("WScript.Shell")
+    shell.Run cmd, 1, False
+    Exit Sub
+
+CleanFail:
+End Sub
+
 Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hyperlink)
-    Const COL_FILE_URI As Long = 28
+    Const COL_FILE_URI As Long = 29
     Dim header As String
     Dim uri As String
     Dim py As String
@@ -208,10 +245,15 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
 
     On Error GoTo CleanFail
 
-    header = CStr(Sh.Cells(1, Target.Range.Column).Value)
+    header = Trim(CStr(Sh.Cells(1, Target.Range.Column).Value))
 
-    If StrComp(header, "View Link List", vbTextCompare) = 0 Then
+    If StrComp(header, "View tracking links", vbTextCompare) = 0 Or StrComp(header, "View Link List", vbTextCompare) = 0 Then
         Call LaunchTrackingLinkViewerForRow(Sh, Target.Range.Row)
+        Exit Sub
+    End If
+
+    If StrComp(header, "Invoice link", vbTextCompare) = 0 Then
+        Call LaunchGiftInvoiceLinkWorkflow(Sh, Target.Range.Row)
         Exit Sub
     End If
 
@@ -294,13 +336,16 @@ def write_clipboard_launch_ini(
     script_path: Path,
     *,
     viewer_script: Path | None = None,
+    giftcard_link_script: Path | None = None,
 ) -> Path:
-    """Write PY=/SCRIPT=/VIEWER= (UTF-8) to dest_file (e.g. python_files/excel_clipboard_launch.ini)."""
+    """Write PY=/SCRIPT=/VIEWER=/GIFTCARD_LINK= (UTF-8) to dest_file."""
     dest_file = dest_file.resolve()
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"PY={py_exe}\n", f"SCRIPT={script_path.resolve()}\n"]
     if viewer_script is not None:
         lines.append(f"VIEWER={viewer_script.resolve()}\n")
+    if giftcard_link_script is not None:
+        lines.append(f"GIFTCARD_LINK={giftcard_link_script.resolve()}\n")
     dest_file.write_text("".join(lines), encoding="utf-8")
     return dest_file
 
