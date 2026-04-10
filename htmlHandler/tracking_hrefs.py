@@ -1,12 +1,11 @@
 """Email href pipeline: extract from HTML → follow redirects → classify shipment tracking.
 
-All logic lives here (regex scan, urllib redirects, domain/keyword heuristics).
+Anchor ``href`` values are parsed with BeautifulSoup (no regex-based URL/href scanning).
 """
 
 from __future__ import annotations
 
 import os
-import re
 import threading
 import urllib.error
 import urllib.request
@@ -14,16 +13,15 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse, urljoin
 
+from bs4 import BeautifulSoup
+
 import runLogger as RL
-
-_DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
-
 
 def _dbg(msg: str) -> None:
     """Write one debug line to logs/debug_tracking_hrefs.txt — file only, no console."""
-    if not _DEBUG_MODE:
-        return
     try:
+        if not RL.is_debug():
+            return
         RL.debug("tracking_hrefs", f"  {msg}")
     except Exception:
         pass
@@ -34,6 +32,7 @@ _SRC = "tracking_hrefs"
 MULTIPLE_TRACKING_LINKS = "multiple tracking links found"
 
 _TRACKING_DOMAINS = [
+    "cta.nam.com",
     "narvar.com",
     "aftership.com",
     "trackingmore.com",
@@ -51,6 +50,7 @@ _TRACKING_PATH_KEYWORDS = [
     "tracking",
     "shipment",
     "orderstatus",
+    "delivery",
 ]
 
 _EXCLUDE_KEYWORDS = [
@@ -78,10 +78,116 @@ _UTM_PARAMS = frozenset({
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
 })
 
-_HREF_PATTERN = re.compile(
-    r'href\s*=\s*(?:"([^"]*?)"|\'([^\']*?)\')',
-    re.IGNORECASE,
+# Sorting only (not used for include/exclude classification) — longer matches rank higher.
+_LINK_PRIORITY_SUBSTRINGS = (
+    "track",
+    "tracking",
+    "shipment",
+    "delivery",
+    "orderstatus",
+    "order/",
+    "order?",
+    "order&",
+    "order=",
 )
+
+
+def clean_link(link: str) -> str:
+    """Collapse broken/multiline email ``href`` values into one line."""
+    s = (link or "").replace("\n", "").replace("\r", "").strip()
+    # Strip BOM / zero-width chars (e.g. first href in a UTF-8 file with BOM).
+    return s.lstrip("\ufeff\u200b\u200c\u200d\u2060").strip()
+
+
+def is_absolute_browser_url(url: str) -> bool:
+    """True if *url* is ``http(s)://`` with a host that can be opened in a browser.
+
+    Drops stray tokens (e.g. query fragments saved without a scheme) that would
+    never work with ``os.startfile`` / the default browser.
+    """
+    s = clean_link(url)
+    if not s:
+        return False
+    if s.startswith("//"):
+        s = "https:" + s
+    try:
+        p = urlparse(s)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = (p.netloc or "").split("@")[-1].split(":")[0].strip().strip(".").lower()
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    if host.startswith("["):
+        return True
+    if "." in host:
+        return True
+    # IPv4 without domain name
+    octets = host.split(".")
+    if len(octets) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+        return True
+    return False
+
+
+def _link_priority_score(url: str) -> int:
+    low = url.lower()
+    return sum(1 for s in _LINK_PRIORITY_SUBSTRINGS if s in low)
+
+
+def _should_print_link_debug() -> bool:
+    return RL.is_debug() or os.getenv("EMAIL_LINK_DEBUG", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def extract_all_links(html: str) -> list[str]:
+    """Return every distinct anchor ``href`` from *html* (document order), fully cleaned.
+
+    Uses ``BeautifulSoup`` and ``<a href=…>`` only — no regex href scanning.
+    """
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    tags = soup.find_all("a", href=True)
+
+    seen: set[str] = set()
+    out: list[str] = []
+
+    for tag in tags:
+        raw = tag.get("href")
+        if raw is None:
+            continue
+        link = clean_link(str(raw))
+        if not link:
+            continue
+
+        low = link.lower()
+        if low.startswith("http://") or low.startswith("https://"):
+            if len(link) <= 50 and _link_priority_score(link) > 0:
+                print(
+                    f"[DEBUG] SUSPICIOUS short tracking-like http(s) link "
+                    f"(len={len(link)}): {link}"
+                )
+        elif low.startswith("http") and not (
+            low.startswith("http://") or low.startswith("https://")
+        ):
+            print(f"[DEBUG] SUSPICIOUS non-standard http scheme prefix: {link[:120]}")
+
+        if link not in seen:
+            seen.add(link)
+            out.append(link)
+            if _should_print_link_debug():
+                print(f"[DEBUG] Link Length: {len(link)}")
+                print(f"[DEBUG] Link Preview: {link[:120]}")
+
+    return out
+
 
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -181,20 +287,37 @@ def _http_status_and_location(
 
 
 def extract_hrefs_from_html(html: str) -> list[str]:
-    """Return unique ``href`` values from raw HTML (double- or single-quoted)."""
+    """Return unique ``href`` values from raw HTML (BeautifulSoup ``<a href>`` only)."""
     raw_occurrences = html.lower().count("href=")
     RL.trace(
         _SRC,
         f"extract_hrefs_from_html() — html len={len(html):,}, raw 'href=' count={raw_occurrences}",
     )
-    seen: set[str] = set()
-    out: list[str] = []
-    for match in _HREF_PATTERN.finditer(html):
-        value = (match.group(1) if match.group(1) is not None else match.group(2)).strip()
-        if value and value not in seen:
-            seen.add(value)
-            out.append(value)
+    out = extract_all_links(html)
     RL.trace(_SRC, f"extract_hrefs_from_html() — {len(out)} unique hrefs")
+    max_len = max((len(x) for x in out), default=0)
+    if RL.is_debug():
+        RL.debug(
+            "tracking_hrefs",
+            f"  extract_hrefs_from_html summary: unique={len(out)}, "
+            f"max_href_len={max_len}, raw_href_token_count={raw_occurrences}",
+        )
+        if raw_occurrences > 0 and len(out) == 0:
+            RL.debug(
+                "tracking_hrefs",
+                "  WARNING: HTML contains 'href=' substrings but 0 <a href> links were "
+                "parsed (saved file may differ from inbox HTML, or hrefs are not on <a>).",
+            )
+        for i, h in enumerate(out[:25], 1):
+            RL.debug(
+                "tracking_hrefs",
+                f"  href[{i}] len={len(h)} preview={h[:200]!r}",
+            )
+        if len(out) > 25:
+            RL.debug(
+                "tracking_hrefs",
+                f"  … {len(out) - 25} more href(s) omitted from debug log (see JSON extracted_links)",
+            )
     return out
 
 
@@ -328,33 +451,49 @@ def href_final_pairs(
 def list_tracking_links_from_pairs(
     pairs: list[tuple[str, str]],
 ) -> list[str]:
-    """Distinct tracking destinations from pre-resolved ``(href, final)`` pairs (UTM-normalized dedupe)."""
+    """Distinct tracking URLs from ``(href, final)`` pairs (UTM-normalized dedupe).
+
+    Narvar-style CTAs often redirect to a generic retailer home URL that no longer
+    matches tracking heuristics, while the *raw* ``href`` still does. If either
+    raw or final classifies as tracking, we keep a link—preferring ``final`` when
+    *both* classify, otherwise the side that still matches.
+    """
     if not pairs:
+        _dbg("list_tracking_links_from_pairs: empty pairs (no hrefs extracted or resolved)")
         return []
 
-    seen_final: set[str] = set()
-    finals_unique: list[str] = []
-    for _, final in pairs:
-        if final not in seen_final:
-            seen_final.add(final)
-            finals_unique.append(final)
-
-    _dbg(f"classify: {len(finals_unique)} unique final URLs to check")
+    _dbg(f"classify: {len(pairs)} (href, final) pair(s) in document order")
     seen_norm: set[str] = set()
-    tracking_finals: list[str] = []
+    tracking_chosen: list[str] = []
 
-    for final in finals_unique:
-        verdict = url_classifies_as_tracking(final)
-        _dbg(f"  {'TRACKING    ' if verdict else 'not-tracking'}  {final[:120]}")
-        if not verdict:
+    for href, final in pairs:
+        raw_ok = url_classifies_as_tracking(href)
+        fin_ok = url_classifies_as_tracking(final)
+        if not raw_ok and not fin_ok:
+            _dbg(f"  not-tracking  raw={href[:120]}  final={final[:120]}")
             continue
-        norm = _strip_utm_for_dedupe(final)
+        chosen = final if fin_ok else href
+        if raw_ok and not fin_ok:
+            _dbg(
+                "  TRACKING (raw only — final landing page not matched)  "
+                f"final[:80]={final[:80]!r}"
+            )
+        else:
+            _dbg(f"  {'TRACKING    ' if fin_ok else 'TRACKING(raw)'}  {chosen[:120]}")
+        norm = _strip_utm_for_dedupe(chosen)
         if norm not in seen_norm:
+            if not is_absolute_browser_url(chosen):
+                _dbg(f"  skip (not a full http(s) URL): {chosen[:160]!r}")
+                continue
             seen_norm.add(norm)
-            tracking_finals.append(final)
+            tracking_chosen.append(chosen)
 
-    _dbg(f"list_tracking_links: {len(tracking_finals)} distinct tracking URL(s)")
-    return tracking_finals
+    _dbg(f"list_tracking_links: {len(tracking_chosen)} distinct tracking URL(s)")
+    if len(tracking_chosen) > 1:
+        indexed = list(enumerate(tracking_chosen))
+        indexed.sort(key=lambda t: (-_link_priority_score(t[1]), t[0]))
+        tracking_chosen = [t[1] for t in indexed]
+    return tracking_chosen
 
 
 def pick_tracking_link_from_pairs(

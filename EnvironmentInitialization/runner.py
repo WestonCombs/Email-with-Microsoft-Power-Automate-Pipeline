@@ -23,6 +23,7 @@ def _run_verifications(root: Path) -> None:
     folder_verification(root, "email_contents/pdf")
     folder_verification(root, "email_contents/html")
     folder_verification(root, "email_contents/json")
+    folder_verification(root, "email_contents/tracking_link_viewer_state")
     folder_verification(root, "logs/openai usage")
 
     # Files: parent dirs are created automatically; use overwrite=True only if you must truncate

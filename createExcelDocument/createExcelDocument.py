@@ -30,6 +30,11 @@ CLIPBOARD_INI_CELL = "AA1"
 # Hidden: plain-text file:/// URI per row. Copy Path cells use internal # links only
 # (Excel hyperlink events cannot cancel file:// navigation).
 COPY_PATH_URI_COL = 28  # column AB — keep equal to COL_FILE_URI in macro_template.py
+# Hidden full tracking URLs: column 29 + slot-1. Must match VBA COL_TRACK_URI_* in macro_template.py
+TRACKING_URI_COL_START = 29  # AC
+# One hidden column per visible tracking slot (Track 1 … Track N).
+TRACKING_LINK_VISIBLE_SLOTS = 15
+TRACKING_URI_SLOT_COUNT = TRACKING_LINK_VISIBLE_SLOTS  # AC through (28+N)
 
 # Optional .env overrides (absolute or relative paths expand from user / cwd).
 def _optional_path(env_name: str, default: Path) -> Path:
@@ -49,6 +54,9 @@ CLIPBOARD_LAUNCH_INI_PATH = _optional_path(
 EXCEL_PATH = str(
     _optional_path("EXCEL_OUTPUT_PATH", PROJECT_ROOT / "email_contents" / "orders.xlsx")
 )
+
+# Launched from Excel VBA (VIEWER= in excel_clipboard_launch.ini) for the "View Link List" column.
+TRACKING_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingLinkViewer" / "tracking_link_viewer.py"
 
 
 def _resolve_excel_output_path(using_template: bool) -> str:
@@ -89,7 +97,8 @@ def _macro_template_module():
 # Hairline vertical borders after View Email and after Tax Paid (section breaks).
 SECTION_BOUNDARY_KEYS = ("source_file_link", "tax_paid")
 
-COLUMN_ORDER = [
+# Tracking URLs: hidden columns AC–AQ for VBA + ``View Link List`` launches ``trackingLinkViewer``.
+_COLUMN_ORDER_PREFIX = [
     "email_category",
     "order_number",
     "purchase_datetime",
@@ -99,10 +108,10 @@ COLUMN_ORDER = [
     "source_file_link",
     "total_amount_paid",
     "tax_paid",
-    "tracking_number",
-    "tracking_link",
-    "duplicate_on_last_run",
 ]
+_COLUMN_ORDER_SUFFIX = ["open_tracking_list"]
+
+COLUMN_ORDER = _COLUMN_ORDER_PREFIX + _COLUMN_ORDER_SUFFIX
 
 COLUMN_HEADERS = {
     "email_category":        "Category",
@@ -112,9 +121,7 @@ COLUMN_HEADERS = {
     "email":                 "Email",
     "total_amount_paid":     "Total Paid",
     "tax_paid":              "Tax Paid",
-    "tracking_number":       "Tracking Number",
-    "tracking_link":         "Tracking Link (Unstable)",
-    "duplicate_on_last_run": "Duplicate On Last Run",
+    "open_tracking_list":    "View Link List",
     "copy_file_path":        "Copy Path",
     "source_file_link":      "View Email",
 }
@@ -225,9 +232,7 @@ def set_column_widths(ws, column_keys: list[str]):
         "email":                 30,
         "total_amount_paid":     14,
         "tax_paid":              12,
-        "tracking_number":       28,
-        "tracking_link":         44,
-        "duplicate_on_last_run": 24,
+        "open_tracking_list":    18,
         "copy_file_path":        12,
         "source_file_link":      14,
     }
@@ -311,22 +316,48 @@ def _tracking_urls_for_record(record: dict) -> list[str]:
     return []
 
 
-def _escape_excel_hyperlink_url(url: str) -> str:
-    """Double embedded double-quotes for use inside Excel HYPERLINK("...")."""
-    return (url or "").replace('"', '""')
+def apply_hidden_tracking_url_columns(
+    ws,
+    records: list[dict],
+    start_row: int,
+    *,
+    vba_friendly: bool = False,
+):
+    """Write JSON ``tracking_links`` into hidden columns (29…43) for VBA / View Link List viewer."""
+    if not records:
+        return
+    last_uri_col = TRACKING_URI_COL_START + TRACKING_URI_SLOT_COUNT - 1
+
+    for i, record in enumerate(records):
+        row_idx = start_row + i
+        urls = _tracking_urls_for_record(record)
+        for uc in range(TRACKING_URI_COL_START, last_uri_col + 1):
+            ws.cell(row=row_idx, column=uc, value=None)
+        if not vba_friendly:
+            continue
+        for j, u in enumerate(urls[:TRACKING_URI_SLOT_COUNT]):
+            ws.cell(row=row_idx, column=TRACKING_URI_COL_START + j, value=u)
+
+    if vba_friendly:
+        for uc in range(TRACKING_URI_COL_START, last_uri_col + 1):
+            ws.column_dimensions[get_column_letter(uc)].hidden = True
 
 
-def apply_tracking_link_column(
+def apply_open_tracking_list_column(
     ws,
     column_keys: list[str],
     records: list[dict],
     start_row: int,
+    *,
+    vba_friendly: bool = False,
 ):
-    """Show tracking URLs as ``tracking1``, ``tracking2``, … (clickable)."""
-    cols = _col_indices(column_keys, "tracking_link")
+    """``View Link List`` cell: VBA launches :mod:`trackingLinkViewer` with all row tracking URLs."""
+    cols = _col_indices(column_keys, "open_tracking_list")
     if not cols or not records:
         return
     col_idx = cols[0]
+    col_letter = get_column_letter(col_idx)
+    sn = _sheet_name_for_excel_ref(ws.title)
 
     for i, record in enumerate(records):
         row_idx = start_row + i
@@ -334,20 +365,16 @@ def apply_tracking_link_column(
         urls = _tracking_urls_for_record(record)
         cell.hyperlink = None
         if not urls:
+            cell.value = None
             continue
-        if len(urls) == 1:
-            cell.value = "tracking1"
-            cell.hyperlink = urls[0]
+        if vba_friendly:
+            cell.value = "View Link List"
+            cell.hyperlink = f"#{sn}!${col_letter}${row_idx}"
             cell.font = HYPERLINK_FONT
-            cell.alignment = LEFT_ALIGN
-            continue
-        parts: list[str] = []
-        for j, u in enumerate(urls, 1):
-            esc = _escape_excel_hyperlink_url(u)
-            parts.append(f'HYPERLINK("{esc}","tracking{j}")')
-        cell.value = "=" + ' & ", " & '.join(parts)
-        cell.font = CELL_FONT
-        cell.alignment = LEFT_ALIGN
+            cell.alignment = CENTER_ALIGN
+        else:
+            cell.value = "—"
+            cell.alignment = CENTER_ALIGN
 
 
 def _merge_border(cell, top=None, bottom=None, left=None, right=None):
@@ -431,6 +458,7 @@ def apply_header_border(ws):
 
 def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
     """Rebuild the Orders sheet from scratch (headers + rows + styling + hyperlinks)."""
+    vba_friendly = getattr(wb, "vba_archive", None) is not None
     column_keys, header_labels = _build_column_order()
 
     if "Orders" in wb.sheetnames:
@@ -468,7 +496,10 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
 
     apply_copy_path_hyperlink_columns(ws, copy_cols, start_row=2, records=records)
     apply_hyperlink_columns(ws, source_cols, start_row=2)
-    apply_tracking_link_column(ws, column_keys, records, start_row=2)
+    apply_hidden_tracking_url_columns(ws, records, start_row=2, vba_friendly=vba_friendly)
+    apply_open_tracking_list_column(
+        ws, column_keys, records, start_row=2, vba_friendly=vba_friendly
+    )
 
     ws.freeze_panes = "B2"
 
@@ -537,9 +568,17 @@ def append_to_workbook(path: str, records: list[dict]):
     apply_table_outline(ws)
     apply_order_group_borders(ws, records, start_row=next_row)
 
+    vba_friendly = Path(path).suffix.lower() == ".xlsm" and getattr(
+        wb, "vba_archive", None
+    ) is not None
     apply_copy_path_hyperlink_columns(ws, copy_cols, start_row=next_row, records=records)
     apply_hyperlink_columns(ws, source_cols, start_row=next_row)
-    apply_tracking_link_column(ws, desired_keys, records, start_row=next_row)
+    apply_hidden_tracking_url_columns(
+        ws, records, start_row=next_row, vba_friendly=vba_friendly
+    )
+    apply_open_tracking_list_column(
+        ws, desired_keys, records, start_row=next_row, vba_friendly=vba_friendly
+    )
 
     ws.freeze_panes = "B2"
 
@@ -548,7 +587,10 @@ def append_to_workbook(path: str, records: list[dict]):
         if macro_mod is not None:
             script_path = Path(__file__).resolve().parent / "copy_email_path_to_clipboard.py"
             ini_written = macro_mod.write_clipboard_launch_ini(
-                CLIPBOARD_LAUNCH_INI_PATH, sys.executable, script_path
+                CLIPBOARD_LAUNCH_INI_PATH,
+                sys.executable,
+                script_path,
+                viewer_script=TRACKING_VIEWER_SCRIPT,
             )
             set_clipboard_ini_cell(wb, ini_written)
 
@@ -592,7 +634,10 @@ def main():
         m = macro_mod if macro_mod is not None else _macro_template_module()
         script_path = Path(__file__).resolve().parent / "copy_email_path_to_clipboard.py"
         ini_written = m.write_clipboard_launch_ini(
-            CLIPBOARD_LAUNCH_INI_PATH, sys.executable, script_path
+            CLIPBOARD_LAUNCH_INI_PATH,
+            sys.executable,
+            script_path,
+            viewer_script=TRACKING_VIEWER_SCRIPT,
         )
         set_clipboard_ini_cell(wb, ini_written)
         print(f"Wrote clipboard launcher config: {ini_written}")

@@ -29,15 +29,30 @@ On **Windows**, when you run createExcelDocument (or the full pipeline):
 
      <python_files>/excel_clipboard_launch.ini
 
-   It lists `python.exe` and `copy_email_path_to_clipboard.py`. The workbook stores the
-   **full path** to that ini in hidden cell **AA1**, so the macro finds it even though
-   `orders.xlsm` lives under `email_contents`.
+   It lists `python.exe`, `copy_email_path_to_clipboard.py`, and **`trackingLinkViewer/tracking_link_viewer.py`**
+   as `VIEWER=`. The workbook stores the **full path** to that ini in hidden cell **AA1**, so the macro
+   finds it even though `orders.xlsm` lives under `email_contents`.
 
    Override with `EXCEL_CLIPBOARD_INI_PATH` in `.env`.
 
 3. The workbook is saved as **`orders.xlsm`** (under `email_contents` by default) when
    the template exists. Copy Path cells use **in-workbook `#` hyperlinks** only; the real
    `file:///…` path is in hidden column **AB** (28).
+
+4. **Tracking links (long URLs):** Up to **15** URLs per row from JSON ``tracking_links`` are stored in
+   **hidden** columns **AC** through **AQ** (29…43). There are no per-link cells in the visible grid;
+   use **View Link List** (below) to open them.
+
+   **Unhide URL columns (optional):** Select **AC:AQ** in the **Name Box**, press Enter, then
+   right‑click → **Unhide** if you want to inspect raw URLs in Excel.
+
+5. **View Link List:** When a row has tracking URLs, the **View Link List** cell is a `#` in-sheet link; VBA
+   collects AC–AQ for that row, writes a temp UTF-8 `.txt` (one URL per line) and a matching
+   `.ctx.tsv` with **Company**, **Order Number**, **Category**, etc. from that row, then runs
+   `VIEWER=` from the ini **without showing a console window**. The **tracking link viewer** is a
+   small grid (**#**, **Item**, **Description**, **Tracking link**): **single-click** expands the full
+   URL in the last column; **double-click** opens the URL in your browser. Optional **Describe with
+   OpenAI** uses `OPENAI_API_KEY` from `.env` (override model with `TRACKING_VIEWER_OPENAI_MODEL`).
 
 You do **not** need to paste VBA by hand for normal use.
 
@@ -67,7 +82,9 @@ Updating the embedded macro after a code change
 The VBA lives inside `orders_template.xlsm`. After pulling a fix, delete
 `python_files/orders_template.xlsm` once and run createExcelDocument so Excel
 automation rebuilds it from `macro_template.py` (or paste the latest `THISWORKBOOK_VBA`
-into ThisWorkbook).
+into ThisWorkbook). This is required after VBA changes so **Copy Path** and **View Link List**
+keep working; the generated `orders.xlsm` keeps whatever VBA was in the template when
+it was loaded.
 
 Manual fallback (only if automation failed)
 --------------------------------------------
