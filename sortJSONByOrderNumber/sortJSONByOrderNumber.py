@@ -40,6 +40,15 @@ def main():
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    try:
+        from grabbingImportantEmailContent.grabbingImportantEmailContent import (
+            apply_order_company_consensus_and_sync,
+        )
+
+        apply_order_company_consensus_and_sync(data, PROJECT_ROOT)
+    except Exception as e:
+        print(f"  WARNING: order-level company consensus skipped: {e}")
+
     data.sort(key=lambda x: (
         x.get("order_number") is None,
         str(x.get("order_number") or ""),

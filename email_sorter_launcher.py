@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
@@ -96,6 +97,19 @@ def _find_workbook_by_path(excel_app, path: str):
     return None
 
 
+def orders_workbook_open_in_excel(target: Path) -> bool:
+    """True if Excel has this workbook open (Windows + pywin32)."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import win32com.client
+
+        excel = win32com.client.GetActiveObject("Excel.Application")
+    except Exception:
+        return False
+    return _find_workbook_by_path(excel, str(target.resolve())) is not None
+
+
 def focus_or_open_orders_workbook() -> None:
     target = resolve_orders_workbook_path()
     if target is None:
@@ -143,23 +157,6 @@ def focus_or_open_orders_workbook() -> None:
         os.startfile(path_str)
     except OSError as e:
         messagebox.showerror("Excel", f"Could not open file:\n{e}")
-
-
-def start_main_runner() -> None:
-    script = _PYTHON_FILES_DIR / "mainRunner.py"
-    if not script.is_file():
-        messagebox.showerror("Run", f"Missing {script.name}")
-        return
-    kwargs: dict = {
-        "args": [sys.executable, str(script)],
-        "cwd": str(_PYTHON_FILES_DIR),
-    }
-    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NEW_CONSOLE"):
-        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[assignment]
-    try:
-        subprocess.Popen(**kwargs)
-    except OSError as e:
-        messagebox.showerror("Run", str(e))
 
 
 def prompt_update() -> None:
@@ -273,27 +270,90 @@ def main() -> None:
     inner = tk.Frame(root, padx=28, pady=8)
     inner.pack(fill=tk.BOTH, expand=True)
 
-    tk.Button(
+    run_in_progress = False
+
+    def set_pipeline_ui_busy(busy: bool) -> None:
+        st = tk.DISABLED if busy else tk.NORMAL
+        run_btn.config(state=st)
+        excel_btn.config(state=st)
+
+    def on_excel() -> None:
+        if run_in_progress:
+            messagebox.showinfo(
+                "Excel",
+                "Wait until Run finishes before opening the workbook in Excel.",
+            )
+            return
+        focus_or_open_orders_workbook()
+
+    def on_run() -> None:
+        nonlocal run_in_progress
+        if run_in_progress:
+            return
+        script = _PYTHON_FILES_DIR / "mainRunner.py"
+        if not script.is_file():
+            messagebox.showerror("Run", f"Missing {script.name}")
+            return
+        target = resolve_orders_workbook_path()
+        if target is not None and target.is_file() and orders_workbook_open_in_excel(target):
+            messagebox.showwarning(
+                "Run",
+                "Close the orders workbook in Excel before running.\n\n"
+                "The pipeline needs the file closed for a stable run.",
+            )
+            return
+        kwargs: dict = {
+            "args": [sys.executable, str(script)],
+            "cwd": str(_PYTHON_FILES_DIR),
+        }
+        if sys.platform == "win32" and hasattr(subprocess, "CREATE_NEW_CONSOLE"):
+            kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[assignment]
+
+        run_in_progress = True
+        set_pipeline_ui_busy(True)
+
+        def worker() -> None:
+            err: str | None = None
+            try:
+                p = subprocess.Popen(**kwargs)
+                p.wait()
+            except OSError as e:
+                err = str(e)
+
+            def done() -> None:
+                nonlocal run_in_progress
+                run_in_progress = False
+                set_pipeline_ui_busy(False)
+                if err is not None:
+                    messagebox.showerror("Run", err)
+
+            root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    run_btn = tk.Button(
         inner,
         text="Run",
         bg="#1e88e5",
         fg="white",
         activebackground="#1565c0",
         activeforeground="white",
-        command=start_main_runner,
+        command=on_run,
         **common_btn,
-    ).pack(fill=tk.X, **pad)
+    )
+    run_btn.pack(fill=tk.X, **pad)
 
-    tk.Button(
+    excel_btn = tk.Button(
         inner,
         text="Excel",
         bg="#43a047",
         fg="white",
         activebackground="#2e7d32",
         activeforeground="white",
-        command=focus_or_open_orders_workbook,
+        command=on_excel,
         **common_btn,
-    ).pack(fill=tk.X, **pad)
+    )
+    excel_btn.pack(fill=tk.X, **pad)
 
     tk.Button(
         inner,

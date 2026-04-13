@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -99,6 +100,15 @@ RATE_LIMIT_COOLDOWN_CAP = 10           # max seconds to sleep per cooldown itera
 EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_BAD_ARGS = 2
+# OpenAI returned 429 on every attempt until retries exhausted (quota / rate limit).
+# mainRunner.py must use the same numeric code when handling the subprocess.
+EXIT_OPENAI_RATE_LIMIT_FATAL = 3
+
+
+class OpenAIRateLimitFatalError(Exception):
+    """Raised when every OpenAI chat completion attempt failed with RateLimitError."""
+
+    pass
 
 client = OpenAI(api_key=API_KEY)
 
@@ -489,6 +499,62 @@ def _estimate_remaining(remain: int, limit: int, reset_secs: float, elapsed: flo
     return min(limit, remain + int((elapsed / reset_secs) * limit))
 
 
+def _openai_rate_limit_debug(exc: RateLimitError) -> tuple[str, str]:
+    """Build (short one-line summary, full multi-line block) for 429 responses."""
+    lines: list[str] = [
+        f"message: {exc.message}",
+        f"status_code: {exc.status_code}",
+    ]
+    rid = getattr(exc, "request_id", None)
+    if rid:
+        lines.append(f"x-request-id: {rid}")
+
+    body = getattr(exc, "body", None)
+    if body is not None:
+        try:
+            lines.append("body:\n" + json.dumps(body, ensure_ascii=False, indent=2))
+        except (TypeError, ValueError):
+            lines.append(f"body: {body!r}")
+
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        h = resp.headers
+        for key in (
+            "retry-after",
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-remaining-requests",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-limit-tokens",
+            "x-ratelimit-remaining-tokens",
+            "x-ratelimit-reset-tokens",
+        ):
+            val = h.get(key)
+            if val:
+                lines.append(f"{key}: {val}")
+
+    full = "\n".join(lines)
+
+    short_parts: list[str] = []
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            for k in ("code", "type"):
+                v = err.get(k)
+                if v:
+                    short_parts.append(f"{k}={v}")
+            em = err.get("message")
+            if isinstance(em, str) and em.strip():
+                short_parts.append(em.strip()[:200])
+    if resp is not None:
+        ra = resp.headers.get("retry-after")
+        if ra:
+            short_parts.append(f"retry-after={ra}s")
+    if rid:
+        short_parts.append(f"request_id={rid}")
+    short = "  |  ".join(short_parts) if short_parts else exc.message[:240]
+    return short, full
+
+
 def _check_and_throttle(headers) -> float:
     """Inspect rate-limit headers; if usage >= threshold, sleep and re-check in a loop.
 
@@ -572,12 +638,19 @@ def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
             response = raw_resp.parse()
             total_waited += _check_and_throttle(raw_resp.headers)
             break
-        except RateLimitError:
+        except RateLimitError as e:
             print(f"  Rate limit hit (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}) — waiting {RATE_LIMIT_RETRY_WAIT}s...")
+            if RL.is_debug():
+                short, full = _openai_rate_limit_debug(e)
+                print(f"  {short}")
+                RL.debug(
+                    "grabbingImportantEmailContent",
+                    f"OpenAI RateLimitError (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}):\n{full}\n",
+                )
             time.sleep(RATE_LIMIT_RETRY_WAIT)
             total_waited += RATE_LIMIT_RETRY_WAIT
     else:
-        raise RuntimeError(
+        raise OpenAIRateLimitFatalError(
             f"OpenAI rate limit not cleared after {RATE_LIMIT_MAX_RETRIES} retries "
             f"({total_waited:.0f}s total wait)"
         )
@@ -915,6 +988,10 @@ def process_file(
                 RL.debug("grabbingImportantEmailContent",
                     f"  [step5] {_openai_fields_log_line(extracted)}"
                 )
+            except OpenAIRateLimitFatalError:
+                timings["step5_s"] = round(_time.perf_counter() - t5, 3)
+                print(f"FAILED  ({timings['step5_s']:.2f}s)")
+                raise
             except Exception as e:
                 timings["step5_s"] = round(_time.perf_counter() - t5, 3)
                 print(f"FAILED  ({timings['step5_s']:.2f}s, {e})")
@@ -950,6 +1027,10 @@ def process_file(
                     else ("items invoice" if gift_verdict is False else "inconclusive")
                 )
                 print(f"done  ({timings['step5b_s']:.2f}s, {gv_label})")
+            except OpenAIRateLimitFatalError:
+                timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
+                print(f"FAILED  ({timings['step5b_s']:.2f}s)")
+                raise
             except Exception as e:
                 timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
                 print(f"FAILED  ({timings['step5b_s']:.2f}s, {e})")
@@ -1205,6 +1286,158 @@ def archive_html_before_pdf(source_html: Path, record: dict, html_folder: Path) 
 
 
 # =========================
+# COMPANY NAME CONSENSUS (per order_number)
+# =========================
+
+
+def _normalized_order_key(record: dict) -> str:
+    """Stable order id for grouping rows (same as Excel / JSON order_number)."""
+    v = record.get("order_number")
+    if v is None:
+        return ""
+    s = str(v).replace("\ufeff", "").strip()
+    return s
+
+
+def _company_vote_key(company: str | None) -> str:
+    """Normalize company for plurality voting (case, spacing, & vs 'and')."""
+    c = clean_text(company)
+    if not c:
+        return ""
+    s = c.casefold()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("&", " and ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def unify_company_names_by_order(results: list[dict]) -> None:
+    """For each order_number shared by 2+ rows, set ``company`` to the plurality winner.
+
+    Voting uses a normalized key so variants like 'Bath & Body Works' and
+    'bath and body works' count together; the displayed string is the most
+    frequent *original* spelling among rows in the winning bucket.
+    """
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for r in results:
+        ok = _normalized_order_key(r)
+        if ok:
+            groups[ok].append(r)
+
+    for order_key, group in groups.items():
+        if len(group) < 2:
+            continue
+
+        key_votes: Counter[str] = Counter()
+        originals_by_vote_key: dict[str, list[str]] = defaultdict(list)
+
+        for r in group:
+            raw = clean_text(r.get("company"))
+            if not raw:
+                continue
+            vk = _company_vote_key(raw)
+            if not vk:
+                continue
+            key_votes[vk] += 1
+            originals_by_vote_key[vk].append(raw)
+
+        if not key_votes:
+            continue
+
+        winning_vote_key = sorted(
+            key_votes.items(),
+            key=lambda kv: (
+                -kv[1],
+                -max((len(x) for x in originals_by_vote_key[kv[0]]), default=0),
+                kv[0],
+            ),
+        )[0][0]
+
+        origs = originals_by_vote_key[winning_vote_key]
+        oc = Counter(origs)
+        winner_display = sorted(
+            oc.items(),
+            key=lambda kv: (-kv[1], -len(kv[0]), kv[0]),
+        )[0][0]
+
+        before_vals = [clean_text(r.get("company")) for r in group]
+        for r in group:
+            r["company"] = winner_display
+
+        if any(b != winner_display for b in before_vals):
+            print(
+                f"  Company consensus (order {order_key}): {winner_display!r} "
+                f"— {key_votes[winning_vote_key]} vote(s) for winning label, "
+                f"{len(group)} row(s) updated"
+            )
+
+
+def rename_assets_to_match_record(
+    record: dict, pdf_folder: Path, html_folder: Path
+) -> None:
+    """Rename PDF and archived HTML so basenames match :func:`build_convention_filename`."""
+    src = record.get("source_file")
+    if not src:
+        return
+    old_pdf = Path(src)
+    if not old_pdf.is_absolute():
+        old_pdf = pdf_folder / old_pdf.name
+    if not old_pdf.is_file():
+        return
+
+    ext = old_pdf.suffix
+    want_name = build_convention_filename(record, ext)
+    if old_pdf.name == want_name:
+        return
+
+    new_pdf = pdf_folder / want_name
+    counter = 2
+    while new_pdf.exists() and new_pdf.resolve() != old_pdf.resolve():
+        stem = Path(want_name).stem
+        new_pdf = pdf_folder / f"{stem} ({counter}){ext}"
+        counter += 1
+
+    old_stem = old_pdf.stem
+    old_pdf.rename(new_pdf)
+
+    old_html = html_folder / f"{old_stem}.html"
+    if old_html.is_file():
+        new_html = html_folder / f"{new_pdf.stem}.html"
+        c2 = 2
+        while new_html.exists() and new_html.resolve() != old_html.resolve():
+            new_html = html_folder / f"{new_pdf.stem} ({c2}).html"
+            c2 += 1
+        old_html.rename(new_html)
+
+    record["source_file"] = clean_text(new_pdf)
+    record["source_file_link"] = (
+        "file:///" + str(new_pdf.resolve()).replace("\\", "/")
+    )
+
+
+def apply_order_company_consensus_and_sync(
+    results: list[dict], base_dir: Path
+) -> None:
+    """Update ``company`` by order-number plurality and rename PDF/HTML to match."""
+    pdf_folder = base_dir / "email_contents" / "pdf"
+    html_folder = base_dir / "email_contents" / "html"
+    unify_company_names_by_order(results)
+    for r in results:
+        try:
+            rename_assets_to_match_record(r, pdf_folder, html_folder)
+        except OSError as e:
+            print(f"  WARNING: could not sync filenames for {r.get('source_file')}: {e}")
+
+
+def _write_results_with_consensus(
+    output_path: Path, results: list[dict], base: Path
+) -> None:
+    apply_order_company_consensus_and_sync(results, base)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+
+# =========================
 # DEDUPLICATION
 # =========================
 def compute_file_hash(file_path: Path) -> str:
@@ -1234,6 +1467,24 @@ def _load_existing_results(output_path: Path) -> list[dict]:
 def _known_hashes(results: list[dict]) -> set[str]:
     """Collect all content_hash values from existing results."""
     return {r["content_hash"] for r in results if r.get("content_hash")}
+
+
+def _print_openai_fatal_banner() -> None:
+    """Console message when OpenAI retries are exhausted (subprocess — no GUI here)."""
+    print(
+        "\n"
+        + "=" * 60
+        + "\n"
+        "FATAL: OpenAI API — could not complete after all automatic retries.\n"
+        "\n"
+        "A moderator must fix the OPENAI_API_KEY and the OpenAI account it belongs to\n"
+        "(billing, quota, and key/project scope at platform.openai.com).\n"
+        "\n"
+        "This run stops here. Remaining emails were not processed.\n"
+        + "=" * 60
+        + "\n",
+        file=sys.stderr,
+    )
 
 
 # =========================
@@ -1311,8 +1562,7 @@ def main(flow_started_at: datetime | None = None):
                 if r.get("content_hash") == file_hash:
                     r["duplicate_on_last_run"] = 1
                     break
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2, ensure_ascii=False)
+            _write_results_with_consensus(output_path, results, base)
             return
 
         file_path = rename_single_file(file_path, pdf_folder)
@@ -1339,8 +1589,7 @@ def main(flow_started_at: datetime | None = None):
 
         results.append(entry)
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        _write_results_with_consensus(output_path, results, base)
 
         print(f"  Result saved to: {output_path} ({len(results)} total records)")
         return
@@ -1396,8 +1645,7 @@ def main(flow_started_at: datetime | None = None):
         hashes.add(file_hash)
         new_count += 1
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    _write_results_with_consensus(output_path, results, base)
 
     print(f"\n  Done. {new_count} new + {len(results) - new_count} existing = {len(results)} total records → {output_path}")
 
@@ -1433,6 +1681,12 @@ if __name__ == "__main__":
             print("Set BASE_DIR and OPENAI_API_KEY in python_files/.env.")
             print("Optional args: --file, --subject, --sender-name, --email")
         sys.exit(e.code)
+    except OpenAIRateLimitFatalError as e:
+        _elapsed = time.time() - _start_time
+        _print_openai_fatal_banner()
+        print(f"Detail: {e}", file=sys.stderr)
+        print(f"Total operation time: {_elapsed:.2f}s")
+        sys.exit(EXIT_OPENAI_RATE_LIMIT_FATAL)
     except Exception as e:
         _elapsed = time.time() - _start_time
         print(f"\nERROR: {e}")

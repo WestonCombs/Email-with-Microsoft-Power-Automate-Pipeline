@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import html
 import re
+import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -15,6 +18,10 @@ class EmailMessage:
     subject: str
     body_html: str
     attachments: list[tuple[str, bytes]] = field(default_factory=list)
+    # Outlook-style header (optional; filled by Graph fetcher when available)
+    to_line: str = ""
+    sent_line: str = ""
+    header_title: str = ""
 
     @property
     def sender_email(self) -> str:
@@ -23,6 +30,98 @@ class EmailMessage:
     @property
     def sender_name(self) -> str:
         return extract_sender_name(self.from_raw)
+
+
+def format_graph_datetime_local(iso_ts: str | None) -> str:
+    """Graph ISO timestamp (e.g. ending in Z) → local 'Wednesday, April 1, 2026 5:30 PM'."""
+    if not iso_ts or not iso_ts.strip():
+        return ""
+    try:
+        s = iso_ts.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone()
+        if sys.platform == "win32":
+            time_part = local.strftime("%#I:%M %p")
+        else:
+            time_part = local.strftime("%-I:%M %p")
+        return f"{local.strftime('%A, %B ')}{local.day}, {local.year} {time_part}"
+    except ValueError:
+        return iso_ts.strip()
+
+
+def _build_outlook_header_fragment(msg: EmailMessage) -> str:
+    """HTML fragment: bold recipient title, rule, then From / Sent / To / Subject rows."""
+    rows = []
+    if msg.from_raw.strip():
+        rows.append(
+            ("From", msg.from_raw.strip()),
+        )
+    if msg.sent_line.strip():
+        rows.append(("Sent", msg.sent_line.strip()))
+    if msg.to_line.strip():
+        rows.append(("To", msg.to_line.strip()))
+    subj = msg.subject or ""
+    rows.append(("Subject", subj))
+
+    inner_rows = []
+    for label, value in rows:
+        inner_rows.append(
+            "<tr>"
+            f'<td style="font-weight:bold;white-space:nowrap;vertical-align:top;'
+            f'padding:2px 12px 2px 0;font-family:Arial,Helvetica,sans-serif;">'
+            f"{html.escape(label)}:</td>"
+            f'<td style="vertical-align:top;padding:2px 0;font-family:Arial,Helvetica,sans-serif;">'
+            f"{html.escape(value)}</td>"
+            "</tr>"
+        )
+
+    table = (
+        '<table style="border-collapse:collapse;width:100%;max-width:900px;">'
+        + "".join(inner_rows)
+        + "</table>"
+    )
+
+    title = (msg.header_title or "").strip()
+    parts: list[str] = [
+        '<div class="email-meta-header" style="margin-bottom:16px;">',
+    ]
+    if title:
+        parts.append(
+            '<div style="font-weight:bold;font-size:14pt;font-family:Arial,Helvetica,sans-serif;">'
+            f"{html.escape(title)}</div>"
+            '<hr style="border:none;border-top:2px solid #000;margin:8px 0;" />'
+        )
+    parts.append(table)
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def prepend_outlook_style_header(body_html: str, msg: EmailMessage) -> str:
+    """Put an Outlook-like metadata block at the top of the saved HTML (and thus the PDF)."""
+    header = _build_outlook_header_fragment(msg)
+    m = re.search(r"(<body[^>]*>)", body_html, re.IGNORECASE | re.DOTALL)
+    if m:
+        pos = m.end()
+        return body_html[:pos] + "\n" + header + "\n" + body_html[pos:]
+    m_head = re.search(r"(</head\s*>)", body_html, re.IGNORECASE | re.DOTALL)
+    if m_head:
+        insert_at = m_head.end()
+        return (
+            body_html[:insert_at]
+            + "\n<body>\n"
+            + header
+            + "\n"
+            + body_html[insert_at:]
+        )
+    return (
+        "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\" /></head><body>\n"
+        + header
+        + "\n"
+        + body_html
+        + "\n</body></html>\n"
+    )
 
 
 def extract_email(text: str) -> str:

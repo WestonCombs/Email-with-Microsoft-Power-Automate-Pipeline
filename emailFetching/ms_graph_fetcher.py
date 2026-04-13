@@ -13,7 +13,7 @@ from pathlib import Path
 
 import msal
 
-from .emailFetcher import EmailMessage, save_attachments
+from .emailFetcher import EmailMessage, format_graph_datetime_local, save_attachments
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 # Silent MSAL refresh can block indefinitely; cap it so stale/expired sessions fail fast.
@@ -340,13 +340,27 @@ def fetch_emails(
         safe_mid = urllib.parse.quote(mid, safe="")
         detail_url = (
             f"{GRAPH_ROOT}/me/messages/{safe_mid}"
-            f"?$select=body,from,subject,hasAttachments"
+            f"?$select=body,from,subject,hasAttachments,sentDateTime,receivedDateTime,toRecipients"
         )
         detail = _graph_get(detail_url, token)
 
         from_raw = _recipient_to_from_raw(detail.get("from"))
         subject = detail.get("subject") or ""
         body_html = _message_body_html(detail.get("body"))
+
+        to_recs = detail.get("toRecipients") or []
+        to_line = ", ".join(
+            x for x in (_recipient_to_from_raw(r) for r in to_recs) if x
+        )
+        header_title = ""
+        if to_recs:
+            ea0 = (to_recs[0].get("emailAddress") or {})
+            header_title = (ea0.get("name") or "").strip() or (
+                ea0.get("address") or ""
+            ).strip()
+
+        sent_iso = detail.get("sentDateTime") or detail.get("receivedDateTime")
+        sent_line = format_graph_datetime_local(sent_iso)
 
         attachments: list[tuple[str, bytes]] = []
         if detail.get("hasAttachments"):
@@ -363,6 +377,9 @@ def fetch_emails(
                 subject=subject,
                 body_html=body_html,
                 attachments=attachments,
+                to_line=to_line,
+                sent_line=sent_line,
+                header_title=header_title,
             )
         )
 
