@@ -171,7 +171,7 @@ from dotenv import load_dotenv
 load_dotenv(_PYTHON_FILES_DIR / ".env")
 
 import runLogger as RL
-from emailFetching.emailFetcher import fetch_emails
+from emailFetching.emailFetcher import fetch_emails, prepend_outlook_style_header
 
 BASE_DIR_ENV = "BASE_DIR"
 OPENAI_USAGE_REL = Path("logs") / "openai usage"
@@ -250,6 +250,36 @@ def print_usage_summary(usage_log_path: Path) -> None:
     print(f"  Usage log: {usage_log_path}")
 
 
+# Must match grabbingImportantEmailContent.EXIT_OPENAI_RATE_LIMIT_FATAL
+_OPENAI_FATAL_EXIT = 3
+
+
+def _prompt_openai_moderator_action() -> None:
+    """Tell the user (console + dialog) that OpenAI quota/rate must be fixed by a moderator."""
+    msg = (
+        "OpenAI failed after all automatic retries (rate limit / quota exhausted).\n\n"
+        "A moderator must fix the OPENAI_API_KEY and the OpenAI account it is tied to "
+        "(billing, limits, and key scope at platform.openai.com).\n\n"
+        "This run has been stopped. Remaining emails were not processed."
+    )
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("FATAL: OpenAI API — action required (moderator)", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print(msg, file=sys.stderr)
+    print("=" * 60 + "\n", file=sys.stderr)
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showerror("OpenAI — moderator action required", msg, parent=root)
+        root.destroy()
+    except Exception:
+        pass
+
+
 def _rebuild_email_html_archive_folder(html_dir: Path) -> None:
     """Empty archived HTML folder before a run that will create PDFs (non-duplicates only)."""
     html_dir.mkdir(parents=True, exist_ok=True)
@@ -308,6 +338,9 @@ def run_grabbing_important_content(
     if timing_buffer_path:
         env["TIMING_BUFFER_PATH"] = str(timing_buffer_path)
     result = subprocess.run(cmd, cwd=str(_PYTHON_FILES_DIR), env=env)
+    if result.returncode == _OPENAI_FATAL_EXIT:
+        _prompt_openai_moderator_action()
+        sys.exit(_OPENAI_FATAL_EXIT)
     if result.returncode != 0:
         print(f"  WARNING: extractor exited with code {result.returncode}")
 
@@ -553,7 +586,10 @@ def main() -> None:
         print(f"[{i}/{n_emails}] \"{subj_display}\" — {msg.sender_name} <{msg.sender_email}>")
 
         email_html = pdf_dir / f"file{i}.html"
-        email_html.write_text(msg.body_html, encoding="utf-8")
+        email_html.write_text(
+            prepend_outlook_style_header(msg.body_html, msg),
+            encoding="utf-8",
+        )
 
         t_email = time.perf_counter()
         run_grabbing_important_content(
