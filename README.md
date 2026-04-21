@@ -1,4 +1,4 @@
-# Email Sorter (Python)
+﻿# Email Sorter (Python)
 
 Fetches shopping emails via **Microsoft Graph** (OAuth 2.0), extracts structured order data with the OpenAI API, stores results as JSON, sorts them, and builds an Excel workbook. Everything runs from a single entry point — `mainRunner.py`.
 
@@ -73,7 +73,7 @@ This single command runs the full pipeline:
 
 An OpenAI usage log (`usageN.txt`) is created per run in `BASE_DIR/logs/openai usage/`. A summary with total tokens, cost, and average time per email is printed at the end.
 
-Logs and admin traces go under `BASE_DIR/logs/` (see `runLogger.py`) and `BASE_DIR/adminLog/` as applicable.
+Logs and admin traces go under `BASE_DIR/logs/` (see `shared/runLogger.py`) and `BASE_DIR/adminLog/` as applicable.
 
 ## Project layout
 
@@ -84,3 +84,13 @@ Logs and admin traces go under `BASE_DIR/logs/` (see `runLogger.py`) and `BASE_D
 - `sortJSONByOrderNumber/` — sort `results.json`
 - `createExcelDocument/` — JSON → Excel
 - `htmlHandler/` — HTML cleanup and helpers used by the extractor
+
+
+## Current Layout
+
+- `shared/` contains reusable helpers such as logging, GUI utilities, and theme constants.
+- `assets/images/` holds bundled local artwork used by the launchers.
+- `tools/git/` holds repository maintenance helpers like `pull_latest.py`.
+
+
+

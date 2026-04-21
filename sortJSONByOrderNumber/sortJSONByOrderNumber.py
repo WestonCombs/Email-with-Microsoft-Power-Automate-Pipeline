@@ -10,11 +10,13 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import runLogger as RL
+from shared import runLogger as RL
 
 _base_dir_raw = os.getenv("BASE_DIR")
 if not _base_dir_raw:
-    raise ValueError("BASE_DIR is not set in python_files/.env")
+    raise ValueError(
+        'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
+    )
 
 PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
 INPUT_FILE  = PROJECT_ROOT / "email_contents" / "json" / "results.json"

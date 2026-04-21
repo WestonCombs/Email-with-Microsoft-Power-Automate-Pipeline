@@ -128,6 +128,8 @@ def gift_order_link_label(
 ) -> str | None:
     """Cell text for Invoice link column. *order_num* = normalized order for this row."""
     cat = (category or "").strip() if isinstance(category, str) else ""
+    if cat == "Automation Hub":
+        return None
     if cat == "Gift Card":
         return "Linked" if any(e.gift_key == gift_key for e in edges) else "Link to order"
     if not cat:
@@ -139,4 +141,3 @@ def gift_order_link_label(
         if any(e.order_number == order_num for e in edges)
         else "Link to Gift Card"
     )
-

@@ -13,6 +13,37 @@ __pycache__/
 excel_clipboard_launch.ini
 
 # Logs may contain emails, paths, names, and order details
+adminLog/
 run_log.txt
 trackingLinkConsoleOutput.txt
-environmentInitialization/console_log
+EnvironmentInitialization/console_log
+
+# PDF capture (mitmproxy): debug-mode-only mitmdump logs; legacy capture filenames
+**/mitmdump.stdout.log
+**/mitmdump.stderr.log
+**/mitm_out.txt
+**/mitm_err.txt
+**/pdf_capture_session.log
+
+# PDF capture: Chrome profile (cache, IndexedDB, GPUCache, cookies, etc.) — recreated at runtime
+**/chrome_user_data_mitm/
+
+# PDF capture: downloaded PDFs and session marker when runtime dir is under the repo
+pdfCaptureFromChrome/captured_pdfs/
+**/.pdfCaptureFromChrome_done.json
+
+# PDF capture runtime when BASE_DIR is set (see pdfCaptureFromChrome/paths.py)
+logs/pdfCaptureFromChrome/
+
+# Tool / package caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Windows Explorer metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini

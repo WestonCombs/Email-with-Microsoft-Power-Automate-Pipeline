@@ -38,7 +38,7 @@ from pathlib import Path
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 except ImportError:
     pass
 
@@ -56,7 +56,11 @@ _INCLUDE_TRACE_SAMPLES = os.getenv("TRACE_INCLUDE_SAMPLES", "").strip().lower() 
 
 def _logs_dir() -> Path:
     base = (os.getenv("BASE_DIR") or "").strip()
-    root = Path(base).expanduser().resolve() if base else Path(__file__).resolve().parent
+    if not base:
+        raise ValueError(
+            'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
+        )
+    root = Path(base).expanduser().resolve()
     d = root / "logs"
     try:
         d.mkdir(parents=True, exist_ok=True)

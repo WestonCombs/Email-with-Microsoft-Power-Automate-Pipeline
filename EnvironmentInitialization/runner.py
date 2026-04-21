@@ -1,4 +1,4 @@
-"""Entry point for Power Automate: load BASE_DIR from .env, then run the verification checklist below."""
+"""Entry point for Power Automate: load BASE_DIR (from ``python_files/.env``, set via Email Sorter → Settings), then run the verification checklist below."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ def _run_verifications(root: Path) -> None:
     folder_verification(root, "email_contents/attachments", clear_if_exists=True)
     folder_verification(root, "email_contents/pdf")
     folder_verification(root, "email_contents/html")
+    folder_verification(root, "custom_import_html_files")
     folder_verification(root, "email_contents/json")
     folder_verification(root, "email_contents/tracking_link_viewer_state")
     folder_verification(root, "logs/openai usage")
@@ -37,12 +38,12 @@ def main() -> int:
 
     load_dotenv(_ENV_PATH)
 
-    import runLogger as RL
+    from shared import runLogger as RL
 
     base_raw = os.getenv(BASE_DIR_ENV)
     if not base_raw:
         print(
-            f"ERROR: {BASE_DIR_ENV} is not set. Add it to {_ENV_PATH}",
+            f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
             file=sys.stderr,
         )
         return 1

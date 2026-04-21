@@ -28,19 +28,37 @@ load_dotenv(_PYTHON_FILES / ".env")
 
 import os
 
-from gui_aux_singleton import detach_console_win32, register_current_aux_gui
+from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
 
 _base = os.getenv("BASE_DIR")
 if not _base:
-    print("BASE_DIR missing from .env", file=sys.stderr)
+    print(
+        'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 PROJECT_ROOT = Path(_base).expanduser().resolve()
 JSON_PATH = PROJECT_ROOT / "email_contents" / "json" / "results.json"
 
+_REFRESH_ATTEMPTS = 3
+_REFRESH_BACKOFF_SEC = 0.35
+
+_MSG_REFRESH_FAILED = (
+    "Your link changes were saved on disk, but Excel could not finish refreshing "
+    "every Invoice link cell.\n\n"
+    "Wait until processing finishes - do not click other rows or Invoice links while "
+    "Excel updates. Then try again, or save and reopen the workbook.\n\n"
+    "Technical detail:\n"
+)
+
 from tkinter import Tk, messagebox
 
-from giftcardInvoiceLink.excel_link_sync import find_workbook_by_path, sync_workbook_invoice_links
+from giftcardInvoiceLink.excel_link_sync import (
+    find_workbook_and_application,
+    find_workbook_by_path,
+    sync_workbook_invoice_links,
+)
 from giftcardInvoiceLink.link_store import (
     add_edge,
     clean_value,
@@ -53,13 +71,31 @@ from giftcardInvoiceLink.link_store import (
     save_edges,
     stable_record_key,
 )
+from proofOfDelivery.pod_data import load_excel_records
+
+
+def _refresh_invoice_links_with_retries(excel, wb_path: str) -> None:
+    """Run COM refresh + Save with backoff (recovers from races with UI interaction)."""
+    last: BaseException | None = None
+    for attempt in range(_REFRESH_ATTEMPTS):
+        try:
+            wb2 = find_workbook_by_path(excel, wb_path)
+            if wb2 is None:
+                raise RuntimeError(
+                    "The workbook was closed or is no longer the same file you clicked from."
+                )
+            sync_workbook_invoice_links(wb2, project_root=PROJECT_ROOT)
+            wb2.Save()
+            return
+        except Exception as e:
+            last = e
+            time.sleep(_REFRESH_BACKOFF_SEC * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 def _load_records() -> list[dict]:
-    if not JSON_PATH.is_file():
-        return []
-    data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
-    return data if isinstance(data, list) else []
+    return load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=False)
 
 
 def _category(ws, row: int, col_cat: int) -> str:
@@ -265,27 +301,39 @@ def main() -> None:
         root.destroy()
         return
 
-    try:
-        import win32com.client
+    import win32com.client
 
-        excel = win32com.client.GetActiveObject("Excel.Application")
-    except Exception:
-        root = Tk()
-        root.withdraw()
-        messagebox.showerror("Invoice link", "Excel is not running.")
-        root.destroy()
-        return
-
-    wb = find_workbook_by_path(excel, wb_path)
+    wb, excel = find_workbook_and_application(wb_path)
     if wb is None:
         root = Tk()
         root.withdraw()
-        messagebox.showerror(
-            "Invoice link",
-            "Open this workbook in Excel and keep it as the file you clicked from.",
-        )
+        try:
+            win32com.client.GetActiveObject("Excel.Application")
+            messagebox.showerror(
+                "Invoice link",
+                "Excel is open, but this script could not match your orders file to any "
+                "open workbook.\n\n"
+                "Close all Excel windows, open only your orders workbook, then try the "
+                "Invoice link again. Using several Excel windows at once can cause this.",
+            )
+        except Exception:
+            messagebox.showerror("Invoice link", "Excel is not running.")
         root.destroy()
         return
+
+    if excel is None:
+        try:
+            excel = wb.Application
+        except Exception:
+            root = Tk()
+            root.withdraw()
+            messagebox.showerror(
+                "Invoice link",
+                "Found the workbook but could not attach to Excel. Close other Office apps "
+                "and try again.",
+            )
+            root.destroy()
+            return
 
     try:
         ws = wb.Worksheets("Orders")
@@ -326,17 +374,18 @@ def main() -> None:
         root.destroy()
 
     try:
-        wb2 = find_workbook_by_path(excel, wb_path)
-        if wb2 is not None:
-            sync_workbook_invoice_links(wb2, project_root=PROJECT_ROOT)
-            wb2.Save()
+        _refresh_invoice_links_with_retries(excel, wb_path)
+        root = Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "Invoice link",
+            "Invoice Link column is now up to date, whether you made a change or not.",
+        )
+        root.destroy()
     except Exception as ex:
         root = Tk()
         root.withdraw()
-        messagebox.showwarning(
-            "Invoice link",
-            f"Links were saved, but Excel could not refresh automatically:\n{ex}",
-        )
+        messagebox.showwarning("Invoice link", _MSG_REFRESH_FAILED + str(ex))
         root.destroy()
 
 

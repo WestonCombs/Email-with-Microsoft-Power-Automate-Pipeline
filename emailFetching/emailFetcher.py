@@ -99,7 +99,7 @@ def _build_outlook_header_fragment(msg: EmailMessage) -> str:
 
 
 def prepend_outlook_style_header(body_html: str, msg: EmailMessage) -> str:
-    """Put an Outlook-like metadata block at the top of the saved HTML (and thus the PDF)."""
+    """Put an Outlook-like metadata block at the top of *body_html* (used for PDF print)."""
     header = _build_outlook_header_fragment(msg)
     m = re.search(r"(<body[^>]*>)", body_html, re.IGNORECASE | re.DOTALL)
     if m:

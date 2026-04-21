@@ -9,7 +9,7 @@ import re
 
 from bs4 import BeautifulSoup
 
-import runLogger as RL
+from shared import runLogger as RL
 
 _SRC = "convertHTMLToPlaintext"
 _OPENAI_MAX_CHARS_ENV = "openai_max_chars_per_prompting"
@@ -31,10 +31,19 @@ def _remove_hidden_elements(soup: BeautifulSoup) -> int:
     """Remove elements that are visually hidden in the rendered email.
     Returns the count of removed elements."""
     removed = 0
+    # Two-pass: collect targets first, then remove.
+    # Decomposing a parent also destroys its children, clearing their attrs dict
+    # to None.  If a child also had a style attribute it would still be queued
+    # in a single-pass loop, and the next el.get("style") call would crash with
+    # "'NoneType' object has no attribute 'get'".
+    to_remove = []
     for el in soup.find_all(style=True):
         style = el.get("style") or ""
         if re.search(r"display\s*:\s*none", style, re.IGNORECASE) or \
            re.search(r"visibility\s*:\s*hidden", style, re.IGNORECASE):
+            to_remove.append(el)
+    for el in to_remove:
+        if el.parent is not None:   # skip if already removed by an ancestor
             el.decompose()
             removed += 1
     return removed

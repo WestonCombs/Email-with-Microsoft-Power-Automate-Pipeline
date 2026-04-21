@@ -42,7 +42,8 @@ _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES_DIR) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES_DIR))
 
-from gui_aux_singleton import detach_console_win32, register_current_aux_gui
+from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
+from shared.gui_treeview_copy import bind_treeview_copy_menu
 
 # Per-viewer JSON files: ``BASE_DIR/email_contents/tracking_link_viewer_state/<sha256>.json``
 _TRACKING_STATE_SUBDIR = "tracking_link_viewer_state"
@@ -156,19 +157,18 @@ def _load_context_tsv(path: Path) -> dict[str, str]:
 
 
 def _email_contents_project_root() -> Path | None:
-    """Project root containing ``email_contents`` (``BASE_DIR`` from ``.env``, else parent of *python_files*)."""
+    """Project root containing ``email_contents`` (``BASE_DIR``, set in Email Sorter → Settings)."""
     try:
         from dotenv import load_dotenv
 
         load_dotenv(_PYTHON_FILES_DIR / ".env", override=False)
     except ImportError:
         pass
-    base = os.getenv("BASE_DIR")
-    if base:
-        p = Path(base).expanduser().resolve()
-        return p if p.is_dir() else None
-    parent = _PYTHON_FILES_DIR.resolve().parent
-    return parent if parent.is_dir() else None
+    base = (os.getenv("BASE_DIR") or "").strip()
+    if not base:
+        return None
+    p = Path(base).expanduser().resolve()
+    return p if p.is_dir() else None
 
 
 def _tracking_state_dir() -> Path | None:
@@ -183,12 +183,21 @@ def _tracking_state_dir() -> Path | None:
     return d
 
 
+def _context_tracking_numbers_value(context: dict[str, str]) -> str:
+    raw = context.get("tracking_numbers")
+    if raw is None:
+        raw = context.get("tracking_number")
+    if isinstance(raw, list):
+        return ", ".join(str(x).strip() for x in raw if str(x).strip())
+    return (raw or "").strip() if isinstance(raw, str) else ""
+
+
 def _state_fingerprint(urls: list[str], context: dict[str, str]) -> str:
     normalized = [_strip_leading_url_gunk(u) for u in urls]
     payload = {
         "company": (context.get("company") or "").strip(),
         "order_number": (context.get("order_number") or "").strip(),
-        "tracking_number": (context.get("tracking_number") or "").strip(),
+        "tracking_numbers": _context_tracking_numbers_value(context),
         "urls": normalized,
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -407,10 +416,13 @@ class TrackingLinkViewerApp:
         self._frm.pack(fill=tk.BOTH, expand=True)
 
         ctx_bits = []
-        for k in ("company", "order_number", "category", "tracking_number", "purchase_datetime"):
+        for k in ("company", "order_number", "category", "purchase_datetime"):
             v = self._context.get(k)
             if v:
                 ctx_bits.append(f"{k.replace('_', ' ')}: {v}")
+        tn_disp = _context_tracking_numbers_value(self._context)
+        if tn_disp:
+            ctx_bits.append(f"tracking numbers: {tn_disp}")
         ctx_line = "  |  ".join(ctx_bits) if ctx_bits else "No order context file (optional .ctx.tsv from Excel)."
 
         hint = ttk.Label(
@@ -487,6 +499,7 @@ class TrackingLinkViewerApp:
         self._tree.bind("<MouseWheel>", self._on_mousewheel)
         self._tree.bind("<Button-4>", self._on_mousewheel_linux)
         self._tree.bind("<Button-5>", self._on_mousewheel_linux)
+        bind_treeview_copy_menu(self._tree, self._root)
 
         btn_row = ttk.Frame(self._frm)
         btn_row.pack(fill=tk.X, pady=(8, 0))

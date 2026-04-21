@@ -10,7 +10,7 @@ Requires Windows + Excel + pywin32 (same as macro template).
 Usage (from python_files):
   python createExcelDocument/create_clipboard_test_xlsm.py
 
-Reads BASE_DIR from .env; writes:
+Reads BASE_DIR (set in Email Sorter → Settings); writes:
   <BASE_DIR>/email_contents/clipboard_test.xlsm
 Uses the same clipboard ini as the main exporter (default: python_files/excel_clipboard_launch.ini).
 """
@@ -46,7 +46,9 @@ def _load_macro_template():
 def main() -> int:
     base_raw = os.getenv("BASE_DIR")
     if not base_raw:
-        print("BASE_DIR missing in python_files/.env")
+        print(
+            'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
+        )
         return 1
 
     email_contents = Path(base_raw).expanduser().resolve() / "email_contents"
