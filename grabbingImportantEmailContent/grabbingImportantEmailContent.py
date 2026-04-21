@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# python_files/ — .env must load before htmlHandler (trace uses BASE_DIR from .env)
+# python_files/ — .env must load before htmlHandler (BASE_DIR is set in Email Sorter → Settings)
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PYTHON_FILES_DIR))
 # Same folder as this script (sibling modules: isGiftCard, grabTrackingLinks, …)
@@ -27,7 +27,15 @@ from openai import OpenAI, RateLimitError
 from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
 import time as _time
 
-import runLogger as RL
+from shared import runLogger as RL
+from htmlHandler.carrier_tracking_ids import (
+    _norm_key,
+    extract_carrier_ids_from_href_pairs,
+    extract_carrier_ids_from_text,
+    extract_carrier_ids_from_tracking_link_pairs,
+    merge_unique_tracking_ids,
+    normalize_openai_tracking_numbers,
+)
 from htmlHandler.tracking_hrefs import (
     extract_hrefs_from_html,
     href_final_pairs,
@@ -42,6 +50,8 @@ try:
 except ImportError:
     _HAS_XHTML2PDF = False
 
+from emailFetching.emailFetcher import EmailMessage, prepend_outlook_style_header
+
 from isGiftCard import UNKNOWN as IS_GIFT_CARD_UNKNOWN, is_gift_card, should_run_is_gift_card
 
 
@@ -52,7 +62,6 @@ def _openai_fields_log_line(extracted: dict) -> str:
         "order_number",
         "purchase_datetime",
         "email_category",
-        "tracking_number",
         "total_amount_paid",
         "tax_paid",
     )
@@ -68,6 +77,13 @@ def _openai_fields_log_line(extracted: dict) -> str:
         if len(s) > 100:
             s = s[:97] + "..."
         parts.append(f"{k}={s!r}")
+    tn = extracted.get("tracking_numbers")
+    if isinstance(tn, list) and tn:
+        s = ", ".join(str(x).strip() for x in tn if str(x).strip())
+        s = re.sub(r"\s+", " ", s)
+        if len(s) > 120:
+            s = s[:117] + "..."
+        parts.append(f"tracking_numbers={s!r}")
     return "OpenAI — " + (", ".join(parts) if parts else "no structured fields")
 
 
@@ -205,7 +221,7 @@ def _write_openai_log(
         f"order={extracted.get('order_number') or 'n/a'}  |  "
         f"date={extracted.get('purchase_datetime') or 'n/a'}  |  "
         f"amount={extracted.get('total_amount_paid') or 'n/a'}",
-        f"  tracking_number={extracted.get('tracking_number') or 'n/a'}",
+        f"  tracking_numbers={extracted.get('tracking_numbers') or 'n/a'}",
         f"  OpenAI: {'ran' if timings.get('step5_ran') else 'skipped'}  "
         f"{timings.get('step5_s', 0.0):.2f}s  |  "
         f"GiftCard check: {'ran' if timings.get('step5b_ran') else 'skipped'}  "
@@ -219,7 +235,7 @@ def _write_openai_log(
         f"order={extracted.get('order_number')!r}, "
         f"date={extracted.get('purchase_datetime')!r}, "
         f"amount={extracted.get('total_amount_paid')!r}, "
-        f"tracking_number={extracted.get('tracking_number')!r}, "
+        f"tracking_numbers={extracted.get('tracking_numbers')!r}, "
         f"category_raw={extracted.get('email_category')!r}, "
         f"confidence_raw={extracted.get('email_category_confidence')!r}\n"
     )
@@ -307,6 +323,36 @@ def clean_text(text) -> str | None:
     return str(text).replace("\ufeff", "").strip() or None
 
 
+def _coerce_llm_tracking_numbers(extracted: dict) -> None:
+    """Normalize OpenAI output: ``tracking_numbers`` list; fold legacy ``tracking_number``."""
+    nums = normalize_openai_tracking_numbers(extracted.get("tracking_numbers"))
+    leg = extracted.get("tracking_number")
+    if isinstance(leg, str) and leg.strip():
+        nums.append(leg.strip())
+    extracted["tracking_numbers"] = nums
+    extracted.pop("tracking_number", None)
+
+
+def _merged_tracking_numbers_for_record(
+    text_only: str,
+    subject: str | None,
+    href_pairs: list[tuple[str, str]],
+    extracted: dict,
+) -> list[str]:
+    """Body/HTML + redirect URLs + LLM list — unique, stable order (first wins)."""
+    from_text = extract_carrier_ids_from_text(text_only)
+    from_subj = extract_carrier_ids_from_text(subject or "")
+    from_urls = extract_carrier_ids_from_href_pairs(href_pairs)
+    from_llm = normalize_openai_tracking_numbers(extracted.get("tracking_numbers"))
+    return merge_unique_tracking_ids(from_text, from_subj, from_urls, from_llm)
+
+
+def _link_confirmed_tracking_keys(href_pairs: list[tuple[str, str]]) -> set[str]:
+    """Normalized keys for IDs found only on URLs that pass tracking-link classification."""
+    ids = extract_carrier_ids_from_tracking_link_pairs(href_pairs)
+    return {_norm_key(x) for x in ids if x}
+
+
 def read_email_html_file(file_path: Path) -> tuple[str, str]:
     """Read HTML saved by Outlook / Power Automate.
 
@@ -371,18 +417,61 @@ def _find_browser() -> Path | None:
     return None
 
 
-def convert_html_to_pdf(html_path: Path) -> Path:
+def _outlook_msg_for_pdf_from_env(subject: str | None) -> EmailMessage | None:
+    """When mainRunner sets OUTLOOK_PREPEND_PDF_HEADER, build metadata for PDF print only."""
+    flag = os.getenv("OUTLOOK_PREPEND_PDF_HEADER", "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return None
+    return EmailMessage(
+        from_raw=os.getenv("OUTLOOK_FROM_RAW", ""),
+        subject=subject or "",
+        body_html="",
+        attachments=[],
+        to_line=os.getenv("OUTLOOK_TO_LINE", ""),
+        sent_line=os.getenv("OUTLOOK_SENT_LINE", ""),
+        header_title=os.getenv("OUTLOOK_HEADER_TITLE", ""),
+    )
+
+
+def convert_html_to_pdf(
+    html_path: Path,
+    outlook_msg: EmailMessage | None = None,
+) -> Path:
     """Convert an HTML file to PDF. Tries Edge/Chrome headless first (perfect
     rendering), then xhtml2pdf as fallback. Returns the original path if all
-    methods fail."""
+    methods fail.
+
+    If *outlook_msg* is set, the Outlook-style metadata block is prepended only
+    for this print step; the file at *html_path* is still the raw body until it
+    is removed after a successful conversion.
+    """
     pdf_path = html_path.with_suffix(".pdf")
-    file_uri = html_path.resolve().as_uri()
+
+    html_for_pdf: str | None = None
+    tmp_print: Path | None = None
+    if outlook_msg is not None:
+        raw_html, _ = read_email_html_file(html_path)
+        html_for_pdf = prepend_outlook_style_header(raw_html, outlook_msg)
+        tmp_print = html_path.with_name(f"__print_{html_path.stem}.html")
+        tmp_print.write_text(html_for_pdf, encoding="utf-8")
+
+    def _cleanup_print_tmp() -> None:
+        if tmp_print is not None:
+            try:
+                if tmp_print.exists():
+                    tmp_print.unlink()
+            except OSError:
+                pass
+
+    file_uri = (
+        tmp_print.resolve().as_uri() if tmp_print is not None else html_path.resolve().as_uri()
+    )
 
     # --- Strategy 1: Edge / Chrome headless (handles any email HTML) ---
     browser = _find_browser()
     if browser:
         try:
-            result = subprocess.run(
+            subprocess.run(
                 [
                     str(browser),
                     "--headless",
@@ -395,6 +484,7 @@ def convert_html_to_pdf(html_path: Path) -> Path:
                 timeout=30,
             )
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                _cleanup_print_tmp()
                 html_path.unlink()
                 print(f"  Converted to PDF: {pdf_path.name}")
                 return pdf_path
@@ -406,13 +496,16 @@ def convert_html_to_pdf(html_path: Path) -> Path:
                 except OSError:
                     pass
 
+    _cleanup_print_tmp()
+
     # --- Strategy 2: xhtml2pdf (pure Python fallback) ---
     if _HAS_XHTML2PDF:
         try:
-            html_content, _ = read_email_html_file(html_path)
+            if html_for_pdf is None:
+                html_for_pdf, _ = read_email_html_file(html_path)
             with open(pdf_path, "wb") as pdf_file:
                 pisa.CreatePDF(
-                    io.StringIO(html_content),
+                    io.StringIO(html_for_pdf),
                     dest=pdf_file,
                     encoding="utf-8",
                 )
@@ -725,10 +818,10 @@ Important rules:
 8. company should be the retailer/store/merchant, not the recipient's name.
 9. order_number: check the subject line first, then the body. Strip any leading "#".
 10. Do NOT guess. If something is not clearly present, use null.
-11. tracking_number: The shipping carrier's tracking number (e.g. "1Z999AA10123456784",
-    "9400111899223456789012"). This is NOT the order number — it is the alphanumeric ID
-    assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
-    If not clearly present, return null.
+11. tracking_numbers: Every distinct shipping carrier tracking ID visible in the text (e.g. UPS
+    "1Z999AA10123456784", USPS 22- or 30-digit, FedEx 12-digit). NOT the retail order number —
+    only IDs assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
+    Include each real ID once (no duplicates). Use an empty array [] if none are clearly present.
 12. email_category: Classify into exactly ONE of these categories (do NOT use "Gift Card" here):
     - "Invoice": Order placed, confirmed, or receipt for a purchase (merchandise, services, or a gift card purchase — any order/receipt email).
     - "Shipped": The package has been shipped or is in transit (carrier handoff, tracking, out for delivery).
@@ -779,12 +872,12 @@ EMAIL TEXT:
                             "type": ["number", "null"],
                             "description": "Tax amount in dollars, or null if unknown.",
                         },
-                        "tracking_number": {
-                            "type": ["string", "null"],
+                        "tracking_numbers": {
+                            "type": "array",
+                            "items": {"type": "string"},
                             "description": (
-                                "Shipping carrier tracking number "
-                                "(e.g. UPS, FedEx, USPS, DHL). Not the order number. "
-                                "Null if not clearly present."
+                                "Distinct carrier tracking IDs in the email text "
+                                "(UPS, FedEx, USPS, DHL, etc.). Not order numbers. Empty if none."
                             ),
                         },
                         "email_category": {
@@ -811,7 +904,7 @@ EMAIL TEXT:
                         "purchase_datetime",
                         "total_amount_paid",
                         "tax_paid",
-                        "tracking_number",
+                        "tracking_numbers",
                         "email_category",
                         "email_category_confidence",
                     ],
@@ -822,7 +915,9 @@ EMAIL TEXT:
         temperature=0,
     )
 
-    return _chat_completion_json_parsed(api_kwargs)
+    data = _chat_completion_json_parsed(api_kwargs)
+    _coerce_llm_tracking_numbers(data)
+    return data
 
 
 # =========================
@@ -837,7 +932,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Filename (or full path) of a single HTML file to process. "
-            "A bare filename is resolved under email_contents/pdf/ relative to BASE_DIR from .env "
+            "A bare filename is resolved under email_contents/pdf/ relative to BASE_DIR (Email Sorter → Settings) "
             "(e.g. file1.html). When provided, only that file is processed and the result is appended "
             "to the output JSON."
         ),
@@ -883,7 +978,7 @@ def process_file(
         "purchase_datetime": None,
         "total_amount_paid": None,
         "tax_paid": None,
-        "tracking_number": None,
+        "tracking_numbers": [],
         "email_category": "Unknown",
         "email_category_confidence": 0,
     }
@@ -953,8 +1048,6 @@ def process_file(
         print("  » Resolving redirects & classifying tracking links...", end=" ", flush=True)
         href_pairs = href_final_pairs(extracted_hrefs)
         tracking_links = list_tracking_links_from_pairs(href_pairs)
-        # Primary URL for legacy single-field consumers; full list is ``tracking_links``.
-        tracking_link = tracking_links[0] if tracking_links else None
         redirected = sum(1 for h, f in href_pairs if h.strip() != f.strip())
         tracking_cands = sum(1 for _, f in href_pairs if url_classifies_as_tracking(f))
         timings["step4_s"] = round(_time.perf_counter() - t, 3)
@@ -1004,6 +1097,7 @@ def process_file(
             if not API_KEY:
                 print("  WARNING: No API key — empty fields only.")
             extracted = empty_extraction
+        _coerce_llm_tracking_numbers(extracted)
 
         if not clean_text(extracted.get("company")):
             extracted["company"] = infer_company_from_subject(subject)
@@ -1067,10 +1161,26 @@ def process_file(
             f"order={extracted.get('order_number') or 'n/a'}  |  "
             f"total={timings['total_s']:.2f}s"
         )
+        merged_tracking: list[str] = _merged_tracking_numbers_for_record(
+            text_only, subject, href_pairs, extracted
+        )
+        tracking_numbers_out: list[str] = []
+        for x in merged_tracking:
+            c = clean_text(x)
+            if c:
+                tracking_numbers_out.append(c)
+
+        link_confirmed_keys = _link_confirmed_tracking_keys(href_pairs)
+        tracking_numbers_link_confirmed: list[bool] = [
+            _norm_key(t) in link_confirmed_keys for t in tracking_numbers_out
+        ]
+
         RL.debug("grabbingImportantEmailContent",
             f"  [final] category={final_category}, confidence={raw_confidence}, "
             f"company={extracted.get('company')!r}, order={extracted.get('order_number')!r}, "
             f"amount={extracted.get('total_amount_paid')!r}, "
+            f"tracking_numbers={tracking_numbers_out!r}, "
+            f"tracking_numbers_link_confirmed={tracking_numbers_link_confirmed!r}, "
             f"tracking_links={tracking_links!r}\n"
         )
 
@@ -1085,8 +1195,8 @@ def process_file(
             "purchase_datetime": clean_text(extracted.get("purchase_datetime")),
             "total_amount_paid": extracted.get("total_amount_paid"),
             "tax_paid": extracted.get("tax_paid"),
-            "tracking_number": clean_text(extracted.get("tracking_number")),
-            "tracking_link": tracking_link,
+            "tracking_numbers": tracking_numbers_out,
+            "tracking_numbers_link_confirmed": tracking_numbers_link_confirmed,
             "tracking_links": tracking_links,
             "extracted_links": extracted_hrefs,
             "email_category": final_category,
@@ -1116,8 +1226,8 @@ def process_file(
             "purchase_datetime": None,
             "total_amount_paid": None,
             "tax_paid": None,
-            "tracking_number": None,
-            "tracking_link": None,
+            "tracking_numbers": [],
+            "tracking_numbers_link_confirmed": [],
             "tracking_links": [],
             "extracted_links": extracted_hrefs,
             "email_category": "Unknown",
@@ -1255,16 +1365,8 @@ def rename_to_convention(file_path: Path, record: dict, target_folder: Path) -> 
 
 
 def rebuild_email_html_archive_folder(html_dir: Path) -> None:
-    """Empty *html_dir* (create if missing). Call once per program run before saving archived HTML."""
+    """Ensure *html_dir* exists; do not clear it (same idea as the PDF folder)."""
     html_dir.mkdir(parents=True, exist_ok=True)
-    for child in list(html_dir.iterdir()):
-        try:
-            if child.is_file():
-                child.unlink()
-            elif child.is_dir():
-                shutil.rmtree(child)
-        except OSError as e:
-            print(f"WARNING: could not remove {child}: {e}")
 
 
 def archive_html_before_pdf(source_html: Path, record: dict, html_folder: Path) -> Path:
@@ -1508,14 +1610,15 @@ def main(flow_started_at: datetime | None = None):
     base_dir = os.getenv(BASE_DIR_ENV)
     if not base_dir:
         raise ValueError(
-            f"{BASE_DIR_ENV} is not set. Add it to python_files/.env "
-            f"(e.g. BASE_DIR=C:\\path\\to\\project)."
+            f'{BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
         )
 
     base = Path(base_dir).expanduser().resolve()
     pdf_folder = base / "email_contents" / "pdf"
     html_archive_folder = base / "email_contents" / "html"
     output_path = base / "email_contents" / "json" / "results.json"
+
+    outlook_msg_for_pdf = _outlook_msg_for_pdf_from_env(args.subject)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1556,8 +1659,17 @@ def main(flow_started_at: datetime | None = None):
         file_hash = compute_file_hash(file_path)
         if file_hash in hashes:
             print(f"SKIPPED (duplicate content): {file_path.name}")
-            file_path.unlink()
-            print(f"  Deleted temp file: {file_path.name}")
+            try:
+                in_pdf_only = file_path.resolve().parent == pdf_folder.resolve()
+            except OSError:
+                in_pdf_only = False
+            if in_pdf_only:
+                file_path.unlink()
+                print(f"  Deleted temp file: {file_path.name}")
+            else:
+                print(
+                    "  (left on disk: duplicate skip only removes temp HTML under email_contents/pdf)"
+                )
             for r in results:
                 if r.get("content_hash") == file_hash:
                     r["duplicate_on_last_run"] = 1
@@ -1581,7 +1693,7 @@ def main(flow_started_at: datetime | None = None):
         entry["duplicate_on_last_run"] = 0
 
         archive_html_before_pdf(file_path, entry, html_archive_folder)
-        pdf_path = convert_html_to_pdf(file_path)
+        pdf_path = convert_html_to_pdf(file_path, outlook_msg_for_pdf)
         pdf_path = rename_to_convention(pdf_path, entry, pdf_folder)
         file_uri = "file:///" + str(pdf_path.resolve()).replace("\\", "/")
         entry["source_file"] = clean_text(pdf_path)
@@ -1635,7 +1747,7 @@ def main(flow_started_at: datetime | None = None):
         entry["duplicate_on_last_run"] = 0
 
         archive_html_before_pdf(fp, entry, html_archive_folder)
-        pdf_path = convert_html_to_pdf(fp)
+        pdf_path = convert_html_to_pdf(fp, outlook_msg_for_pdf)
         pdf_path = rename_to_convention(pdf_path, entry, pdf_folder)
         file_uri = "file:///" + str(pdf_path.resolve()).replace("\\", "/")
         entry["source_file"] = clean_text(pdf_path)
@@ -1656,7 +1768,7 @@ if __name__ == "__main__":
     _base_for_log = os.getenv(BASE_DIR_ENV)
     if not _base_for_log:
         print(
-            f"ERROR: {BASE_DIR_ENV} is not set. Set it in {_PYTHON_FILES_DIR / '.env'}",
+            f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1678,7 +1790,10 @@ if __name__ == "__main__":
         print(f"Total operation time: {_elapsed:.2f}s")
         if e.code == EXIT_BAD_ARGS:
             print("\nERROR: Invalid or missing arguments.")
-            print("Set BASE_DIR and OPENAI_API_KEY in python_files/.env.")
+            print(
+                'Set BASE_DIR in Email Sorter → Settings ("Project folder on disk"). '
+                "Set OPENAI_API_KEY in python_files/.env."
+            )
             print("Optional args: --file, --subject, --sender-name, --email")
         sys.exit(e.code)
     except OpenAIRateLimitFatalError as e:

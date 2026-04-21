@@ -21,7 +21,7 @@ On **Windows**, when you run createExcelDocument (or the full pipeline):
 1. If `orders_template.xlsm` is missing, the script tries to **create it** using Excel
    in the background (COM automation). Default location:
 
-     <python_files>/orders_template.xlsm
+     <BASE_DIR>/email_contents/orders_template.xlsm
 
    (Override with `EXCEL_TEMPLATE_PATH` in `.env` if needed.)
 
@@ -65,7 +65,8 @@ Requirements for auto-build
   object model) while creating the template, then restores your previous setting.
 
 If auto-build fails (Excel missing, COM error, Group Policy blocks VBOM), the script
-still writes **`orders.xlsx`**. See "Manual fallback" below.
+falls back to **`orders.xlsx`** only when no valid macro template is available. With a working
+template in `email_contents`, normal runs write **`orders.xlsm`**.
 
 Clipboard helper
 ----------------
@@ -80,7 +81,7 @@ Updating the embedded macro after a code change
 ------------------------------------------------
 
 The VBA lives inside `orders_template.xlsm`. After pulling a fix, delete
-`python_files/orders_template.xlsm` once and run createExcelDocument so Excel
+`email_contents/orders_template.xlsm` once and run createExcelDocument so Excel
 automation rebuilds it from `macro_template.py` (or paste the latest `THISWORKBOOK_VBA`
 into ThisWorkbook). This is required after VBA changes so **Copy Path** and **View Link List**
 keep working; the generated `orders.xlsm` keeps whatever VBA was in the template when
@@ -92,7 +93,7 @@ Manual fallback (only if automation failed)
 1. Create `orders_template.xlsm` in Excel (macro-enabled), sheet named **Orders**.
 2. Alt+F11 -> **ThisWorkbook** -> paste the VBA from `macro_template.py` constant
    `THISWORKBOOK_VBA` (or copy from an older backup).
-3. Save as `<python_files>/orders_template.xlsm` (or your `EXCEL_TEMPLATE_PATH`).
+3. Save as `<BASE_DIR>/email_contents/orders_template.xlsm` (or your `EXCEL_TEMPLATE_PATH`).
 4. Run createExcelDocument again.
 
 Optional .env
@@ -107,11 +108,4 @@ One-off: rebuild template only
 
   python createExcelDocument/macro_template.py
 
-(Loads `.env`; default template path is `python_files/orders_template.xlsm`.)
-
-Moving from email_contents
---------------------------
-
-If you still have `email_contents/orders_template.xlsm` or
-`email_contents/excel_clipboard_launch.ini`, you can delete them after the new defaults
-are in place; the next run recreates them under **python_files** (or your `.env` paths).
+(Loads `.env`; default template path is `<BASE_DIR>/email_contents/orders_template.xlsm`.)

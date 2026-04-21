@@ -1,17 +1,17 @@
 """
 Force-sync the Git repository with GitHub (or whatever ``origin`` points to).
 
-Runs in the repository root (the folder *above* ``gitControle`` when this project
-is the repo root). Fetches from ``origin`` and resets the current branch hard to
+Runs in the repository root (the folder *above* ``tools`` when this project is
+the repo root). Fetches from ``origin`` and resets the current branch hard to
 ``origin/<branch>``, discarding local commits and uncommitted changes on tracked files.
 
 Usage (from anywhere, if Git is on PATH):
 
-    python gitControle/pull_latest.py
+    python tools/git/pull_latest.py
 
 Optional: also remove untracked files and directories (like a clean clone of the branch):
 
-    python gitControle/pull_latest.py --clean
+    python tools/git/pull_latest.py --clean
 """
 
 from __future__ import annotations

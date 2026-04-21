@@ -1,0 +1,5 @@
+# Passive PDF capture: pip install -r requirements_mitmproxy.txt
+mitmproxy>=10.0
+pymupdf>=1.24.0
+Pillow>=10.0.0
+websocket-client>=1.8.0
