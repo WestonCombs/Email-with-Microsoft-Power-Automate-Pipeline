@@ -410,6 +410,7 @@ def _rebuild_email_html_archive_folder(html_dir: Path) -> None:
 # ──────────────────────────────────────────────
 _SNAPSHOT_TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
 _SNAPSHOT_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_SNAPSHOT_DIR_SUFFIX = " - Emails From mail folder"
 
 
 def _sanitize_for_filename(text: str, *, max_len: int = 60) -> str:
@@ -422,8 +423,9 @@ def _sanitize_for_filename(text: str, *, max_len: int = 60) -> str:
 
 
 def inbox_snapshot_dir(base_dir: Path, flow_started_at: datetime) -> Path:
-    """``BASE_DIR/<YYYY-MM-DD_HH-MM-SS>/`` — one snapshot folder per run."""
-    return base_dir / flow_started_at.strftime(_SNAPSHOT_TS_FORMAT)
+    """``BASE_DIR/logs/<YYYY-MM-DD_HH-MM-SS> - Emails From mail folder/``."""
+    folder_name = flow_started_at.strftime(_SNAPSHOT_TS_FORMAT) + _SNAPSHOT_DIR_SUFFIX
+    return base_dir / "logs" / folder_name
 
 
 def save_inbox_snapshot(
@@ -431,7 +433,7 @@ def save_inbox_snapshot(
     flow_started_at: datetime,
     emails: list[object],
 ) -> Path | None:
-    """Write all fetched email HTML bodies to ``BASE_DIR/<YYYY-MM-DD_HH-MM-SS>/``."""
+    """Write all fetched email HTML bodies to ``BASE_DIR/logs/<run timestamp>.../``."""
     snapshot_dir = inbox_snapshot_dir(base_dir, flow_started_at)
     try:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
