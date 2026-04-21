@@ -97,6 +97,25 @@ def _pip_available() -> bool:
         return False
 
 
+def _record_runtime_error_and_exit(code: int, summary: str) -> None:
+    """Log runtime/bootstrap errors to program_errors when possible, then exit."""
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(_PYTHON_FILES_DIR / ".env")
+    except ImportError:
+        pass
+    try:
+        from shared import runLogger as _RL
+
+        _RL.record_program_error_exit(
+            exit_code=code, summary=summary, source="mainRunner.runtime"
+        )
+    except Exception:
+        pass
+    sys.exit(code)
+
+
 def _ensure_runtime_ready() -> None:
     """Verify Python version, pip, and requirements before importing project dependencies."""
     if sys.version_info < _MIN_PYTHON:
@@ -110,7 +129,11 @@ def _ensure_runtime_ready() -> None:
             "and ensure `python` points to it (or use the py launcher on Windows).",
             file=sys.stderr,
         )
-        sys.exit(1)
+        _record_runtime_error_and_exit(
+            1,
+            f"Python {'.'.join(str(x) for x in _MIN_PYTHON)}+ required; "
+            f"interpreter={sys.executable!r}",
+        )
 
     if not _pip_available():
         print(
@@ -120,7 +143,7 @@ def _ensure_runtime_ready() -> None:
             "and enable 'pip' / 'Add Python to PATH' in the installer.",
             file=sys.stderr,
         )
-        sys.exit(1)
+        _record_runtime_error_and_exit(1, f"pip not available for {sys.executable!r}")
 
     if not _REQUIREMENTS_FILE.is_file():
         print(
@@ -153,14 +176,14 @@ def _run_pip_install() -> None:
         )
     except OSError as e:
         print(f"ERROR: Could not run pip: {e}", file=sys.stderr)
-        sys.exit(1)
+        _record_runtime_error_and_exit(1, f"Could not run pip: {e}")
     if r.returncode != 0:
         print(
             "\nERROR: pip install failed. Check your network connection and try:\n"
             f"  {sys.executable} -m pip install -r {_REQUIREMENTS_FILE}",
             file=sys.stderr,
         )
-        sys.exit(1)
+        _record_runtime_error_and_exit(1, "pip install failed (requirements.txt)")
 
     if not _requirements_satisfied(_REQUIREMENTS_FILE):
         print(
@@ -168,7 +191,9 @@ def _run_pip_install() -> None:
             f"  Try manually: {sys.executable} -m pip install -r {_REQUIREMENTS_FILE}",
             file=sys.stderr,
         )
-        sys.exit(1)
+        _record_runtime_error_and_exit(
+            1, "Dependencies still do not match requirements.txt after pip install"
+        )
 
 
 if __name__ == "__main__":
@@ -185,12 +210,43 @@ from emailFetching.emailFetcher import (
     fetch_emails,
 )
 
+
+def _fatal(code: int, summary: str) -> None:
+    try:
+        RL.record_program_error_exit(exit_code=code, summary=summary, source="mainRunner")
+    except Exception:
+        pass
+    raise SystemExit(code)
+
+
+def _warn(message: str, *, segment: str = "timing") -> None:
+    print(f"  WARNING: {message}")
+    RL.log(segment, f"{RL.ts()}  WARNING: {message}")
+
+
+def _nonfatal_error(message: str, *, segment: str = "timing") -> None:
+    print(f"  ERROR: {message}")
+    RL.log(segment, f"{RL.ts()}  ERROR: {message}")
+
+
 BASE_DIR_ENV = "BASE_DIR"
 OPENAI_USAGE_REL = Path("logs") / "openai usage"
 
 # Debug ``--custom-import-html``: substitute Graph envelope fields (not read from each file).
 _CUSTOM_IMPORT_LABEL = "customImportHTML"
 _CUSTOM_IMPORT_EMAIL = "customImportHTML@local.invalid"
+_EXCEL_STEP_WARN_SECONDS_DEFAULT = 120.0
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
 
 
 def _custom_import_outlook_env() -> dict[str, str]:
@@ -350,6 +406,79 @@ def _rebuild_email_html_archive_folder(html_dir: Path) -> None:
 
 
 # ──────────────────────────────────────────────
+# Raw inbox snapshot (saved BEFORE pipeline processing)
+# ──────────────────────────────────────────────
+_SNAPSHOT_TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
+_SNAPSHOT_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _sanitize_for_filename(text: str, *, max_len: int = 60) -> str:
+    """Return a filesystem-safe name fragment with normalized spacing."""
+    s = _SNAPSHOT_INVALID_CHARS_RE.sub(" ", text or "")
+    s = re.sub(r"\s+", " ", s).strip().strip(". ")
+    if len(s) > max_len:
+        s = s[:max_len].rstrip().strip(". ")
+    return s or "untitled"
+
+
+def inbox_snapshot_dir(base_dir: Path, flow_started_at: datetime) -> Path:
+    """``BASE_DIR/<YYYY-MM-DD_HH-MM-SS>/`` — one snapshot folder per run."""
+    return base_dir / flow_started_at.strftime(_SNAPSHOT_TS_FORMAT)
+
+
+def save_inbox_snapshot(
+    base_dir: Path,
+    flow_started_at: datetime,
+    emails: list[object],
+) -> Path | None:
+    """Write all fetched email HTML bodies to ``BASE_DIR/<YYYY-MM-DD_HH-MM-SS>/``."""
+    snapshot_dir = inbox_snapshot_dir(base_dir, flow_started_at)
+    try:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        _warn(
+            f"could not create inbox snapshot folder {snapshot_dir}: {e}",
+            segment="emailFetching",
+        )
+        return None
+
+    pad = max(2, len(str(len(emails))))
+    used_names: set[str] = set()
+    saved_count = 0
+    for i, msg in enumerate(emails, start=1):
+        subj_part = _sanitize_for_filename(getattr(msg, "subject", "") or "", max_len=60)
+        sender_part = _sanitize_for_filename(
+            getattr(msg, "sender_name", "") or getattr(msg, "sender_email", "") or "",
+            max_len=40,
+        )
+        stem = f"{i:0{pad}d} - {subj_part} - {sender_part}"
+        file_name = f"{stem}.html"
+        suffix = 2
+        while file_name.lower() in used_names:
+            file_name = f"{stem} ({suffix}).html"
+            suffix += 1
+        used_names.add(file_name.lower())
+
+        try:
+            (snapshot_dir / file_name).write_text(
+                getattr(msg, "body_html", "") or "",
+                encoding="utf-8",
+            )
+            saved_count += 1
+        except OSError as e:
+            _nonfatal_error(
+                f"could not write snapshot file {file_name}: {e}",
+                segment="emailFetching",
+            )
+
+    RL.log(
+        "emailFetching",
+        f"{RL.ts()}  inbox_snapshot  dir={snapshot_dir}  saved={saved_count}/{len(emails)}",
+    )
+    return snapshot_dir
+
+
+# ──────────────────────────────────────────────
 # Step runners (each invokes its script as a subprocess so cwd and __main__
 # match standalone execution)
 # ──────────────────────────────────────────────
@@ -401,9 +530,12 @@ def run_grabbing_important_content(
     result = subprocess.run(cmd, cwd=str(_PYTHON_FILES_DIR), env=env)
     if result.returncode == _OPENAI_FATAL_EXIT:
         _prompt_openai_moderator_action()
-        sys.exit(_OPENAI_FATAL_EXIT)
+        _fatal(_OPENAI_FATAL_EXIT, "OpenAI fatal error from grabbingImportantEmailContent (exit 3)")
     if result.returncode != 0:
-        print(f"  WARNING: extractor exited with code {result.returncode}")
+        _warn(
+            f"extractor exited with code {result.returncode}",
+            segment="grabbingImportantEmailContent",
+        )
 
 
 def run_sort_json() -> float:
@@ -413,18 +545,73 @@ def run_sort_json() -> float:
     result = subprocess.run([sys.executable, str(script)], cwd=str(_PYTHON_FILES_DIR))
     elapsed = time.perf_counter() - t
     if result.returncode != 0:
-        print(f"  WARNING: sortJSONByOrderNumber exited with code {result.returncode}")
+        _warn(
+            f"sortJSONByOrderNumber exited with code {result.returncode}",
+            segment="sortJSONByOrderNumber",
+        )
     return elapsed
 
 
 def run_create_excel() -> float:
     """Returns elapsed seconds."""
     script = _PYTHON_FILES_DIR / "createExcelDocument" / "createExcelDocument.py"
+    warn_after_s = _read_float_env("EXCEL_STEP_WARN_SECONDS", _EXCEL_STEP_WARN_SECONDS_DEFAULT)
+    timeout_raw = (os.getenv("EXCEL_CREATE_TIMEOUT_SECONDS") or "").strip()
+    timeout_s: float | None = None
+    if timeout_raw:
+        try:
+            parsed = float(timeout_raw)
+            if parsed > 0:
+                timeout_s = parsed
+        except ValueError:
+            timeout_s = None
+    cmd = [sys.executable, str(script)]
+    RL.log("timing", f"{RL.ts()}  step5_excel=start")
+    RL.debug(
+        "timing",
+        f"{RL.ts()}  step5_excel detail: cmd={cmd!r} cwd={str(_PYTHON_FILES_DIR)!r} "
+        f"warn_after={warn_after_s:.1f}s timeout={timeout_s!r}",
+    )
     t = time.perf_counter()
-    result = subprocess.run([sys.executable, str(script)], cwd=str(_PYTHON_FILES_DIR))
+    try:
+        result = subprocess.run(cmd, cwd=str(_PYTHON_FILES_DIR), timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+        elapsed = time.perf_counter() - t
+        RL.log(
+            "timing",
+            f"{RL.ts()}  step5_excel=timeout  elapsed={elapsed:.2f}s  timeout={timeout_s}",
+        )
+        RL.debug(
+            "timing",
+            f"{RL.ts()}  step5_excel timeout detail: cmd={cmd!r} exception={e!r}",
+        )
+        raise
+    except Exception as e:
+        elapsed = time.perf_counter() - t
+        RL.log("timing", f"{RL.ts()}  step5_excel=error  elapsed={elapsed:.2f}s  error={e}")
+        RL.debug(
+            "timing",
+            f"{RL.ts()}  step5_excel error detail: cmd={cmd!r} exception={e!r}",
+        )
+        raise
     elapsed = time.perf_counter() - t
+    status = "ok" if result.returncode == 0 else f"exit_{result.returncode}"
+    RL.log("timing", f"{RL.ts()}  step5_excel=end  status={status}  elapsed={elapsed:.2f}s")
+    if elapsed >= warn_after_s:
+        RL.log(
+            "timing",
+            f"{RL.ts()}  step5_excel=slow  elapsed={elapsed:.2f}s  warn_after={warn_after_s:.1f}s",
+        )
+        RL.debug(
+            "timing",
+            f"{RL.ts()}  step5_excel slow detail: elapsed={elapsed:.2f}s "
+            f"warn_after={warn_after_s:.1f}s returncode={result.returncode}",
+        )
     if result.returncode != 0:
-        print(f"  WARNING: createExcelDocument exited with code {result.returncode}")
+        _warn(
+            f"createExcelDocument exited with code {result.returncode}",
+            segment="timing",
+        )
     return elapsed
 
 
@@ -642,7 +829,7 @@ def main() -> None:
             "ERROR: use only one of --skip-email-fetch or --custom-import-html.",
             file=sys.stderr,
         )
-        sys.exit(1)
+        _fatal(1, "Invalid CLI: both --skip-email-fetch and --custom-import-html")
 
     base_dir_raw = os.getenv(BASE_DIR_ENV)
     if not base_dir_raw:
@@ -650,7 +837,7 @@ def main() -> None:
             f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
             file=sys.stderr,
         )
-        sys.exit(1)
+        _fatal(1, f"{BASE_DIR_ENV} is not set (Email Sorter → Settings)")
     base_dir = Path(base_dir_raw).expanduser().resolve()
     _clear_launcher_cancel(base_dir)
     _emit_run_launcher_progress(1, "Starting…")
@@ -676,7 +863,7 @@ def main() -> None:
             "ERROR: AZURE_CLIENT_ID must be set in .env (Azure app registration client ID).",
             file=sys.stderr,
         )
-        sys.exit(1)
+        _fatal(1, "AZURE_CLIENT_ID is not set in .env")
 
     demo_mode = os.getenv("DEMO_MODE", "0").strip().lower() in ("1", "true", "yes")
 
@@ -718,7 +905,8 @@ def main() -> None:
     try:
         usage_log_path = create_usage_log(base_dir, flow_started_at)
     except OSError as e:
-        print(f"WARNING: Could not create OpenAI usage log: {e}\n")
+        _warn(f"Could not create OpenAI usage log: {e}", segment="openai_extraction")
+        print()
 
     # ── Step 1: Environment initialization ──────────────────────
     init_s = run_environment_init()
@@ -766,12 +954,18 @@ def main() -> None:
             try:
                 shutil.copy2(src_path, dst_path)
             except OSError as e:
-                print(f"  ERROR: could not copy {src_path.name} -> {dst_path.name}: {e}")
+                _nonfatal_error(
+                    f"could not copy {src_path.name} -> {dst_path.name}: {e}",
+                    segment="emailFetching",
+                )
                 continue
             try:
                 html_text = dst_path.read_text(encoding="utf-8-sig")
             except OSError as e:
-                print(f"  ERROR: could not read {dst_path}: {e}")
+                _nonfatal_error(
+                    f"could not read {dst_path}: {e}",
+                    segment="emailFetching",
+                )
                 continue
             subj, sender_email, sender_name = _parse_saved_email_html_metadata(html_text)
             subj_display = (subj or "(no subject)")[:60]
@@ -834,7 +1028,10 @@ def main() -> None:
             try:
                 shutil.copy2(src_path, dst_path)
             except OSError as e:
-                print(f"  ERROR: could not copy {src_path.name} -> {dst_path.name}: {e}")
+                _nonfatal_error(
+                    f"could not copy {src_path.name} -> {dst_path.name}: {e}",
+                    segment="emailFetching",
+                )
                 continue
             print(
                 f"[{i}/{n_emails}] \"{subj}\" — {sender_name} <{sender_email}>\n"
@@ -886,6 +1083,13 @@ def main() -> None:
             f"{RL.ts()}  folder={mail_folder!r}  tenant={azure_tenant_id}  "
             f"auth={auth_flow}  fetched={len(emails)}  time={fetch_s:.2f}s",
         )
+        snapshot_dir = save_inbox_snapshot(base_dir, flow_started_at, emails)
+        if snapshot_dir is not None:
+            print(
+                f"[Step 2] Raw inbox snapshot saved:\n"
+                f"         {snapshot_dir}\n"
+                "         (copy these *.html files into custom_import_html_files/ to replay this batch)\n"
+            )
 
         # ── Step 3: Process each email ───────────────────────────────
         n_emails = len(emails)
@@ -972,5 +1176,15 @@ if __name__ == "__main__":
         print(f"\nFATAL ERROR: {e}")
         import traceback
 
+        tb = traceback.format_exc()
         traceback.print_exc()
+        try:
+            RL.record_program_error_exit(
+                exit_code=1,
+                summary=str(e),
+                detail=tb,
+                source="mainRunner",
+            )
+        except Exception:
+            pass
         sys.exit(1)

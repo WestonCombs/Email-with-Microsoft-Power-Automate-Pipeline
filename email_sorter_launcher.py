@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import os
 import queue
 import re
@@ -42,8 +43,48 @@ def _optional_path(env_name: str, default: Path) -> Path:
 
 
 def _env_debug_enabled() -> bool:
-    """True when ``DEBUG_MODE`` is on (same rule as ``runLogger.is_debug``)."""
-    return os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
+    """True when ``runLogger.is_debug`` reports DEBUG mode enabled."""
+    try:
+        from shared import runLogger as _RL
+
+        return _RL.is_debug()
+    except Exception:
+        return os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _record_launcher_subprocess_error(
+    *,
+    component: str,
+    exit_code: int | None,
+    err_msg: str | None,
+    log_tail: str | None = None,
+) -> None:
+    """Append to ``BASE_DIR/logs/program_errors.txt`` (independent of ``DEBUG_MODE``)."""
+    load_dotenv(_ENV_PATH, override=True)
+    parts: list[str] = []
+    if err_msg:
+        parts.append(err_msg)
+    if exit_code is not None:
+        parts.append(f"exit_code={exit_code}")
+    summary = " — ".join(parts) if parts else "Subprocess failed"
+    detail: str | None = None
+    if log_tail and log_tail.strip():
+        t = log_tail.strip()
+        if len(t) > 8000:
+            t = t[-8000:]
+        detail = f"Recent output:\n{t}"
+    ec = 1 if exit_code is None else int(exit_code)
+    try:
+        from shared import runLogger as _RL
+
+        _RL.record_program_error_exit(
+            exit_code=ec,
+            summary=summary,
+            detail=detail,
+            source=f"email_sorter_launcher.{component}",
+        )
+    except Exception:
+        pass
 
 
 def _run_cancel_request_file() -> Path | None:
@@ -311,10 +352,51 @@ def focus_or_open_orders_workbook() -> None:
 
 
 def prompt_update() -> None:
-    messagebox.askyesno(
+    if not messagebox.askyesno(
         "Update",
-        "Are you sure you want to update?",
+        "Are you sure you want to force update from GitHub?\n\n"
+        "This overwrites local tracked code changes.",
+    ):
+        return
+
+    updater = _PYTHON_FILES_DIR / "tools" / "git" / "pull_latest.py"
+    if not updater.is_file():
+        messagebox.showerror("Update", f"Update script not found:\n{updater}")
+        return
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(updater)],
+            cwd=str(_PYTHON_FILES_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=_subprocess_creationflags(show_console=False),
+        )
+    except Exception as e:
+        messagebox.showerror("Update", f"Could not start update:\n{e}")
+        return
+
+    details = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
     )
+    if len(details) > 3000:
+        details = details[-3000:]
+
+    if result.returncode == 0:
+        msg = "Force update completed from GitHub.\nRestart the app to load latest code."
+        if details:
+            msg += f"\n\n{details}"
+        messagebox.showinfo("Update", msg)
+        return
+
+    msg = "Force update failed."
+    if details:
+        msg += f"\n\n{details}"
+    else:
+        msg += f"\n\nProcess exited with code {result.returncode}."
+    messagebox.showerror("Update", msg)
 
 
 class MitmInitializeWindow:
@@ -937,22 +1019,64 @@ def main() -> None:
                 Path(skip17_flag_path).unlink(missing_ok=True)
             except OSError:
                 pass
-            excel_btn.config(state=tk.NORMAL)
-            win.close_window()
-            if err_msg is not None:
-                messagebox.showerror(
-                    "Excel",
-                    "Could not update the orders workbook before opening.\n\n" + err_msg,
-                )
-                return
+
+            def release_excel_btn() -> None:
+                excel_btn.config(state=tk.NORMAL)
+
             if stopped:
+                release_excel_btn()
+                win.close_window()
                 return
-            if code not in (0, None):
-                messagebox.showerror(
-                    "Excel",
-                    f"Rebuild failed (exit code {code}).",
+
+            if err_msg is not None:
+                _record_launcher_subprocess_error(
+                    component="excel",
+                    exit_code=None,
+                    err_msg=err_msg,
                 )
+                detail = "Could not update the orders workbook before opening.\n\n" + err_msg
+                if show_console:
+                    win.prepare_error_review_mode(
+                        status_message=(
+                            "Excel rebuild failed before finishing.\n\n"
+                            "Review the debug log above, then click Close."
+                        ),
+                        on_dismiss=lambda: (
+                            release_excel_btn(),
+                            messagebox.showerror("Excel", detail, parent=root),
+                        ),
+                    )
+                    return
+                release_excel_btn()
+                win.close_window()
+                messagebox.showerror("Excel", detail, parent=root)
                 return
+
+            if code not in (0, None):
+                _record_launcher_subprocess_error(
+                    component="excel",
+                    exit_code=int(code),
+                    err_msg=f"Excel rebuild subprocess failed (exit code {code})",
+                )
+                brief = f"Rebuild failed (exit code {code})."
+                if show_console:
+                    win.prepare_error_review_mode(
+                        status_message=(
+                            f"{brief}\n\nReview the debug log above, then click Close."
+                        ),
+                        on_dismiss=lambda: (
+                            release_excel_btn(),
+                            messagebox.showerror("Excel", brief, parent=root),
+                        ),
+                    )
+                    return
+                release_excel_btn()
+                win.close_window()
+                messagebox.showerror("Excel", brief, parent=root)
+                return
+
+            release_excel_btn()
+            win.close_window()
             focus_or_open_orders_workbook()
 
         def pump_excel() -> None:
@@ -1103,6 +1227,7 @@ def main() -> None:
 
         line_q: queue.Queue[tuple[str, object]] = queue.Queue()
         done_flag = [False]
+        run_log_tail: deque[str] = deque(maxlen=40)
 
         def read_thread() -> None:
             try:
@@ -1128,32 +1253,128 @@ def main() -> None:
             except Exception as e:
                 line_q.put(("err", str(e)))
 
-        def finish_run(stopped: bool, err_msg: str | None, code: int | None) -> None:
+        def finish_run(
+            stopped: bool,
+            err_msg: str | None,
+            code: int | None,
+            *,
+            log_tail: list[str] | None = None,
+        ) -> None:
             nonlocal run_in_progress
             if skip17_flag_path_run:
                 try:
                     Path(skip17_flag_path_run).unlink(missing_ok=True)
                 except OSError:
                     pass
-            run_in_progress = False
-            set_pipeline_ui_busy(False)
-            win.close_window()
-            if err_msg is not None:
-                messagebox.showerror("Run", err_msg)
-                return
+
+            def release_run_ui() -> None:
+                nonlocal run_in_progress
+                run_in_progress = False
+                set_pipeline_ui_busy(False)
+
             if stopped and is_excel_rebuild_only:
+                release_run_ui()
+                win.close_window()
                 return
             if stopped:
+                release_run_ui()
+                win.close_window()
                 return
-            if code == 3:
-                messagebox.showerror(
-                    "Run",
-                    "The pipeline stopped due to an OpenAI rate limit or another fatal "
-                    "OpenAI error. Check logs and your OpenAI billing/settings.",
+
+            if err_msg is not None:
+                _record_launcher_subprocess_error(
+                    component="run",
+                    exit_code=None,
+                    err_msg=err_msg,
+                    log_tail="\n".join(log_tail) if log_tail else None,
                 )
+                if show_console:
+                    win.prepare_error_review_mode(
+                        status_message=(
+                            "The pipeline subprocess failed before finishing.\n\n"
+                            "Review the debug log above, then click Close."
+                        ),
+                        on_dismiss=lambda: (
+                            release_run_ui(),
+                            messagebox.showerror("Run", err_msg, parent=root),
+                        ),
+                    )
+                    return
+                release_run_ui()
+                win.close_window()
+                messagebox.showerror("Run", err_msg, parent=root)
                 return
+
+            if code == 3:
+                tail_txt = None
+                if log_tail:
+                    tail_txt = "\n".join(log_tail).strip()
+                    if len(tail_txt) > 8000:
+                        tail_txt = tail_txt[-8000:]
+                _record_launcher_subprocess_error(
+                    component="run",
+                    exit_code=3,
+                    err_msg="OpenAI rate limit or fatal OpenAI error (exit code 3)",
+                    log_tail=tail_txt,
+                )
+                openai_msg = (
+                    "The pipeline stopped due to an OpenAI rate limit or another fatal "
+                    "OpenAI error. Check logs and your OpenAI billing/settings."
+                )
+                if show_console:
+                    win.prepare_error_review_mode(
+                        status_message=(
+                            "Pipeline exited with code 3 (OpenAI rate limit or fatal OpenAI error).\n\n"
+                            "Review the debug log above, then click Close."
+                        ),
+                        on_dismiss=lambda: (
+                            release_run_ui(),
+                            messagebox.showerror("Run", openai_msg, parent=root),
+                        ),
+                    )
+                    return
+                release_run_ui()
+                win.close_window()
+                messagebox.showerror("Run", openai_msg, parent=root)
+                return
+
             if code not in (0, None):
-                messagebox.showerror("Run", f"Pipeline exited with code {code}.")
+                tail_txt = None
+                if log_tail:
+                    tail_txt = "\n".join(log_tail).strip()
+                    if len(tail_txt) > 8000:
+                        tail_txt = tail_txt[-8000:]
+                _record_launcher_subprocess_error(
+                    component="run",
+                    exit_code=int(code),
+                    err_msg=f"Pipeline subprocess exited with code {code}",
+                    log_tail=tail_txt,
+                )
+                msg = f"Pipeline exited with code {code}."
+                if log_tail:
+                    tail = "\n".join(log_tail).strip()
+                    if len(tail) > 4000:
+                        tail = tail[-4000:]
+                    msg = f"{msg}\n\nRecent output:\n{tail}"
+                if show_console:
+                    win.prepare_error_review_mode(
+                        status_message=(
+                            f"Pipeline exited with code {code}.\n\n"
+                            "Review the debug log above, then click Close."
+                        ),
+                        on_dismiss=lambda: (
+                            release_run_ui(),
+                            messagebox.showerror("Run", msg, parent=root),
+                        ),
+                    )
+                    return
+                release_run_ui()
+                win.close_window()
+                messagebox.showerror("Run", msg, parent=root)
+                return
+
+            release_run_ui()
+            win.close_window()
 
         def pump_run() -> None:
             if done_flag[0]:
@@ -1170,13 +1391,21 @@ def main() -> None:
                         if parsed:
                             pct, msg = parsed
                             win.set_progress(pct, msg or None)
+                        else:
+                            one = line.rstrip("\n\r")
+                            if one.strip():
+                                run_log_tail.append(one[-800:])
                         if show_console:
                             win.append_log(line)
                     elif kind == "code":
                         done_flag[0] = True
                         stopped = win.stop_requested
                         c = int(payload)
-                        root.after(0, lambda s=stopped, c=c: finish_run(s, None, c))
+                        tail = list(run_log_tail)
+                        root.after(
+                            0,
+                            lambda s=stopped, co=c, t=tail: finish_run(s, None, co, log_tail=t),
+                        )
                         return
                     elif kind == "err":
                         done_flag[0] = True

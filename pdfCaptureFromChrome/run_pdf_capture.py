@@ -6,7 +6,7 @@ window with an optional first-page image preview (PyMuPDF + Pillow). Auto-closes
 after 10 seconds.
 
 Optional **last positional** ``0`` = quiet (no mitmdump log files, minimal console),
-``1`` or omitted = debug (writes ``mitmdump.*.log``, verbose output).
+``1`` = debug. If omitted, default follows ``DEBUG_MODE`` when set; otherwise legacy debug-on.
 
     pip install -r requirements_mitmproxy.txt
 
@@ -625,7 +625,8 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         metavar="ARG",
         help=(
-            "Optional last argument 0 = quiet (no mitmdump log files), 1 = debug (default if omitted). "
+            "Optional last argument 0 = quiet (no mitmdump log files), 1 = debug. "
+            "If omitted, follow DEBUG_MODE when set; otherwise debug-on. "
             "Otherwise: 0 args → defaults; 1 arg → URL; 3 args → URL, output dir, filename."
         ),
     )

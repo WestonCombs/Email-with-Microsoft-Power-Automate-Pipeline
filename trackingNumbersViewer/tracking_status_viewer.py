@@ -29,6 +29,7 @@ if str(_PYTHON_FILES_DIR) not in sys.path:
 
 from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
 from shared.gui_treeview_copy import bind_treeview_copy_menu
+from shared import runLogger as RL
 from htmlHandler.carrier_urls import normalize_carrier_for_public_url, public_tracking_url
 from pdfCaptureFromChrome.paths import PDF_CAPTURE_SESSION_LOG
 from proofOfDelivery.pod_data import (
@@ -504,8 +505,7 @@ class TrackingStatusViewerApp:
             return None
 
     def _debug_positional_flag(self) -> str:
-        v = (os.getenv("DEBUG_MODE") or "0").strip().lower()
-        return "1" if v in ("1", "true", "yes") else "0"
+        return "1" if RL.is_debug() else "0"
 
     def _info_for_index(self, idx: int) -> dict[str, object]:
         return self._row_infos[idx]
