@@ -81,14 +81,35 @@ def is_mitm_it_install_url(url: str) -> bool:
     return url.rstrip("/").lower() in ("http://mitm.it", "https://mitm.it")
 
 
+def _env_debug_enabled() -> bool:
+    """Resolve DEBUG_MODE consistently with the rest of the app."""
+    try:
+        from shared import runLogger as RL  # type: ignore
+
+        return RL.is_debug()
+    except Exception:
+        return (os.getenv("DEBUG_MODE") or "0").strip().lower() in ("1", "true", "yes")
+
+
+def _default_debug_mode() -> bool:
+    """Default PDF-capture verbosity when trailing 0/1 is omitted.
+
+    - If DEBUG_MODE is set, follow it.
+    - If DEBUG_MODE is absent, keep legacy behavior (debug/verbose on).
+    """
+    if os.getenv("DEBUG_MODE") is None:
+        return True
+    return _env_debug_enabled()
+
+
 def split_debug_positional(args: list[str]) -> tuple[list[str], bool]:
     """If the last token is ``0`` or ``1``, treat it as quiet (0) / debug (1) and strip it.
 
-    Otherwise debug defaults to ``True`` (verbose logging, same as before).
+    Otherwise debug defaults to :func:`_default_debug_mode`.
     """
     if not args:
-        return [], True
+        return [], _default_debug_mode()
     last = args[-1].strip()
     if last in ("0", "1"):
         return args[:-1], last == "1"
-    return args, True
+    return args, _default_debug_mode()

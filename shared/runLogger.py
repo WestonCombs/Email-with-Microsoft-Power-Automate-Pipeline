@@ -13,6 +13,7 @@ Segment files written to BASE_DIR/logs/:
   htmlHandler.txt                   — HTML processing events (includes trace() lines)
   sortJSONByOrderNumber.txt         — sort events
   environmentInitialization.txt     — initialization events
+  program_errors.txt                — fatal exits and subprocess failures (always; not gated on DEBUG_MODE)
 
 When DEBUG_MODE=1, additional detail-only files are also written:
   debug_tracking_hrefs.txt
@@ -43,15 +44,16 @@ except ImportError:
     pass
 
 
-# Import-time snapshot (for non-debug code paths that only need a hint).
-_DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
+_TRUTHY = ("1", "true", "yes")
 _MASTER_FILE = "master.txt"
 _MAX_TRACE_SAMPLE = 500
-_INCLUDE_TRACE_SAMPLES = os.getenv("TRACE_INCLUDE_SAMPLES", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
+
+
+def _is_truthy(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in _TRUTHY
+
+
+_INCLUDE_TRACE_SAMPLES = _is_truthy(os.getenv("TRACE_INCLUDE_SAMPLES"))
 
 
 def _logs_dir() -> Path:
@@ -75,7 +77,7 @@ def is_debug() -> bool:
     Subprocesses and ``load_dotenv`` can set this after some modules import; using the
     current value keeps ``debug_*`` logs aligned with ``python_files/.env``.
     """
-    return os.getenv("DEBUG_MODE", "0").strip().lower() in ("1", "true", "yes")
+    return _is_truthy(os.getenv("DEBUG_MODE", "0"))
 
 
 def ts() -> str:
@@ -150,6 +152,41 @@ def trace(source: str, message: str, sample: str | None = None) -> None:
             frag = frag[:_MAX_TRACE_SAMPLE] + "…"
         line += f"\n    sample: {frag}"
     log("htmlHandler", line)
+
+
+def record_program_error_exit(
+    *,
+    exit_code: int,
+    summary: str,
+    detail: str | None = None,
+    source: str = "unknown",
+) -> None:
+    """Append one error-exit record to ``program_errors.txt`` under ``BASE_DIR/logs/``.
+
+    Used for non-zero exits, launcher-reported subprocess failures, and similar cases.
+    Always writes when ``BASE_DIR`` is set and the path is writable — independent of
+    ``DEBUG_MODE``. Does nothing if ``BASE_DIR`` is missing or the write fails.
+    """
+    try:
+        logs = _logs_dir()
+    except ValueError:
+        return
+    sep = "─" * 72
+    sum_one_line = summary.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [
+        f"\n{sep}",
+        f"{ts()}  exit_code={exit_code}  source={source}",
+        f"  summary: {sum_one_line}",
+    ]
+    if detail:
+        d = detail.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if d:
+            lines.append("  detail:")
+            lines.extend("    " + ln for ln in d.split("\n"))
+    lines.append(sep)
+    block = "\n".join(lines) + "\n"
+    _append(logs / "program_errors.txt", block)
+    _append_master("program_errors", block, nl=True)
 
 
 def write_timing_entry(buffer_path: Path, data: dict) -> None:

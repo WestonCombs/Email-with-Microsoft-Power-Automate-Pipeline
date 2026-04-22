@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -85,6 +86,33 @@ def _openai_fields_log_line(extracted: dict) -> str:
             s = s[:117] + "..."
         parts.append(f"tracking_numbers={s!r}")
     return "OpenAI — " + (", ".join(parts) if parts else "no structured fields")
+
+
+def _log_warning(segment: str, message: str) -> None:
+    RL.log(segment, f"{RL.ts()}  WARNING: {message}")
+
+
+def _log_error(segment: str, message: str) -> None:
+    RL.log(segment, f"{RL.ts()}  ERROR: {message}")
+
+
+def _record_fatal_exit(
+    *,
+    exit_code: int,
+    summary: str,
+    detail: str | None = None,
+    source: str = "grabbingImportantEmailContent",
+) -> None:
+    """Best-effort write to program_errors.txt; no-op when BASE_DIR is unavailable."""
+    try:
+        RL.record_program_error_exit(
+            exit_code=exit_code,
+            summary=summary,
+            detail=detail,
+            source=source,
+        )
+    except Exception:
+        pass
 
 
 # =========================
@@ -487,9 +515,17 @@ def convert_html_to_pdf(
                 _cleanup_print_tmp()
                 html_path.unlink()
                 print(f"  Converted to PDF: {pdf_path.name}")
+                RL.log(
+                    "htmlHandler",
+                    f"{RL.ts()}  converted_to_pdf browser={browser.name} source={html_path.name} output={pdf_path.name}",
+                )
                 return pdf_path
         except Exception as e:
             print(f"  Browser PDF conversion failed: {e}")
+            _log_warning(
+                "htmlHandler",
+                f"Browser PDF conversion failed for {html_path.name}: {e}",
+            )
             if pdf_path.exists():
                 try:
                     pdf_path.unlink()
@@ -512,12 +548,21 @@ def convert_html_to_pdf(
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
                 html_path.unlink()
                 print(f"  Converted to PDF (xhtml2pdf): {pdf_path.name}")
+                RL.log(
+                    "htmlHandler",
+                    f"{RL.ts()}  converted_to_pdf xhtml2pdf source={html_path.name} output={pdf_path.name}",
+                )
                 return pdf_path
         except Exception as e:
             print(f"  xhtml2pdf conversion failed: {e}")
+            _log_warning(
+                "htmlHandler",
+                f"xhtml2pdf conversion failed for {html_path.name}: {e}",
+            )
 
     # --- Both failed ---
     print(f"  WARNING: Could not convert {html_path.name} to PDF, keeping HTML")
+    _log_warning("htmlHandler", f"Could not convert {html_path.name} to PDF; keeping HTML")
     if pdf_path.exists():
         try:
             pdf_path.unlink()
@@ -733,6 +778,10 @@ def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
             break
         except RateLimitError as e:
             print(f"  Rate limit hit (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}) — waiting {RATE_LIMIT_RETRY_WAIT}s...")
+            RL.log(
+                "openai_extraction",
+                f"{RL.ts()}  rate_limit_retry attempt={attempt}/{RATE_LIMIT_MAX_RETRIES} wait={RATE_LIMIT_RETRY_WAIT}s",
+            )
             if RL.is_debug():
                 short, full = _openai_rate_limit_debug(e)
                 print(f"  {short}")
@@ -751,6 +800,10 @@ def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
 
     if total_waited > 0:
         print(f"  Total rate-limit wait: {total_waited:.1f}s")
+        RL.log(
+            "openai_extraction",
+            f"{RL.ts()}  rate_limit_total_wait={total_waited:.1f}s",
+        )
 
     usage = getattr(response, "usage", None)
     if usage is not None and _flow_usage_log_path is not None:
@@ -771,6 +824,7 @@ def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
             )
         except OSError as e:
             print(f"  WARNING: Could not write OpenAI usage log: {e}")
+            _log_warning("openai_extraction", f"Could not write OpenAI usage log: {e}")
 
     content = response.choices[0].message.content
     return json.loads(content)
@@ -997,6 +1051,10 @@ def process_file(
         print(f"done  ({timings['step1_s']:.2f}s, {len(raw_html):,} chars)")
         if len(raw_html) < 500:
             print(f"  WARNING: HTML is very short ({len(raw_html)} chars) — check source email.")
+            _log_warning(
+                "grabbingImportantEmailContent",
+                f"{file_path.name}: HTML is very short ({len(raw_html)} chars)",
+            )
         RL.debug("grabbingImportantEmailContent",
             f"  [step1] {file_path.name}: {len(raw_html):,} chars ({html_encoding}), "
             f"href_tokens={href_count_raw}, anchor_tags={raw_html.lower().count('<a ')}"
@@ -1036,6 +1094,10 @@ def process_file(
         print(f"done  ({timings['step3_s']:.2f}s, {len(extracted_hrefs)} unique, {fetchable} http/https)")
         if not extracted_hrefs:
             print(f"  WARNING: 0 hrefs extracted (HTML had {href_count_raw} href= tokens)")
+            _log_warning(
+                "grabbingImportantEmailContent",
+                f"{file_path.name}: 0 hrefs extracted (raw href tokens={href_count_raw})",
+            )
         RL.debug("grabbingImportantEmailContent",
             f"  [step3] hrefs: found={len(extracted_hrefs)}, http/https={fetchable}, "
             f"non-web={len(extracted_hrefs)-fetchable}"
@@ -1088,6 +1150,10 @@ def process_file(
             except Exception as e:
                 timings["step5_s"] = round(_time.perf_counter() - t5, 3)
                 print(f"FAILED  ({timings['step5_s']:.2f}s, {e})")
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: OpenAI extraction failed after {timings['step5_s']:.2f}s: {e}",
+                )
                 extracted = None
         else:
             timings["step5_s"] = 0.0
@@ -1096,6 +1162,10 @@ def process_file(
         if extracted is None:
             if not API_KEY:
                 print("  WARNING: No API key — empty fields only.")
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    "No OpenAI API key configured; using empty extraction fields",
+                )
             extracted = empty_extraction
         _coerce_llm_tracking_numbers(extracted)
 
@@ -1128,6 +1198,10 @@ def process_file(
             except Exception as e:
                 timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
                 print(f"FAILED  ({timings['step5b_s']:.2f}s, {e})")
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: Gift card check failed after {timings['step5b_s']:.2f}s: {e}",
+                )
                 gift_verdict = None
         else:
             timings["step5b_s"] = 0.0
@@ -1211,9 +1285,7 @@ def process_file(
         timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
         timings["error"] = str(e)
         print(f"  ERROR in pipeline: {e}")
-        RL.log("grabbingImportantEmailContent",
-            f"{RL.ts()}  {file_path.name}  |  ERROR: {e}"
-        )
+        _log_error("grabbingImportantEmailContent", f"{file_path.name}: {e}")
         return {
             "source_file": clean_text(file_path),
             "source_file_link": None,
@@ -1632,11 +1704,16 @@ def main(flow_started_at: datetime | None = None):
             init_flow_usage_log(base, started)
         except OSError as e:
             print(f"WARNING: Could not create OpenAI usage log file: {e}")
+            _log_warning("openai_extraction", f"Could not create OpenAI usage log file: {e}")
 
     if not API_KEY:
         print(
             f"WARNING: {OPENAI_API_KEY_ENV} is not set. "
             "Structured extraction will be skipped (empty fields only)."
+        )
+        _log_warning(
+            "openai_extraction",
+            f"{OPENAI_API_KEY_ENV} is not set; structured extraction is skipped",
         )
 
     _timing_buffer_path: Path | None = None
@@ -1771,6 +1848,11 @@ if __name__ == "__main__":
             f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
             file=sys.stderr,
         )
+        _record_fatal_exit(
+            exit_code=1,
+            summary=f"{BASE_DIR_ENV} is not set",
+            source="grabbingImportantEmailContent.__main__",
+        )
         sys.exit(1)
 
     _start_time = time.time()
@@ -1795,15 +1877,33 @@ if __name__ == "__main__":
                 "Set OPENAI_API_KEY in python_files/.env."
             )
             print("Optional args: --file, --subject, --sender-name, --email")
+        _exit_code = e.code if isinstance(e.code, int) else (0 if e.code in (None, False) else 1)
+        if _exit_code != 0:
+            _record_fatal_exit(
+                exit_code=_exit_code,
+                summary=f"SystemExit in __main__: code={e.code!r}",
+                source="grabbingImportantEmailContent.__main__",
+            )
         sys.exit(e.code)
     except OpenAIRateLimitFatalError as e:
         _elapsed = time.time() - _start_time
         _print_openai_fatal_banner()
         print(f"Detail: {e}", file=sys.stderr)
         print(f"Total operation time: {_elapsed:.2f}s")
+        _record_fatal_exit(
+            exit_code=EXIT_OPENAI_RATE_LIMIT_FATAL,
+            summary=str(e),
+            source="grabbingImportantEmailContent.__main__",
+        )
         sys.exit(EXIT_OPENAI_RATE_LIMIT_FATAL)
     except Exception as e:
         _elapsed = time.time() - _start_time
         print(f"\nERROR: {e}")
         print(f"Total operation time: {_elapsed:.2f}s")
+        _record_fatal_exit(
+            exit_code=1,
+            summary=str(e),
+            detail=traceback.format_exc(),
+            source="grabbingImportantEmailContent.__main__",
+        )
         sys.exit(1)

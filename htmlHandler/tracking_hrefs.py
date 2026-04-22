@@ -26,6 +26,29 @@ def _dbg(msg: str) -> None:
     except Exception:
         pass
 
+
+def _link_debug_enabled() -> bool:
+    return RL.is_debug() or os.getenv("EMAIL_LINK_DEBUG", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _link_debug(msg: str) -> None:
+    """Write link parsing diagnostics to file logs (never console)."""
+    try:
+        if not _link_debug_enabled():
+            return
+        if RL.is_debug():
+            RL.debug("tracking_hrefs", f"  {msg}")
+            return
+        # Explicit EMAIL_LINK_DEBUG without DEBUG_MODE still records diagnostics in file logs.
+        RL.log("tracking_hrefs", f"{RL.ts()}  [link-debug] {msg}")
+    except Exception:
+        pass
+
+
 _SRC = "tracking_hrefs"
 
 # --- JSON / Excel compatibility: same sentinel string as historical runs ---
@@ -137,14 +160,6 @@ def _link_priority_score(url: str) -> int:
     return sum(1 for s in _LINK_PRIORITY_SUBSTRINGS if s in low)
 
 
-def _should_print_link_debug() -> bool:
-    return RL.is_debug() or os.getenv("EMAIL_LINK_DEBUG", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def extract_all_links(html: str) -> list[str]:
     """Return every distinct anchor ``href`` from *html* (document order), fully cleaned.
 
@@ -170,21 +185,21 @@ def extract_all_links(html: str) -> list[str]:
         low = link.lower()
         if low.startswith("http://") or low.startswith("https://"):
             if len(link) <= 50 and _link_priority_score(link) > 0:
-                print(
-                    f"[DEBUG] SUSPICIOUS short tracking-like http(s) link "
+                _link_debug(
+                    f"SUSPICIOUS short tracking-like http(s) link "
                     f"(len={len(link)}): {link}"
                 )
         elif low.startswith("http") and not (
             low.startswith("http://") or low.startswith("https://")
         ):
-            print(f"[DEBUG] SUSPICIOUS non-standard http scheme prefix: {link[:120]}")
+            _link_debug(f"SUSPICIOUS non-standard http scheme prefix: {link[:120]}")
 
         if link not in seen:
             seen.add(link)
             out.append(link)
-            if _should_print_link_debug():
-                print(f"[DEBUG] Link Length: {len(link)}")
-                print(f"[DEBUG] Link Preview: {link[:120]}")
+            if _link_debug_enabled():
+                _link_debug(f"Link Length: {len(link)}")
+                _link_debug(f"Link Preview: {link[:120]}")
 
     return out
 
