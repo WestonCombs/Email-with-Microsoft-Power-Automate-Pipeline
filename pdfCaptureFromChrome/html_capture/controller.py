@@ -1,5 +1,5 @@
 """
-Isolated Chrome + global Ctrl+Enter: snapshot the focused tab to an expected .pdf path via CDP.
+Isolated Chrome + global Ctrl+Shift+P: snapshot the focused tab to an expected .pdf path via CDP.
 """
 
 from __future__ import annotations
@@ -49,9 +49,13 @@ except ImportError:
     from paths import PDF_CAPTURE_SESSION_LOG  # type: ignore[no-redef]  # noqa: E402
 
 try:
-    from .hotkey_win32 import CtrlEnterHotkey, hotkey_ctrl_enter_available
+    from .hotkey_win32 import CAPTURE_HOTKEY_LABEL, CaptureHotkey, hotkey_capture_available
 except ImportError:
-    from hotkey_win32 import CtrlEnterHotkey, hotkey_ctrl_enter_available  # type: ignore[no-redef]  # noqa: E402
+    from hotkey_win32 import (  # type: ignore[no-redef]  # noqa: E402
+        CAPTURE_HOTKEY_LABEL,
+        CaptureHotkey,
+        hotkey_capture_available,
+    )
 
 _LOG_LOCK = threading.Lock()
 
@@ -110,6 +114,18 @@ def _http_json_new_tab(debug_port: int, url: str) -> str | None:
     return None
 
 
+def _http_close_tab(debug_port: int, target_id: str) -> bool:
+    tid = urllib.parse.quote(str(target_id), safe="")
+    req_url = f"http://127.0.0.1:{debug_port}/json/close/{tid}"
+    try:
+        with urllib.request.urlopen(req_url, timeout=4) as r:
+            r.read()
+        return True
+    except OSError as e:
+        _log_line(f"json/close error: {e!r} target_id={target_id}")
+        return False
+
+
 def _first_page_target_id_for_url(debug_port: int, want_url: str) -> str | None:
     want = _norm_href(want_url)
     try:
@@ -145,14 +161,84 @@ def _apply_runtime_settings() -> None:
         pass
 
 
+def _unique_sibling_path(path: Path, marker: str) -> Path:
+    suffix = path.suffix or ".pdf"
+    candidate = path.with_name(f"{path.stem}{marker}{suffix}")
+    if not candidate.exists():
+        return candidate
+    idx = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}{marker} ({idx}){suffix}")
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
+def _audit_unavailable(reason: str) -> bool:
+    text = reason.casefold()
+    return any(
+        marker in text
+        for marker in (
+            "openai_api_key is not configured",
+            "openai is required",
+            "pypdf2 is required",
+            "validation failed:",
+        )
+    )
+
+
+def _finalize_pdf_with_audit(staged_pdf: Path, expected_pdf: Path, record: dict | None) -> tuple[Path, bool, str]:
+    if not record:
+        staged_pdf.replace(expected_pdf)
+        return expected_pdf, True, ""
+
+    try:
+        from tracking_pdf_audit import log_tracking_pdf
+        from tracking_pdf_validator import validate_pdf_with_llm
+    except Exception as exc:
+        staged_pdf.replace(expected_pdf)
+        _log_line(f"audit import unavailable: {exc!r}")
+        return expected_pdf, True, f"Audit unavailable: {exc!s}"
+
+    try:
+        validation = validate_pdf_with_llm(str(staged_pdf))
+    except Exception as exc:
+        validation = {
+            "latest_tracking_info_visible": False,
+            "confidence": 0,
+            "status_found": "Unknown",
+            "latest_update_found": None,
+            "reason": f"Validation failed: {exc}",
+        }
+
+    validation = validation if isinstance(validation, dict) else {}
+    visible = bool(validation.get("latest_tracking_info_visible"))
+    reason = str(validation.get("reason") or "").strip()
+    can_advance = visible or _audit_unavailable(reason)
+    final_pdf = expected_pdf if can_advance else _unique_sibling_path(expected_pdf, "_needs_review")
+    staged_pdf.replace(final_pdf)
+
+    try:
+        log_tracking_pdf(str(final_pdf), record, validation)
+    except Exception as exc:
+        _log_line(f"audit log failed: {exc!r}")
+
+    if visible:
+        status = str(validation.get("status_found") or "Unknown").strip() or "Unknown"
+        return final_pdf, True, f"AI audit passed ({status})."
+    if can_advance:
+        return final_pdf, True, reason or "AI audit was unavailable."
+    return final_pdf, False, reason or "AI audit did not confirm visible tracking details."
+
+
 class HtmlCaptureController:
     """
-    - ``start()`` registers Ctrl+Enter (Win32) and does not start Chrome until the first ``enqueue_capture``.
+    - ``start()`` registers Ctrl+Shift+P (Win32) and does not start Chrome until the first ``enqueue_capture``.
     - Each ``enqueue_capture`` opens a new tab (or the first load after a fresh launch) to ``url`` and
       records the target id → expected output ``.pdf`` path.
-    - On Ctrl+Enter, the focused page is printed to PDF and written to the mapped path.
+    - On Ctrl+Shift+P, the focused page is printed to PDF and written to the mapped path.
     - With ``auto_print_pdf=True``, a background thread waits for the tab to settle (CDP ``inspect_page``),
-      then prints to PDF without requiring Ctrl+Enter, and writes an optional HTML snapshot beside the PDF.
+      then prints to PDF without requiring Ctrl+Shift+P, and writes an optional HTML snapshot beside the PDF.
     """
 
     def __init__(
@@ -171,8 +257,9 @@ class HtmlCaptureController:
         self._debug_port: int = 0
         self._first_enqueued: bool = False
         self._target_to_path: dict[str, Path] = {}
+        self._target_to_record: dict[str, dict] = {}
         self._order: list[str] = []
-        self._hotkey: CtrlEnterHotkey | None = None
+        self._hotkey: CaptureHotkey | None = None
 
     @staticmethod
     def _env_debug_port() -> int:
@@ -199,14 +286,15 @@ class HtmlCaptureController:
         with self._lock:
             if self._active:
                 return True
-            if not hotkey_ctrl_enter_available():
-                self._emit("error", "HTML capture (Ctrl+Enter) requires Windows.")
+            if not hotkey_capture_available():
+                self._emit("error", f"HTML capture ({CAPTURE_HOTKEY_LABEL}) requires Windows.")
                 return False
             self._debug_port = self._env_debug_port()
             self._target_to_path.clear()
+            self._target_to_record.clear()
             self._order.clear()
             self._first_enqueued = False
-            self._hotkey = CtrlEnterHotkey(self._schedule_snapshot)
+            self._hotkey = CaptureHotkey(self._schedule_snapshot)
             ok = self._hotkey.start() if self._hotkey is not None else False
             if not ok and self._hotkey is not None and self._hotkey.start_error:
                 self._emit("error", self._hotkey.start_error)
@@ -226,6 +314,7 @@ class HtmlCaptureController:
             self._hotkey = None
             self._first_enqueued = False
             self._target_to_path.clear()
+            self._target_to_record.clear()
             self._order.clear()
             self._chrome = None
         if h is not None:
@@ -234,10 +323,15 @@ class HtmlCaptureController:
             _terminate_chrome_process(c)
 
     def enqueue_capture(
-        self, url: str, expected_pdf: Path, *, auto_print_pdf: bool = False
+        self,
+        url: str,
+        expected_pdf: Path,
+        *,
+        record: dict | None = None,
+        auto_print_pdf: bool = False,
     ) -> bool:
         if not self._active:
-            self._emit("error", "HTML capture is not started (toggle PDF capture on first).")
+            self._emit("error", "HTML capture is not started (turn Assisted PDF Capture on first).")
             return False
         u = (url or "").strip()
         if not u:
@@ -287,6 +381,10 @@ class HtmlCaptureController:
 
         with self._lock:
             self._target_to_path[str(target_id)] = expected_pdf
+            if record is not None:
+                self._target_to_record[str(target_id)] = dict(record)
+            else:
+                self._target_to_record.pop(str(target_id), None)
             if str(target_id) not in self._order:
                 self._order.append(str(target_id))
             if not self._first_enqueued:
@@ -323,6 +421,15 @@ class HtmlCaptureController:
         except OSError:
             return None
         return None
+
+    def _close_target_id(self, target_id: str) -> None:
+        with self._lock:
+            dport = self._debug_port
+            self._target_to_path.pop(target_id, None)
+            self._target_to_record.pop(target_id, None)
+            self._order = [tid for tid in self._order if tid != target_id]
+        if dport:
+            _http_close_tab(dport, target_id)
 
     def _thread_auto_pod_capture(self, target_id: str, expected_pdf: Path) -> None:
         self._emit(
@@ -370,14 +477,28 @@ class HtmlCaptureController:
 
             if expected_pdf.is_file() and not self._verbose:
                 self._emit("info", f"File already exists:\n{expected_pdf.name}")
+                self._close_target_id(target_id)
+                if self._on_saved is not None:
+                    try:
+                        self._on_saved()
+                    except Exception:
+                        pass
                 return
             expected_pdf.parent.mkdir(parents=True, exist_ok=True)
 
             pdf_bytes = export_page_pdf(ws_url)
-            expected_pdf.write_bytes(pdf_bytes)
-            _log_line(f"auto-saved PDF {expected_pdf} ({len(pdf_bytes)} bytes)")
+            staged_pdf = _unique_sibling_path(expected_pdf, "_capture_pending")
+            staged_pdf.write_bytes(pdf_bytes)
+            with self._lock:
+                record = self._target_to_record.get(target_id)
+            final_pdf, can_advance, audit_message = _finalize_pdf_with_audit(
+                staged_pdf,
+                expected_pdf,
+                record,
+            )
+            _log_line(f"auto-saved PDF {final_pdf} ({len(pdf_bytes)} bytes)")
 
-            html_path = expected_pdf.with_name(expected_pdf.stem + "_capture.html")
+            html_path = final_pdf.with_name(final_pdf.stem + "_capture.html")
             html_snip = extract_outer_html_snippet(ws_url, max_chars=350_000)
             if html_snip:
                 try:
@@ -386,13 +507,23 @@ class HtmlCaptureController:
                 except OSError as exc:
                     _log_line(f"html snapshot write failed: {exc!r}")
 
-            if self._on_saved is not None:
-                try:
-                    self._on_saved()
-                except Exception:
-                    pass
+            if can_advance:
+                self._close_target_id(target_id)
+                if self._on_saved is not None:
+                    try:
+                        self._on_saved()
+                    except Exception:
+                        pass
             extra = f"\nHTML snapshot:\n{html_path.name}" if html_snip else ""
-            self._emit("info", f"Proof-of-delivery PDF saved:\n{expected_pdf.name}{extra}")
+            if can_advance:
+                audit_line = f"\n{audit_message}" if audit_message else ""
+                self._emit("info", f"Proof-of-delivery PDF saved:\n{final_pdf.name}{extra}{audit_line}")
+            else:
+                self._emit(
+                    "error",
+                    "AI audit did not approve this capture, so the tab is still open and the batch is paused.\n\n"
+                    f"Review PDF:\n{final_pdf.name}\n\n{audit_message}",
+                )
         except Exception as e:
             _log_line("auto pod capture error:\n" + traceback.format_exc())
             self._emit("error", f"Automatic print to PDF failed: {e!s}")
@@ -400,7 +531,7 @@ class HtmlCaptureController:
     def _schedule_snapshot(self) -> None:
         threading.Thread(target=self._do_snapshot, name="html-capture-cdp", daemon=True).start()
 
-    def _resolve_path_for_focused_tab(self) -> Path | None:
+    def _resolve_capture_for_focused_tab(self) -> tuple[str, Path] | None:
         with self._lock:
             dport = self._debug_port
             tmap = dict(self._target_to_path)
@@ -419,12 +550,12 @@ class HtmlCaptureController:
             if not isinstance(ws, str) or not tid or tid not in tmap:
                 continue
             if page_has_focus(ws):
-                return tmap[tid]
+                return tid, tmap[tid]
         for tid in reversed(order):
             if tid in tmap and tid in current_ids:
-                return tmap[tid]
+                return tid, tmap[tid]
         if order and order[-1] in tmap and order[-1] in current_ids:
-            return tmap[order[-1]]
+            return order[-1], tmap[order[-1]]
         return None
 
     def _websocket_for_path(self, out_path: Path) -> str | None:
@@ -464,18 +595,26 @@ class HtmlCaptureController:
                     self._chrome = None
                     self._first_enqueued = False
                     self._target_to_path.clear()
+                    self._target_to_record.clear()
                     self._order.clear()
                 return
 
-            out_path = self._resolve_path_for_focused_tab()
-            if out_path is None:
+            capture = self._resolve_capture_for_focused_tab()
+            if capture is None:
                 self._emit(
                     "error",
-                    "No matching capture tab. Double-click a tracking row, then try Ctrl+Enter in Chrome.",
+                    f"No matching capture tab. Double-click a tracking row, then try {CAPTURE_HOTKEY_LABEL} in Chrome.",
                 )
                 return
+            target_id, out_path = capture
             if out_path.is_file() and not self._verbose:
                 self._emit("info", f"File already exists:\n{out_path.name}")
+                self._close_target_id(target_id)
+                if self._on_saved is not None:
+                    try:
+                        self._on_saved()
+                    except Exception:
+                        pass
                 return
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -503,14 +642,31 @@ class HtmlCaptureController:
                 return
 
             pdf_bytes = export_page_pdf(ws_url)
-            out_path.write_bytes(pdf_bytes)
-            _log_line(f"saved PDF {out_path} ({len(pdf_bytes)} bytes)")
-            if self._on_saved is not None:
-                try:
-                    self._on_saved()
-                except Exception:
-                    pass
-            self._emit("info", f"Proof-of-delivery PDF saved:\n{out_path.name}")
+            staged_pdf = _unique_sibling_path(out_path, "_capture_pending")
+            staged_pdf.write_bytes(pdf_bytes)
+            with self._lock:
+                record = self._target_to_record.get(target_id)
+            final_pdf, can_advance, audit_message = _finalize_pdf_with_audit(
+                staged_pdf,
+                out_path,
+                record,
+            )
+            _log_line(f"saved PDF {final_pdf} ({len(pdf_bytes)} bytes)")
+            if can_advance:
+                self._close_target_id(target_id)
+                if self._on_saved is not None:
+                    try:
+                        self._on_saved()
+                    except Exception:
+                        pass
+                audit_line = f"\n{audit_message}" if audit_message else ""
+                self._emit("info", f"Proof-of-delivery PDF saved:\n{final_pdf.name}{audit_line}")
+            else:
+                self._emit(
+                    "error",
+                    "AI audit did not approve this capture, so the tab is still open and the batch is paused.\n\n"
+                    f"Review PDF:\n{final_pdf.name}\n\n{audit_message}",
+                )
         except Exception as e:
             _log_line("snapshot error:\n" + traceback.format_exc())
             self._emit("error", f"Print to PDF failed: {e!s}")

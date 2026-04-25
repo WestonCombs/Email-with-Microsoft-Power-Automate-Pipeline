@@ -1,5 +1,5 @@
 """
-Global hotkey: Ctrl+Enter (Win32) with a dedicated message-pump thread.
+Global hotkey: Ctrl+Shift+P (Win32) with a dedicated message-pump thread.
 
 RegisterHotKey + GetMessageW — no extra dependencies beyond the Windows C API.
 """
@@ -12,12 +12,17 @@ import threading
 from collections.abc import Callable
 from ctypes import wintypes
 
+CAPTURE_HOTKEY_LABEL = "Ctrl+Shift+P"
+
 if sys.platform != "win32":
 
-    def hotkey_ctrl_enter_available() -> bool:
+    def hotkey_capture_available() -> bool:
         return False
 
-    class CtrlEnterHotkey:
+    def hotkey_ctrl_enter_available() -> bool:
+        return hotkey_capture_available()
+
+    class CaptureHotkey:
         def __init__(self, on_hotkey: Callable[[], None]) -> None:
             self._on_hotkey = on_hotkey
 
@@ -31,6 +36,8 @@ if sys.platform != "win32":
         def stop(self, timeout: float = 4.0) -> None:
             return
 
+    CtrlEnterHotkey = CaptureHotkey
+
 else:
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -38,7 +45,8 @@ else:
     WM_HOTKEY = 0x0312
     WM_QUIT = 0x0012
     MOD_CONTROL = 0x0002
-    VK_RETURN = 0x0D
+    MOD_SHIFT = 0x0004
+    VK_P = 0x50
     PM_REMOVE = 0x0001
 
     class MSG(ctypes.Structure):
@@ -51,8 +59,11 @@ else:
             ("pt", wintypes.POINT),
         ]
 
-    def hotkey_ctrl_enter_available() -> bool:
+    def hotkey_capture_available() -> bool:
         return True
+
+    def hotkey_ctrl_enter_available() -> bool:
+        return hotkey_capture_available()
 
     _LPMSG = ctypes.POINTER(MSG)
     _GetMessageW = user32.GetMessageW
@@ -68,7 +79,7 @@ else:
     _PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     _PostThreadMessageW.restype = wintypes.BOOL
 
-    class CtrlEnterHotkey:
+    class CaptureHotkey:
         _HOTKEY_ID = 1
 
         def __init__(self, on_hotkey: Callable[[], None]) -> None:
@@ -89,10 +100,13 @@ else:
             if not user32.RegisterHotKey(
                 None,
                 self._HOTKEY_ID,
-                MOD_CONTROL,
-                VK_RETURN,
+                MOD_CONTROL | MOD_SHIFT,
+                VK_P,
             ):
-                self._start_error = f"RegisterHotKey failed (is Ctrl+Enter already in use?) winerr={kernel32.GetLastError()}"
+                self._start_error = (
+                    f"RegisterHotKey failed (is {CAPTURE_HOTKEY_LABEL} already in use?) "
+                    f"winerr={kernel32.GetLastError()}"
+                )
                 self._register_ok = False
                 self._ready.set()
                 return
@@ -145,3 +159,5 @@ else:
             with self._lock:
                 self._thread = None
                 self._thread_id = None
+
+    CtrlEnterHotkey = CaptureHotkey

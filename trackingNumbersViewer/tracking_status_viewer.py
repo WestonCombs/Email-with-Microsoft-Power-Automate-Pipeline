@@ -15,12 +15,11 @@ import os
 import re
 import sys
 import webbrowser
-from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, ttk
 
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES_DIR) not in sys.path:
@@ -28,20 +27,24 @@ if str(_PYTHON_FILES_DIR) not in sys.path:
 
 from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
 from shared.gui_treeview_copy import bind_treeview_copy_menu
-from shared import runLogger as RL
 from htmlHandler.carrier_urls import normalize_carrier_for_public_url, public_tracking_url
-from pdfCaptureFromChrome.html_capture import HtmlCaptureController
 from proofOfDelivery.pod_data import (
     POD_HUB_MODE,
     expected_pod_pdf_path,
+    first_existing_capture_pdf_path,
+    pod_status_viewer_rows,
     project_root_from_env,
-    remaining_pod_candidates,
 )
-from trackingNumbersViewer.mitm_readiness import pdf_capture_environment_ready, sanitize_filename_token
+from pdfCaptureFromChrome.html_capture import HtmlCaptureController
+from pdfCaptureFromChrome.html_capture.hotkey_win32 import CAPTURE_HOTKEY_LABEL
+from tracking_pdf_audit import audit_path, load_tracking_pdf_audit_entries
+from tracking_pdf_capture import (
+    read_hands_free_capture_enabled,
+    write_hands_free_capture_enabled,
+)
 from trackingNumbersViewer.seventeen_track_api import api_key_from_env
 from trackingNumbersViewer.seventeen_track_smart import (
     carrier_display_for_number,
-    extract_track_info,
     fetch_tracking_smart,
     load_cache,
     quick_status_from_cache,
@@ -49,19 +52,15 @@ from trackingNumbersViewer.seventeen_track_smart import (
 )
 from launcher_progress_ui import THEME
 from shared.tk_launcher_theme import (
+    SettingsStyleSwitch,
     apply_launcher_theme_root,
     configure_launcher_ttk_styles,
     danger_colors,
     launcher_scrollbar,
     make_flat_button,
     settings_label_opts,
-    style_scrolled_text,
     theme_font,
 )
-
-_PDF_TOGGLE_ON = THEME["excel_accent"]
-_PDF_TOGGLE_OFF = THEME["stop_fg"]
-_PDF_TOGGLE_FG = "#ffffff"
 
 _ROW_GREYED = "greyed_out"
 _ROW_POD_COMPLETE = "pod_pdf_saved"
@@ -112,6 +111,19 @@ def _load_context_tsv(path: Path) -> dict[str, str]:
 
 def _normalize_ctx_text(value: object) -> str:
     return " ".join(str(value or "").strip().split()).casefold()
+
+
+def _normalize_tracking_number_text(value: object) -> str:
+    return "".join(ch for ch in str(value or "").strip() if not ch.isspace())
+
+
+def _order_last4_text(value: object) -> str:
+    digits = re.sub(r"\D", "", str(value or "").strip())
+    if len(digits) >= 4:
+        return digits[-4:]
+    if digits:
+        return digits.zfill(4)
+    return "0000"
 
 
 def _tracking_numbers_for_record(record: object) -> set[str]:
@@ -183,43 +195,6 @@ def _derive_company_from_project_data(context: dict[str, str], numbers: list[str
     return best_company
 
 
-def _event_time_sort_key(e: dict) -> float:
-    raw = str(e.get("time_iso") or e.get("time_raw") or "").strip()
-    if not raw:
-        return 0.0
-    try:
-        s = raw.replace("Z", "+00:00")
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return 0.0
-
-
-def _events_lines_from_track_info(track_info: dict | None) -> list[str]:
-    if not isinstance(track_info, dict):
-        return []
-    rows: list[tuple[float, str]] = []
-    prov = track_info.get("tracking", {}).get("providers", [])
-    if not isinstance(prov, list):
-        return []
-    for p in prov:
-        if not isinstance(p, dict):
-            continue
-        events = p.get("events", [])
-        if not isinstance(events, list):
-            continue
-        for e in events:
-            if not isinstance(e, dict):
-                continue
-            t = str(e.get("time_iso") or e.get("time_raw") or "").strip()
-            desc = str(e.get("description") or e.get("stage") or "").strip()
-            loc = str(e.get("location") or "").strip()
-            chunk = " | ".join(x for x in (t, desc, loc) if x)
-            if chunk:
-                rows.append((_event_time_sort_key(e), chunk))
-    rows.sort(key=lambda x: x[0])
-    return [r[1] for r in rows]
-
-
 class TrackingStatusViewerApp:
     def __init__(self, numbers: list[str], context: dict[str, str]) -> None:
         self._context = dict(context)
@@ -236,8 +211,14 @@ class TrackingStatusViewerApp:
 
         self._row_infos = self._build_row_infos(numbers)
         self._numbers = [str(info["tracking_number"]) for info in self._row_infos]
-        self._pdf_capture = self._hub_remaining_mode
+        self._hands_free_sync_after_id: str | None = None
+        self._hands_free_state_syncing = False
+        self._hands_free_capture_running = False
         self._capture_controller: HtmlCaptureController | None = None
+        self._batch_capture_active = False
+        self._batch_capture_after_id: str | None = None
+        self._audit_entries_cache: list[dict[str, object]] = []
+        self._audit_entries_mtime_ns: int | None = None
 
         try:
             from shared.settings_store import apply_runtime_settings_from_json
@@ -261,7 +242,7 @@ class TrackingStatusViewerApp:
         self._frm.pack(fill=tk.BOTH, expand=True)
 
         bits = []
-        for k in ("company", "order_number", "category", "purchase_datetime"):
+        for k in ("company", "category", "purchase_datetime"):
             v = self._context.get(k)
             if v:
                 bits.append(f"{k.replace('_', ' ')}: {v}")
@@ -282,32 +263,6 @@ class TrackingStatusViewerApp:
 
         hint_frame = tk.Frame(self._frm, bg=THEME["bg"])
         hint_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4))
-
-        if self._hub_remaining_mode:
-            tk.Label(
-                hint_frame,
-                text=(
-                    "This list shows tracking numbers that still need a proof-of-delivery PDF. "
-                    "Double-click a row: Chrome opens the carrier page, the app waits for the page to settle, "
-                    "then saves the PDF automatically (plus an HTML snapshot beside it). No Ctrl+Enter."
-                ),
-                wraplength=920,
-                anchor=tk.W,
-                justify=tk.LEFT,
-                **settings_label_opts(),
-            ).pack(fill=tk.X, anchor=tk.W)
-        else:
-            tk.Label(
-                hint_frame,
-                text=(
-                    "With PDF capture on: double-click a row to open the tracking page in capture Chrome; "
-                    "press Ctrl+Enter there to save the visible page as the proof-of-delivery PDF."
-                ),
-                wraplength=920,
-                anchor=tk.W,
-                justify=tk.LEFT,
-                **settings_label_opts(),
-            ).pack(fill=tk.X, anchor=tk.W)
 
         tk.Label(
             hint_frame,
@@ -361,57 +316,42 @@ class TrackingStatusViewerApp:
 
         btn_row = tk.Frame(self._frm, bg=THEME["bg"])
         btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        make_flat_button(
-            btn_row,
-            text="View more",
-            command=self._view_more,
+        self._hands_free_pdf_var = tk.IntVar(value=1 if read_hands_free_capture_enabled() else 0)
+        self._hands_free_pdf_var.trace_add("write", self._on_hands_free_pdf_toggle)
+        hf_row = tk.Frame(btn_row, bg=THEME["bg"])
+        hf_row.pack(side=tk.LEFT, padx=(0, 8))
+        SettingsStyleSwitch(hf_row, self._hands_free_pdf_var).pack(side=tk.LEFT)
+        tk.Label(
+            hf_row,
+            text="Assisted PDF Capture",
+            **settings_label_opts(),
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        self._capture_play_button = make_flat_button(
+            hf_row,
+            text="Play",
+            command=self._toggle_batch_capture,
             bg=THEME["run_accent"],
             active_bg=THEME["run_accent_dim"],
-        ).pack(side=tk.LEFT, padx=(0, 8))
-        self._pdf_toggle_btn: tk.Button | None = None
-        if self._hub_remaining_mode:
-            self._pdf_toggle_btn = tk.Button(
-                btn_row,
-                text="Hands-free PDF Capture",
-                command=lambda: None,
-                font=theme_font("button"),
-                bg=_PDF_TOGGLE_ON,
-                fg=_PDF_TOGGLE_FG,
-                activebackground=THEME["excel_accent_dim"],
-                activeforeground=_PDF_TOGGLE_FG,
-                relief=tk.FLAT,
-                bd=0,
-                highlightthickness=0,
-                cursor="arrow",
-                padx=14,
-                pady=7,
-            )
-            self._pdf_toggle_btn.pack(side=tk.LEFT, padx=(8, 0))
-        else:
-            self._pdf_toggle_btn = tk.Button(
-                btn_row,
-                text="Toggle PDF Capture",
-                command=self._toggle_pdf_capture,
-                font=theme_font("button"),
-                bg=_PDF_TOGGLE_ON if self._pdf_capture else _PDF_TOGGLE_OFF,
-                fg=_PDF_TOGGLE_FG,
-                activebackground=THEME["excel_accent_dim"]
-                if self._pdf_capture
-                else "#dc2626",
-                activeforeground=_PDF_TOGGLE_FG,
-                relief=tk.FLAT,
-                bd=0,
-                highlightthickness=0,
-                cursor="hand2",
-                padx=14,
-                pady=7,
-            )
-            self._pdf_toggle_btn.pack(side=tk.LEFT, padx=(8, 0))
+            padx=12,
+            pady=5,
+            width=7,
+        )
+        self._capture_play_button.pack(side=tk.LEFT, padx=(14, 0))
+        self._capture_status_var = tk.StringVar(value="")
+        tk.Label(
+            btn_row,
+            textvariable=self._capture_status_var,
+            anchor=tk.W,
+            fg=THEME["muted"],
+            bg=THEME["bg"],
+            font=theme_font("body"),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self._update_capture_controls()
         d_bg, d_active = danger_colors()
         make_flat_button(
             btn_row,
             text="Close",
-            command=self._root.destroy,
+            command=self._on_viewer_closing,
             bg=d_bg,
             active_bg=d_active,
         ).pack(side=tk.RIGHT)
@@ -493,6 +433,7 @@ class TrackingStatusViewerApp:
 
         if self._project_root is not None:
             self._schedule_pod_poll()
+        self._schedule_hands_free_state_sync()
 
         self._tree.bind("<Double-1>", self._on_double)
         self._tree.bind("<Return>", lambda _e: self._activate_row_open_or_capture())
@@ -513,59 +454,28 @@ class TrackingStatusViewerApp:
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_viewer_closing)
 
-        if self._hub_remaining_mode and self._project_root is not None:
-            ok, err = pdf_capture_environment_ready()
-            if ok:
-                ctrl = HtmlCaptureController(
-                    on_notify=self._on_capture_notify,
-                    on_saved=self._on_capture_saved,
-                    verbose=RL.is_debug(),
-                )
-                if ctrl.start():
-                    self._capture_controller = ctrl
-                else:
-                    self._pdf_capture = False
-            else:
-                self._pdf_capture = False
-                messagebox.showwarning(
-                    "Proof of delivery capture",
-                    (err or "Chrome and websocket-client on Windows are required for hands-free capture.")
-                    + "\n\nDouble-click will open the carrier site in your default browser only.",
-                )
-
     def _on_viewer_closing(self) -> None:
-        if self._capture_controller is not None:
-            self._capture_controller.stop()
-            self._capture_controller = None
-        self._root.destroy()
-
-    def _on_capture_notify(self, level: str, message: str) -> None:
-        def _ui() -> None:
-            if level == "error":
-                messagebox.showerror("PDF capture", message)
-                return
-            if self._hub_remaining_mode:
-                # Hands-free mode: avoid stacking info popups while pages load.
-                return
-            messagebox.showinfo("PDF capture", message)
-
-        self._root.after(0, _ui)
-
-    def _on_capture_saved(self) -> None:
-        def _ui() -> None:
-            self._apply_pod_completion_layout()
-
-        self._root.after(0, _ui)
+        self._set_batch_capture_active(False)
+        self._stop_capture_controller()
+        self._cancel_pod_poll()
+        if self._hands_free_sync_after_id is not None:
+            try:
+                self._root.after_cancel(self._hands_free_sync_after_id)
+            except tk.TclError:
+                pass
+            self._hands_free_sync_after_id = None
+        try:
+            self._root.destroy()
+        except tk.TclError:
+            pass
 
     def _build_row_infos(self, numbers: list[str]) -> list[dict[str, object]]:
         if self._hub_remaining_mode and self._project_root is not None:
-            rows = remaining_pod_candidates(self._project_root)
+            rows = pod_status_viewer_rows(self._project_root)
             out: list[dict[str, object]] = []
             for row in rows:
                 num = str(row.get("tracking_number") or "").strip()
                 if not num:
-                    continue
-                if tracking_is_greyed_out(num):
                     continue
                 out.append(
                     {
@@ -574,8 +484,9 @@ class TrackingStatusViewerApp:
                         "company": str(row.get("company") or "").strip(),
                         "purchase_datetime": str(row.get("purchase_datetime") or "").strip(),
                         "order_number": str(row.get("order_number") or "").strip(),
+                        "category": str(row.get("category") or "").strip(),
                         "quick_status": quick_status_from_cache(num) or "—",
-                        "greyed_out": tracking_is_greyed_out(num),
+                        "greyed_out": bool(row.get("greyed_out")),
                     }
                 )
             return out
@@ -584,11 +495,10 @@ class TrackingStatusViewerApp:
         company = str(self._context.get("company") or "").strip()
         purchase_datetime = str(self._context.get("purchase_datetime") or "").strip()
         order_number = str(self._context.get("order_number") or "").strip()
+        category = str(self._context.get("email_category") or self._context.get("category") or "").strip()
         for num in numbers:
             s_num = str(num or "").strip()
             if not s_num:
-                continue
-            if tracking_is_greyed_out(s_num):
                 continue
             out.append(
                 {
@@ -597,6 +507,7 @@ class TrackingStatusViewerApp:
                     "company": company,
                     "purchase_datetime": purchase_datetime,
                     "order_number": order_number,
+                    "category": category,
                     "quick_status": quick_status_from_cache(s_num) or "—",
                     "greyed_out": tracking_is_greyed_out(s_num),
                 }
@@ -635,12 +546,98 @@ class TrackingStatusViewerApp:
             str(info.get("carrier") or "").strip() or carrier_display_for_number(num),
         )
 
+    def _load_tracking_pdf_audit_entries(self) -> list[dict[str, object]]:
+        try:
+            path = audit_path()
+        except Exception:
+            return []
+        try:
+            stat = path.stat()
+        except OSError:
+            self._audit_entries_cache = []
+            self._audit_entries_mtime_ns = None
+            return []
+        if self._audit_entries_mtime_ns == stat.st_mtime_ns:
+            return self._audit_entries_cache
+        entries = load_tracking_pdf_audit_entries()
+        self._audit_entries_cache = [entry for entry in entries if isinstance(entry, dict)]
+        self._audit_entries_mtime_ns = stat.st_mtime_ns
+        return self._audit_entries_cache
+
+    def _audit_entry_matches_info(self, info: dict[str, object], entry: dict[str, object]) -> bool:
+        track_num = _normalize_tracking_number_text(info.get("tracking_number"))
+        if track_num:
+            entry_track = _normalize_tracking_number_text(entry.get("tracking_number"))
+            if entry_track:
+                return entry_track == track_num
+
+        company = _normalize_ctx_text(info.get("company"))
+        order_last4 = _order_last4_text(info.get("order_number"))
+        category = _normalize_ctx_text(info.get("category"))
+        entry_company = _normalize_ctx_text(entry.get("company"))
+        entry_last4 = _order_last4_text(entry.get("order_number") or entry.get("order_last4"))
+        entry_category = _normalize_ctx_text(entry.get("category"))
+        return (
+            bool(company)
+            and company == entry_company
+            and order_last4 == entry_last4
+            and category == entry_category
+        )
+
+    def _audited_pdf_path_for_info(self, info: dict[str, object]) -> Path | None:
+        for entry in self._load_tracking_pdf_audit_entries():
+            if not self._audit_entry_matches_info(info, entry):
+                continue
+            raw_path = str(entry.get("path") or "").strip()
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser().resolve()
+            if path.is_file():
+                return path
+        return None
+
+    def _processed_pdf_path_for_info(self, info: dict[str, object]) -> Path | None:
+        expected_pdf = self._expected_pdf_path_for_info(info)
+        if expected_pdf is not None and expected_pdf.is_file():
+            return expected_pdf
+        if self._project_root is not None:
+            num = str(info.get("tracking_number") or "").strip()
+            if num:
+                existing_pdf = first_existing_capture_pdf_path(
+                    self._project_root,
+                    str(info.get("company") or "").strip() or "Unknown",
+                    str(info.get("purchase_datetime") or "").strip(),
+                    num,
+                    str(info.get("carrier") or "").strip() or carrier_display_for_number(num),
+                    str(info.get("order_number") or "").strip(),
+                    str(info.get("category") or "").strip(),
+                )
+                if existing_pdf is not None:
+                    return existing_pdf
+        return self._audited_pdf_path_for_info(info)
+
     def _is_processed(self, info: dict[str, object]) -> bool:
-        pdf_path = self._expected_pdf_path_for_info(info)
-        return bool(pdf_path and pdf_path.is_file())
+        return self._processed_pdf_path_for_info(info) is not None
+
+    def _has_grey_status(self, info: dict[str, object]) -> bool:
+        quick_status = str(info.get("quick_status") or quick_status_from_cache(str(info.get("tracking_number") or "")) or "")
+        return bool(info.get("greyed_out")) or _quick_status_indicates_notfound(quick_status)
+
+    def _is_grey_row(self, info: dict[str, object]) -> bool:
+        return (not self._is_processed(info)) and self._has_grey_status(info)
+
+    def _row_sort_key(self, pair: tuple[int, dict[str, object]]) -> tuple[int, int]:
+        idx, info = pair
+        if self._is_processed(info):
+            bucket = 1
+        elif self._has_grey_status(info):
+            bucket = 2
+        else:
+            bucket = 0
+        return (bucket, idx)
 
     def _pod_layout_enabled(self) -> bool:
-        return self._project_root is not None and (self._hub_remaining_mode or self._pdf_capture)
+        return self._project_root is not None
 
     def _refresh_all_tree_rows(self) -> None:
         for item in self._tree.get_children():
@@ -663,7 +660,7 @@ class TrackingStatusViewerApp:
 
         old_order = tuple(str(x.get("tracking_number") or "") for x in self._row_infos)
         enumerated = list(enumerate(self._row_infos))
-        enumerated.sort(key=lambda pair: (1 if self._is_processed(pair[1]) else 0, pair[0]))
+        enumerated.sort(key=self._row_sort_key)
         new_infos = [pair[1] for pair in enumerated]
         new_order = tuple(str(x.get("tracking_number") or "") for x in new_infos)
         order_changed = old_order != new_order
@@ -673,6 +670,7 @@ class TrackingStatusViewerApp:
 
         for row in self._row_infos:
             row["pod_completed_row"] = bool(self._is_processed(row))
+            row["greyed_out"] = bool(self._has_grey_status(row))
 
         if order_changed or initial:
             self._refresh_all_tree_rows()
@@ -711,22 +709,6 @@ class TrackingStatusViewerApp:
         self._apply_pod_completion_layout()
         self._pod_poll_after_id = self._root.after(delay_ms, tick)
 
-    def _pdf_basename_for_row(self, idx: int) -> str:
-        info = self._info_for_index(idx)
-        num = str(info.get("tracking_number") or "")
-        carrier_ui = str(info.get("carrier") or "") or carrier_display_for_number(num)
-        company = sanitize_filename_token(info.get("company") or "Unknown")
-        raw_date = str(info.get("purchase_datetime") or "").strip()
-        if not raw_date:
-            date_tok = "nodate"
-        elif len(raw_date) >= 10 and raw_date[4:5] == "-" and raw_date[7:8] == "-":
-            date_tok = sanitize_filename_token(raw_date[:10])
-        else:
-            date_tok = sanitize_filename_token(raw_date.split()[0])
-        track_tok = sanitize_filename_token(num)
-        car_tok = sanitize_filename_token(carrier_ui)
-        return f"DOC {company} {date_tok} {track_tok}_FROM_{car_tok}"
-
     def _render_row(self, idx: int, info: dict[str, object]) -> None:
         num = str(info.get("tracking_number") or "").strip()
         carrier = str(info.get("carrier") or "").strip() or carrier_display_for_number(num)
@@ -741,7 +723,7 @@ class TrackingStatusViewerApp:
             values = values + ("Yes" if self._is_processed(info) else "No",)
         if self._is_processed(info):
             tags = (_ROW_POD_COMPLETE,)
-        elif _quick_status_indicates_notfound(quick_status):
+        elif self._is_grey_row(info):
             tags = (_ROW_GREYED,)
         else:
             tags = ()
@@ -749,46 +731,6 @@ class TrackingStatusViewerApp:
             self._tree.item(str(idx), values=values, tags=tags)
         else:
             self._tree.insert("", tk.END, iid=str(idx), values=values, tags=tags)
-
-    def _toggle_pdf_capture(self) -> None:
-        if self._hub_remaining_mode:
-            return
-        if self._pdf_capture:
-            self._pdf_capture = False
-            if self._capture_controller is not None:
-                self._capture_controller.stop()
-                self._capture_controller = None
-            if self._pdf_toggle_btn is not None:
-                self._pdf_toggle_btn.config(
-                    bg=_PDF_TOGGLE_OFF, activebackground="#dc2626"
-                )
-            self._cancel_pod_poll()
-            if self._project_root is not None:
-                self._schedule_pod_poll()
-            else:
-                self._apply_pod_completion_layout()
-            return
-        ok, err = pdf_capture_environment_ready()
-        if not ok:
-            messagebox.showerror("PDF capture", err or "Setup incomplete.")
-            return
-        ctrl = HtmlCaptureController(
-            on_notify=self._on_capture_notify,
-            on_saved=self._on_capture_saved,
-            verbose=RL.is_debug(),
-        )
-        if not ctrl.start():
-            self._capture_controller = None
-            return
-        self._capture_controller = ctrl
-        self._pdf_capture = True
-        if self._pdf_toggle_btn is not None:
-            self._pdf_toggle_btn.config(
-                bg=_PDF_TOGGLE_ON, activebackground=THEME["excel_accent_dim"]
-            )
-        self._apply_pod_completion_layout()
-        if self._project_root is not None:
-            self._schedule_pod_poll()
 
     def _on_double(self, _event: tk.Event) -> None:
         self._activate_row_open_or_capture()
@@ -803,127 +745,244 @@ class TrackingStatusViewerApp:
             return
         webbrowser.open(url)
 
+    def _record_for_hands_free_capture(self, info: dict[str, object]) -> dict:
+        """Build the record shape expected by the convention filename builder."""
+        record = dict(self._context)
+        num = str(info.get("tracking_number") or "").strip()
+        carrier = str(info.get("carrier") or "").strip() or carrier_display_for_number(num)
+        category = str(
+            info.get("category")
+            or record.get("email_category")
+            or record.get("category")
+            or "Unknown"
+        ).strip()
+        record.update(
+            {
+                "company": str(info.get("company") or record.get("company") or "Unknown").strip(),
+                "order_number": str(info.get("order_number") or record.get("order_number") or "").strip(),
+                "purchase_datetime": str(
+                    info.get("purchase_datetime") or record.get("purchase_datetime") or ""
+                ).strip(),
+                "email_category": category or "Unknown",
+                "category": category or "Unknown",
+                "tracking_number": num,
+                "tracking_numbers": [num] if num else [],
+                "carrier": carrier,
+            }
+        )
+        return record
+
+    def _on_hands_free_pdf_toggle(self, *_args: object) -> None:
+        """Persist this switch so both status windows share the same assisted-capture mode."""
+        if self._hands_free_state_syncing:
+            return
+        enabled = bool(self._hands_free_pdf_var.get())
+        try:
+            write_hands_free_capture_enabled(enabled)
+        except OSError:
+            pass
+        if not enabled:
+            self._set_batch_capture_active(False)
+            self._stop_capture_controller()
+            self._set_capture_status("")
+        self._update_capture_controls()
+
+    def _sync_hands_free_state_from_disk(self) -> None:
+        enabled = read_hands_free_capture_enabled(default=bool(self._hands_free_pdf_var.get()))
+        if enabled == bool(self._hands_free_pdf_var.get()):
+            return
+        self._hands_free_state_syncing = True
+        try:
+            self._hands_free_pdf_var.set(1 if enabled else 0)
+        finally:
+            self._hands_free_state_syncing = False
+        if not enabled:
+            self._set_batch_capture_active(False)
+            self._stop_capture_controller()
+            self._set_capture_status("")
+        self._update_capture_controls()
+
+    def _schedule_hands_free_state_sync(self) -> None:
+        if self._hands_free_sync_after_id is not None:
+            try:
+                self._root.after_cancel(self._hands_free_sync_after_id)
+            except tk.TclError:
+                pass
+            self._hands_free_sync_after_id = None
+
+        def tick() -> None:
+            self._sync_hands_free_state_from_disk()
+            self._hands_free_sync_after_id = self._root.after(1200, tick)
+
+        self._hands_free_sync_after_id = self._root.after(1200, tick)
+
+    def _update_capture_controls(self) -> None:
+        btn = getattr(self, "_capture_play_button", None)
+        if btn is None:
+            return
+        enabled = bool(self._hands_free_pdf_var.get())
+        try:
+            btn.configure(
+                text="Pause" if self._batch_capture_active else "Play",
+                state=tk.NORMAL if enabled else tk.DISABLED,
+            )
+        except tk.TclError:
+            pass
+
+    def _set_capture_status(self, message: str) -> None:
+        var = getattr(self, "_capture_status_var", None)
+        if var is None:
+            return
+        clean = " ".join(str(message or "").split())
+        try:
+            var.set(clean[:180])
+        except tk.TclError:
+            pass
+
+    def _capture_notify(self, level: str, message: str) -> None:
+        def show() -> None:
+            self._set_capture_status(message)
+            if level == "error":
+                self._hands_free_capture_running = False
+                self._set_batch_capture_active(False)
+                messagebox.showerror("PDF capture", message)
+
+        try:
+            self._root.after(0, show)
+        except tk.TclError:
+            pass
+
+    def _ensure_capture_controller(self) -> HtmlCaptureController | None:
+        if self._capture_controller is None:
+            self._capture_controller = HtmlCaptureController(
+                on_notify=self._capture_notify,
+                on_saved=lambda: self._root.after(0, self._on_assisted_capture_saved),
+            )
+        if not self._capture_controller.start():
+            return None
+        return self._capture_controller
+
+    def _stop_capture_controller(self) -> None:
+        controller = self._capture_controller
+        self._capture_controller = None
+        self._hands_free_capture_running = False
+        if controller is not None:
+            controller.stop()
+
+    def _cancel_batch_after(self) -> None:
+        if self._batch_capture_after_id is not None:
+            try:
+                self._root.after_cancel(self._batch_capture_after_id)
+            except tk.TclError:
+                pass
+            self._batch_capture_after_id = None
+
+    def _set_batch_capture_active(self, active: bool) -> None:
+        self._batch_capture_active = bool(active)
+        if not active:
+            self._cancel_batch_after()
+        self._update_capture_controls()
+
+    def _toggle_batch_capture(self) -> None:
+        if self._batch_capture_active:
+            self._set_batch_capture_active(False)
+            self._set_capture_status("Paused. Current tab can still be captured manually.")
+            return
+        if not self._hands_free_pdf_var.get():
+            self._hands_free_pdf_var.set(1)
+        self._set_batch_capture_active(True)
+        self._start_or_continue_batch_capture()
+
+    def _capture_eligible(self, info: dict[str, object]) -> bool:
+        return (not self._is_processed(info)) and (not self._is_grey_row(info))
+
+    def _next_capture_index(self) -> int | None:
+        selected = self._selected_index()
+        if selected is not None and 0 <= selected < len(self._row_infos):
+            if self._capture_eligible(self._row_infos[selected]):
+                return selected
+        for idx, info in enumerate(self._row_infos):
+            if self._capture_eligible(info):
+                return idx
+        return None
+
+    def _start_or_continue_batch_capture(self) -> None:
+        if not self._batch_capture_active:
+            return
+        if self._hands_free_capture_running:
+            return
+        idx = self._next_capture_index()
+        if idx is None:
+            self._set_batch_capture_active(False)
+            self._set_capture_status("Done. No unprocessed, active POD rows remain.")
+            return
+        if not self._open_assisted_capture_for_index(idx):
+            self._set_batch_capture_active(False)
+
+    def _open_assisted_capture_for_index(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self._row_infos):
+            return False
+        info = self._info_for_index(idx)
+        if self._is_processed(info):
+            self._set_capture_status("That POD is already processed.")
+            return False
+        if self._is_grey_row(info):
+            messagebox.showinfo(
+                "PDF capture",
+                "This tracking number is greyed out after a final automatic NotFound retry.\n\n"
+                "Right-click it and choose Force Check Tracking Number to retry 17TRACK.",
+            )
+            return False
+        url = self._carrier_url_for_index(idx)
+        if not url:
+            messagebox.showerror("Tracking", "Could not build a carrier URL for this number.")
+            return False
+        expected_pdf = self._expected_pdf_path_for_info(info)
+        if expected_pdf is None:
+            messagebox.showerror("PDF capture", "Could not build the expected PDF filename for this row.")
+            return False
+        controller = self._ensure_capture_controller()
+        if controller is None:
+            messagebox.showerror(
+                "PDF capture",
+                f"Could not start assisted capture. {CAPTURE_HOTKEY_LABEL} capture requires Windows and Chrome.",
+            )
+            return False
+        self._tree.selection_set(str(idx))
+        self._tree.see(str(idx))
+        record = self._record_for_hands_free_capture(info)
+        if not controller.enqueue_capture(url, expected_pdf, record=record, auto_print_pdf=False):
+            return False
+        self._hands_free_capture_running = True
+        num = str(info.get("tracking_number") or "").strip()
+        self._set_capture_status(f"Opened {num}. Press {CAPTURE_HOTKEY_LABEL} in Chrome when the page is ready.")
+        return True
+
+    def _on_assisted_capture_saved(self) -> None:
+        """Refresh visible POD state and advance the batch after an approved capture."""
+        self._hands_free_capture_running = False
+        self._apply_pod_completion_layout()
+        if self._batch_capture_active:
+            self._set_capture_status("Saved. Opening next active POD row...")
+            self._cancel_batch_after()
+            self._batch_capture_after_id = self._root.after(700, self._start_or_continue_batch_capture)
+        else:
+            self._set_capture_status("Saved. Ready for the next selected row.")
+
     def _activate_row_open_or_capture(self) -> None:
         idx = self._selected_index()
         if idx is None or idx < 0 or idx >= len(self._row_infos):
             return
         info = self._info_for_index(idx)
-        if self._pdf_capture:
-            if bool(info.get("greyed_out")):
-                messagebox.showinfo(
-                    "PDF capture",
-                    "This tracking number is greyed out after a final automatic NotFound retry.\n\n"
-                    "Right-click it and choose Force Check Tracking Number to retry 17TRACK.",
-                )
-                return
-            ok, err = pdf_capture_environment_ready()
-            if not ok:
-                messagebox.showerror("PDF capture", err or "Setup incomplete.")
-                return
-            expected_pdf = self._expected_pdf_path_for_info(info)
-            if expected_pdf is None:
-                messagebox.showerror(
-                    "PDF capture",
-                    "Could not build the expected proof-of-delivery PDF path from BASE_DIR.",
-                )
-                return
-            if expected_pdf.is_file():
-                if bool(info.get("pod_completed_row")):
-                    messagebox.showinfo(
-                        "PDF capture",
-                        "That proof-of-delivery file was already generated for this tracking number.",
-                    )
-                    return
-                self._apply_pod_completion_layout()
-                return
-            url = self._carrier_url_for_index(idx)
-            if not url:
-                messagebox.showerror("Tracking", "Could not build a carrier URL for this number.")
-                return
-            from shared.project_paths import ensure_base_dir_in_environ
-
-            ensure_base_dir_in_environ()
-            try:
-                expected_pdf.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                messagebox.showerror("PDF capture", f"Could not create output folder:\n{e}")
-                return
-            if self._capture_controller is None:
-                messagebox.showerror(
-                    "PDF capture",
-                    "Turn on Toggle PDF Capture first, then double-click a row to open the page.",
-                )
-                return
-            self._capture_controller.enqueue_capture(
-                url,
-                expected_pdf,
-                auto_print_pdf=self._hub_remaining_mode,
-            )
+        url = self._carrier_url_for_index(idx)
+        if not url:
+            messagebox.showerror("Tracking", "Could not build a carrier URL for this number.")
             return
+        if self._hands_free_pdf_var.get() == True:
+            if self._open_assisted_capture_for_index(idx):
+                return
 
         self._open_carrier_in_browser_only()
-
-    def _view_more(self) -> None:
-        idx = self._selected_index()
-        if idx is None or idx < 0 or idx >= len(self._row_infos):
-            messagebox.showinfo("Details", "Select a row first.")
-            return
-        num = str(self._info_for_index(idx).get("tracking_number") or "")
-        c = load_cache(num)
-        track_info = None
-        raw_get: dict = {}
-        if isinstance(c, dict):
-            raw_get = c.get("last_get_response") if isinstance(c.get("last_get_response"), dict) else {}
-            track_info = extract_track_info(raw_get, num)
-        lines = _events_lines_from_track_info(track_info)
-        body = (
-            "\n".join(lines)
-            if lines
-            else "(No milestone events in cached data — open the workbook via the launcher Excel button to refresh caches.)"
-        )
-
-        dlg = tk.Toplevel(self._root)
-        dlg.title(f"Details — {num}")
-        apply_launcher_theme_root(dlg)
-        dlg.geometry("720x480")
-        tk.Label(
-            dlg,
-            text="Milestones / events",
-            anchor=tk.W,
-            padx=8,
-            pady=(8, 4),
-            **settings_label_opts(),
-        ).pack(anchor=tk.W)
-        t1 = scrolledtext.ScrolledText(dlg, height=12, width=86)
-        style_scrolled_text(t1)
-        t1.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-        t1.insert(tk.END, body)
-        t1.configure(state=tk.DISABLED)
-
-        tk.Label(
-            dlg,
-            text="Cached gettrackinfo (JSON)",
-            anchor=tk.W,
-            padx=8,
-            fg=THEME["muted"],
-            bg=THEME["bg"],
-            font=theme_font("body"),
-        ).pack(anchor=tk.W)
-        t2 = scrolledtext.ScrolledText(dlg, height=10, width=86)
-        style_scrolled_text(t2)
-        t2.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
-        t2.insert(tk.END, json.dumps(raw_get, indent=2, ensure_ascii=False) if raw_get else "{}")
-        t2.configure(state=tk.DISABLED)
-        btn_bar = tk.Frame(dlg, bg=THEME["bg"])
-        btn_bar.pack(fill=tk.X, padx=8, pady=(0, 8))
-        d_bg, d_active = danger_colors()
-        make_flat_button(
-            btn_bar,
-            text="Close",
-            command=dlg.destroy,
-            bg=d_bg,
-            active_bg=d_active,
-        ).pack(side=tk.RIGHT)
 
     def _force_check_selected_tracking_number(self) -> None:
         idx = self._selected_index()
@@ -954,11 +1013,7 @@ class TrackingStatusViewerApp:
         info["quick_status"] = str(result.get("quick_status_label") or "—")
         info["carrier"] = str(result.get("carrier_display") or info.get("carrier") or carrier_display_for_number(num))
         info["greyed_out"] = bool(result.get("greyed_out"))
-        if bool(result.get("greyed_out")) and tracking_is_greyed_out(num):
-            self._row_infos.pop(idx)
-            self._numbers = [str(x["tracking_number"]) for x in self._row_infos]
-            self._refresh_all_tree_rows()
-        elif self._project_root is not None:
+        if self._project_root is not None:
             self._apply_pod_completion_layout()
         else:
             self._render_row(idx, info)

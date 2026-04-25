@@ -1,4 +1,4 @@
-"""Check whether proof-of-delivery capture (isolated Chrome + Ctrl+Enter) can start."""
+"""Check whether proof-of-delivery capture (isolated Chrome + Ctrl+Shift+P) can start."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def pdf_capture_environment_ready() -> tuple[bool, str | None]:
     if sys.platform != "win32":
         return (
             False,
-            "PDF capture (Ctrl+Enter) is only supported on Windows in this build.",
+            "PDF capture (Ctrl+Shift+P) is only supported on Windows in this build.",
         )
     if find_chrome_executable() is None:
         return (

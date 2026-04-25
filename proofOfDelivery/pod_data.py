@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,11 @@ AUTOMATION_HUB_COMPANY_LABEL = "Proof of Delivery"
 AUTOMATION_HUB_STATUS_LABEL = "Process Remaining PODs"
 POD_HUB_MODE = "remaining_pod_hub"
 PROOF_OF_DELIVERY_JSON_NAME = "proof_of_delivery.json"
+_LEGACY_CATEGORY_SUFFIX_MAP = {
+    "Invoice": "INVOICE",
+    "Shipped": "SHIPPED",
+    "Delivered": "DELIVERED",
+}
 
 
 def project_root_from_env() -> Path:
@@ -95,7 +101,39 @@ def _purchase_date_token(value: object) -> str:
     return sanitize_filename_token(raw.split()[0])
 
 
+def _tracking_last4_token(value: object) -> str:
+    raw = str(clean_value(value) or "").strip()
+    compact = "".join(ch for ch in raw if not ch.isspace())
+    if len(compact) >= 4:
+        return sanitize_filename_token(compact[-4:])
+    if compact:
+        return sanitize_filename_token(compact.zfill(4))
+    return "0000"
+
+
+def _order_last4_token(value: object) -> str:
+    raw = str(clean_value(value) or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 4:
+        return digits[-4:]
+    if digits:
+        return digits.zfill(4)
+    return "0000"
+
+
 def pod_pdf_basename(
+    company: object,
+    purchase_datetime: object,
+    tracking_number: object,
+    carrier_display: object,
+) -> str:
+    company_tok = sanitize_filename_token(clean_value(company) or "Unknown")
+    date_tok = _purchase_date_token(purchase_datetime)
+    tracking_last4 = _tracking_last4_token(tracking_number)
+    return f"DOC {company_tok} {date_tok} TRACKING_INV_{tracking_last4}"
+
+
+def legacy_pod_pdf_basename(
     company: object,
     purchase_datetime: object,
     tracking_number: object,
@@ -116,6 +154,103 @@ def expected_pod_pdf_path(
     carrier_display: object,
 ) -> Path:
     return pdf_output_dir(project_root) / f"{pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display)}.pdf"
+
+
+def legacy_expected_pod_pdf_path(
+    project_root: Path,
+    company: object,
+    purchase_datetime: object,
+    tracking_number: object,
+    carrier_display: object,
+) -> Path:
+    return pdf_output_dir(project_root) / f"{legacy_pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display)}.pdf"
+
+
+def legacy_email_capture_pdf_basename(
+    company: object,
+    purchase_datetime: object,
+    order_number: object,
+    category: object,
+) -> str:
+    company_tok = sanitize_filename_token(clean_value(company) or "Unknown")
+    date_tok = _purchase_date_token(purchase_datetime)
+    order_last4 = _order_last4_token(order_number)
+    suffix = _LEGACY_CATEGORY_SUFFIX_MAP.get(str(clean_value(category) or "").strip())
+    if suffix:
+        return f"DOC {company_tok} {date_tok} {suffix}_{order_last4}"
+    return f"DOC {company_tok} {date_tok}_{order_last4}"
+
+
+def first_existing_pdf_named(project_root: Path, basename: str) -> Path | None:
+    out_dir = pdf_output_dir(project_root)
+    direct = out_dir / f"{basename}.pdf"
+    if direct.is_file():
+        return direct
+    collision_re = re.compile(rf"^{re.escape(basename)} \(\d+\)\.pdf$", re.IGNORECASE)
+    try:
+        for path in out_dir.glob("*.pdf"):
+            if path.is_file() and collision_re.match(path.name):
+                return path
+    except OSError:
+        return None
+    return None
+
+
+def first_existing_legacy_email_capture_pdf_path(
+    project_root: Path,
+    company: object,
+    purchase_datetime: object,
+    order_number: object,
+    category: object,
+) -> Path | None:
+    return first_existing_pdf_named(
+        project_root,
+        legacy_email_capture_pdf_basename(company, purchase_datetime, order_number, category),
+    )
+
+
+def first_existing_pod_pdf_path(
+    project_root: Path,
+    company: object,
+    purchase_datetime: object,
+    tracking_number: object,
+    carrier_display: object,
+) -> Path | None:
+    for basename in (
+        pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display),
+        legacy_pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display),
+    ):
+        path = first_existing_pdf_named(project_root, basename)
+        if path is not None:
+            return path
+    return None
+
+
+def first_existing_capture_pdf_path(
+    project_root: Path,
+    company: object,
+    purchase_datetime: object,
+    tracking_number: object,
+    carrier_display: object,
+    order_number: object,
+    category: object,
+) -> Path | None:
+    pod_path = first_existing_pod_pdf_path(
+        project_root,
+        company,
+        purchase_datetime,
+        tracking_number,
+        carrier_display,
+    )
+    if pod_path is not None:
+        return pod_path
+    return first_existing_legacy_email_capture_pdf_path(
+        project_root,
+        company,
+        purchase_datetime,
+        order_number,
+        category,
+    )
 
 
 def tracking_numbers_for_record(record: object) -> list[str]:
@@ -181,8 +316,18 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
                 tracking_number,
                 carrier_display,
             )
-            if not pdf_path.is_file():
+            existing_pdf_path = first_existing_capture_pdf_path(
+                project_root,
+                company,
+                purchase_datetime,
+                tracking_number,
+                carrier_display,
+                order_number,
+                source_category,
+            )
+            if existing_pdf_path is None:
                 continue
+            pdf_path = existing_pdf_path
             source_file_link = pdf_path.resolve().as_uri()
             if source_file_link in seen_links:
                 continue
@@ -327,7 +472,15 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
                 tracking_number,
                 carrier_display,
             )
-            if pdf_path.is_file():
+            if first_existing_capture_pdf_path(
+                project_root,
+                company,
+                purchase_datetime,
+                tracking_number,
+                carrier_display,
+                order_number,
+                source_category,
+            ) is not None:
                 continue
             out.append(
                 {
@@ -338,6 +491,51 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
                     "order_number": order_number,
                     "category": source_category,
                     "expected_pdf_path": str(pdf_path.resolve()),
+                }
+            )
+    return out
+
+
+def pod_status_viewer_rows(project_root: Path) -> list[dict]:
+    """All tracking rows for the POD/status viewer, including processed and grey rows."""
+    try:
+        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
+    except Exception:
+        def tracking_is_greyed_out(_tracking_number: str) -> bool:
+            return False
+
+    base_records = load_results_records(project_root)
+    seen_numbers: set[str] = set()
+    out: list[dict] = []
+    for record in base_records:
+        if is_pod_record(record) or is_automation_hub_record(record):
+            continue
+        company = _base_record_company(record)
+        purchase_datetime = clean_value(record.get("purchase_datetime"))
+        order_number = clean_value(record.get("order_number"))
+        source_category = clean_value(record.get("email_category"))
+        for tracking_number in tracking_numbers_for_record(record):
+            if tracking_number in seen_numbers:
+                continue
+            seen_numbers.add(tracking_number)
+            carrier_display = _carrier_display_for_number(tracking_number)
+            pdf_path = expected_pod_pdf_path(
+                project_root,
+                company,
+                purchase_datetime,
+                tracking_number,
+                carrier_display,
+            )
+            out.append(
+                {
+                    "tracking_number": tracking_number,
+                    "carrier": carrier_display,
+                    "company": company,
+                    "purchase_datetime": purchase_datetime,
+                    "order_number": order_number,
+                    "category": source_category,
+                    "expected_pdf_path": str(pdf_path.resolve()),
+                    "greyed_out": bool(tracking_is_greyed_out(tracking_number)),
                 }
             )
     return out

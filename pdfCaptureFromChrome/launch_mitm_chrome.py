@@ -127,7 +127,7 @@ def launch_isolated_chrome_no_proxy(
     verbose: bool = False,
 ) -> subprocess.Popen | None:
     """
-    Isolated profile Chrome **without** mitmproxy. Used by HtmlCaptureController (Ctrl+Enter PDF snapshot).
+    Isolated profile Chrome **without** mitmproxy. Used by HtmlCaptureController (Ctrl+Shift+P PDF snapshot).
     Reuses the same user-data dir as the MITM launcher for shared CA / cookies.
     """
     chrome = chrome_path or _find_chrome_exe()

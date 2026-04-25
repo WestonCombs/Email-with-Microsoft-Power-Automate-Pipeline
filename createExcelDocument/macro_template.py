@@ -29,6 +29,10 @@ EMAIL_SORTER_HOTKEYS_VBA = r'''Option Explicit
 Private escPresses As Long
 Private escLastAt As Date
 Private Const TRIPLE_ESC_MAX_GAP_SEC As Long = 2
+Private Const RAINBOW_TOTAL_SECONDS As Double = 10#
+Private Const RAINBOW_FRAME_SECONDS As Double = 0.12
+Private Const RAINBOW_TOP_ROW As Long = 1
+Private Const RAINBOW_HEADER_ROW As Long = 2
 
 Public Sub EmailSorter_TripleEscapeHandler()
     On Error GoTo CleanFail
@@ -46,12 +50,208 @@ Public Sub EmailSorter_TripleEscapeHandler()
 
     If escPresses >= 3 Then
         escPresses = 0
-        MsgBox "hello world!", vbInformation, "Email Sorter"
+        EmailSorter_RunRainbowMode
     End If
     Exit Sub
 CleanFail:
     escPresses = 0
 End Sub
+
+Private Sub EmailSorter_RunRainbowMode()
+    Dim ws As Worksheet
+    Dim lastCol As Long
+    Dim topRng As Range
+    Dim topState As Variant
+    Dim selectedRng As Range
+    Dim selectedState As Variant
+    Dim selectedRow As Long
+    Dim newRow As Long
+    Dim palette As Variant
+    Dim startedAt As Double
+    Dim frameStartedAt As Double
+    Dim frame As Long
+    Dim oldStatusBar As Variant
+
+    On Error GoTo CleanFail
+    If TypeName(ActiveSheet) <> "Worksheet" Then Exit Sub
+    Set ws = ActiveSheet
+    lastCol = EmailSorter_LastRainbowColumn(ws)
+    If lastCol < 1 Then Exit Sub
+
+    Set topRng = ws.Range(ws.Cells(RAINBOW_TOP_ROW, 1), ws.Cells(RAINBOW_TOP_ROW, lastCol))
+    topState = EmailSorter_SaveInterior(topRng)
+    palette = EmailSorter_RainbowPalette()
+    oldStatusBar = Application.StatusBar
+    Application.StatusBar = "Rainbow row picker active for 10 seconds. Select a data row to preview it."
+
+    startedAt = Timer
+    frame = 0
+    Do While EmailSorter_ElapsedSeconds(startedAt) < RAINBOW_TOTAL_SECONDS
+        EmailSorter_ApplyRainbow topRng, palette, frame
+
+        newRow = EmailSorter_SelectedDataRow(ws)
+        If newRow <> selectedRow Then
+            If Not selectedRng Is Nothing Then
+                EmailSorter_RestoreInterior selectedRng, selectedState
+                Set selectedRng = Nothing
+            End If
+            selectedRow = newRow
+            If selectedRow > RAINBOW_HEADER_ROW Then
+                Set selectedRng = ws.Range(ws.Cells(selectedRow, 1), ws.Cells(selectedRow, lastCol))
+                selectedState = EmailSorter_SaveInterior(selectedRng)
+            End If
+        End If
+
+        If Not selectedRng Is Nothing Then
+            EmailSorter_ApplyRainbow selectedRng, palette, frame
+        End If
+
+        frame = frame + 1
+        frameStartedAt = Timer
+        Do While EmailSorter_ElapsedSeconds(frameStartedAt) < RAINBOW_FRAME_SECONDS _
+            And EmailSorter_ElapsedSeconds(startedAt) < RAINBOW_TOTAL_SECONDS
+            DoEvents
+        Loop
+    Loop
+
+CleanExit:
+    On Error Resume Next
+    If Not selectedRng Is Nothing Then EmailSorter_RestoreInterior selectedRng, selectedState
+    If Not topRng Is Nothing Then EmailSorter_RestoreTopRow topRng
+    Application.StatusBar = oldStatusBar
+    Exit Sub
+CleanFail:
+    Resume CleanExit
+End Sub
+
+Private Function EmailSorter_RainbowPalette() As Variant
+    EmailSorter_RainbowPalette = Array( _
+        RGB(255, 59, 48), _
+        RGB(255, 149, 0), _
+        RGB(255, 214, 10), _
+        RGB(52, 199, 89), _
+        RGB(0, 122, 255), _
+        RGB(88, 86, 214), _
+        RGB(191, 90, 242))
+End Function
+
+Private Function EmailSorter_LastRainbowColumn(ByVal ws As Worksheet) As Long
+    Dim usedLastCol As Long
+    Dim c As Long
+    Dim v1 As Variant
+    Dim v2 As Variant
+    Dim s1 As String
+    Dim s2 As String
+
+    On Error GoTo Fallback
+    usedLastCol = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
+    If usedLastCol < 1 Then usedLastCol = 1
+
+    For c = 1 To usedLastCol
+        If Not ws.Columns(c).Hidden Then
+            v1 = ws.Cells(RAINBOW_TOP_ROW, c).Value
+            v2 = ws.Cells(RAINBOW_HEADER_ROW, c).Value
+            If Not IsError(v1) Then s1 = Trim(CStr(v1)) Else s1 = ""
+            If Not IsError(v2) Then s2 = Trim(CStr(v2)) Else s2 = ""
+            If Len(s1) > 0 Or Len(s2) > 0 Then EmailSorter_LastRainbowColumn = c
+        End If
+    Next c
+    If EmailSorter_LastRainbowColumn < 1 Then EmailSorter_LastRainbowColumn = 1
+    Exit Function
+Fallback:
+    EmailSorter_LastRainbowColumn = 1
+End Function
+
+Private Function EmailSorter_SelectedDataRow(ByVal ws As Worksheet) As Long
+    On Error GoTo CleanFail
+    If TypeName(Selection) <> "Range" Then Exit Function
+    If Not Selection.Worksheet Is ws Then Exit Function
+    If ActiveCell.Row <= RAINBOW_HEADER_ROW Then Exit Function
+    EmailSorter_SelectedDataRow = ActiveCell.Row
+    Exit Function
+CleanFail:
+    EmailSorter_SelectedDataRow = 0
+End Function
+
+Private Sub EmailSorter_ApplyRainbow(ByVal rng As Range, ByVal palette As Variant, ByVal frame As Long)
+    Dim cell As Range
+    Dim visibleIndex As Long
+    Dim colorCount As Long
+
+    On Error Resume Next
+    colorCount = UBound(palette) - LBound(palette) + 1
+    If colorCount <= 0 Then Exit Sub
+
+    visibleIndex = 0
+    For Each cell In rng.Cells
+        If Not cell.EntireColumn.Hidden Then
+            cell.Interior.Pattern = xlSolid
+            cell.Interior.Color = palette((visibleIndex + frame) Mod colorCount)
+            visibleIndex = visibleIndex + 1
+        End If
+    Next cell
+End Sub
+
+Private Function EmailSorter_SaveInterior(ByVal rng As Range) As Variant
+    Dim state() As Variant
+    Dim cell As Range
+    Dim i As Long
+
+    ReDim state(1 To rng.Cells.Count, 1 To 5)
+    i = 0
+    For Each cell In rng.Cells
+        i = i + 1
+        With cell.Interior
+            state(i, 1) = .Pattern
+            state(i, 2) = .Color
+            state(i, 3) = .PatternColor
+            state(i, 4) = .TintAndShade
+            state(i, 5) = .PatternTintAndShade
+        End With
+    Next cell
+    EmailSorter_SaveInterior = state
+End Function
+
+Private Sub EmailSorter_RestoreInterior(ByVal rng As Range, ByVal state As Variant)
+    Dim cell As Range
+    Dim i As Long
+
+    On Error Resume Next
+    i = 0
+    For Each cell In rng.Cells
+        i = i + 1
+        With cell.Interior
+            .Pattern = state(i, 1)
+            .Color = state(i, 2)
+            .PatternColor = state(i, 3)
+            .TintAndShade = state(i, 4)
+            .PatternTintAndShade = state(i, 5)
+        End With
+    Next cell
+End Sub
+
+Private Sub EmailSorter_RestoreTopRow(ByVal rng As Range)
+    Dim cell As Range
+
+    On Error Resume Next
+    For Each cell In rng.Cells
+        If Not cell.EntireColumn.Hidden Then
+            With cell.Interior
+                .Pattern = xlSolid
+                .Color = RGB(244, 177, 131)
+                .TintAndShade = 0
+                .PatternTintAndShade = 0
+            End With
+        End If
+    Next cell
+End Sub
+
+Private Function EmailSorter_ElapsedSeconds(ByVal startedAt As Double) As Double
+    Dim t As Double
+    t = Timer
+    If t < startedAt Then t = t + 86400#
+    EmailSorter_ElapsedSeconds = t - startedAt
+End Function
 '''
 
 THISWORKBOOK_VBA = r'''Option Explicit
