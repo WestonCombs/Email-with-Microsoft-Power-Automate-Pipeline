@@ -36,7 +36,7 @@ def _carrier_code_for_number(tracking_id: str) -> int:
 
 
 def api_key_from_env() -> str | None:
-    k = (os.getenv("SEVENTEEN_TRACK_API_KEY") or os.getenv("17TRACK_API_KEY") or "").strip()
+    k = (os.getenv("SEVENTEEN_TRACK_API_KEY") or "").strip()
     return k or None
 
 

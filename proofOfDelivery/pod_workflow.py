@@ -8,8 +8,6 @@ import tempfile
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 if sys.platform != "win32":
     print("This helper requires Windows + Excel.", file=sys.stderr)
     sys.exit(1)
@@ -18,7 +16,9 @@ _PYTHON_FILES = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES))
 
-load_dotenv(_PYTHON_FILES / ".env")
+from shared.settings_store import apply_runtime_settings_from_json
+
+apply_runtime_settings_from_json()
 
 from tkinter import BOTH, LEFT, RIGHT, W, Button, Frame, Label, Tk, Toplevel, messagebox
 

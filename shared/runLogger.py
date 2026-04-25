@@ -37,11 +37,13 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    from dotenv import load_dotenv
+    from shared.settings_store import apply_runtime_settings_from_json
 
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-except ImportError:
-    pass
+    apply_runtime_settings_from_json()
+except Exception:
+    from .project_paths import ensure_base_dir_in_environ
+
+    ensure_base_dir_in_environ()
 
 
 _TRUTHY = ("1", "true", "yes")
@@ -60,7 +62,8 @@ def _logs_dir() -> Path:
     base = (os.getenv("BASE_DIR") or "").strip()
     if not base:
         raise ValueError(
-            'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
+            "BASE_DIR is unset — project root could not be inferred "
+            '(expected scripts under a folder named "python_files").'
         )
     root = Path(base).expanduser().resolve()
     d = root / "logs"
@@ -74,8 +77,7 @@ def _logs_dir() -> Path:
 def is_debug() -> bool:
     """Return True when DEBUG_MODE=1 is set in the environment (read at call time).
 
-    Subprocesses and ``load_dotenv`` can set this after some modules import; using the
-    current value keeps ``debug_*`` logs aligned with ``python_files/.env``.
+    Uses the current ``DEBUG_MODE`` in the environment (from ``email_sorter_settings.json`` via Settings).
     """
     return _is_truthy(os.getenv("DEBUG_MODE", "0"))
 

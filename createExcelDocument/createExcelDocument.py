@@ -14,7 +14,11 @@ _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES_DIR) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES_DIR))
 
-from dotenv import load_dotenv
+from shared.stdio_utf8 import configure_stdio_utf8, console_safe_text
+
+configure_stdio_utf8()
+
+from shared.settings_store import apply_runtime_settings_from_json
 from shared.runLogger import is_debug
 from giftcardInvoiceLink.link_store import (
     gift_order_link_label,
@@ -27,6 +31,7 @@ from htmlHandler.tracking_hrefs import MULTIPLE_TRACKING_LINKS
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.hyperlink import Hyperlink
 from proofOfDelivery.pod_data import (
     AUTOMATION_HUB_CATEGORY,
     AUTOMATION_HUB_STATUS_LABEL,
@@ -36,7 +41,7 @@ from proofOfDelivery.pod_data import (
     load_excel_records,
 )
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+apply_runtime_settings_from_json()
 
 
 def _use_legacy_category_row_colors() -> bool:
@@ -48,7 +53,7 @@ def _use_legacy_category_row_colors() -> bool:
 _base_dir_raw = os.getenv("BASE_DIR")
 if not _base_dir_raw:
     raise ValueError(
-        'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
+        'BASE_DIR is not set — expected automatic detection from the "python_files" folder layout.'
     )
 
 PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
@@ -59,7 +64,7 @@ EXCEL_BUILD_STATE_PATH = _JSON_DIR / "excel_build_state.json"
 
 # Hidden on Orders; VBA reads this before ThisWorkbook.Path (works if Path is empty).
 CLIPBOARD_INI_CELL = "AA1"
-# Hidden: plain-text file:/// URI per row. Copy Path cells use internal # links only
+# Hidden: plain-text file:/// URI per row. Open File Location cells use internal # links only
 # (Excel hyperlink events cannot cancel file:// navigation).
 COPY_PATH_URI_COL = 29  # column AC — keep equal to COL_FILE_URI in macro_template.py
 # Hidden full tracking URLs: column 30 + slot-1. Must match VBA COL_TRACK_URI_* in macro_template.py
@@ -141,8 +146,8 @@ def _macro_template_module():
     return mod
 
 
-# Column layout: order identity, then Copy Path + View PDF (adjacent, right after Email),
-# then financials and shipping. Copy Path uses in-sheet # links; hidden column AC holds the
+# Column layout: order identity, then Open File Location + View PDF (adjacent, right after Email),
+# then financials and shipping. Open File Location uses in-sheet # links; hidden column AC holds the
 # file URI for VBA. View PDF / View HTML (debug) are file:/// hyperlinks.
 # Hairline vertical borders after the last file-link column and after Tax Paid (section breaks).
 def _section_boundary_keys(column_keys: list[str]) -> tuple[str, str]:
@@ -196,7 +201,7 @@ COLUMN_HEADERS = {
     "open_tracking_list":    "View Tracking Links",
     "open_tracking_numbers_web": "View Tracking Numbers",
     "open_tracking_numbers_order": "View Tracking Numbers (All For Order)",
-    "copy_file_path":        "Copy Path",
+    "copy_file_path":        "Open File Location",
     "source_file_link":      "View PDF",
     "html_source_link":      "View HTML",
 }
@@ -500,12 +505,26 @@ def _sheet_name_for_excel_ref(name: str) -> str:
     return name
 
 
+def _set_internal_hyperlink(cell, location: str) -> None:
+    """Set a true in-workbook hyperlink, not an external target beginning with ``#``."""
+    cell.hyperlink = Hyperlink(ref=cell.coordinate, location=location)
+
+
 def apply_copy_path_hyperlink_columns(
-    ws, col_indices: list[int], start_row: int, records: list[dict]
-):
-    """Copy Path: in-workbook # links only; real file URI in hidden column COPY_PATH_URI_COL."""
+    ws,
+    col_indices: list[int],
+    start_row: int,
+    records: list[dict],
+    *,
+    order_number_col_idx: int | None = None,
+    anchor_col_idx: int | None = None,
+) -> None:
+    """Open File Location: in-workbook # links only; real file URI in hidden column COPY_PATH_URI_COL."""
     col_uri = COPY_PATH_URI_COL
     sn = _sheet_name_for_excel_ref(ws.title)
+    ws.column_dimensions[get_column_letter(col_uri)].hidden = True
+    if not records:
+        return
 
     for i, record in enumerate(records):
         row_idx = start_row + i
@@ -513,19 +532,30 @@ def apply_copy_path_hyperlink_columns(
         if uri and isinstance(uri, str) and uri.startswith("file:///"):
             ws.cell(row=row_idx, column=col_uri, value=uri)
 
-    ws.column_dimensions[get_column_letter(col_uri)].hidden = True
-
     for col_idx in col_indices:
-        for row in ws.iter_rows(min_row=start_row, max_row=ws.max_row,
+        for row in ws.iter_rows(min_row=start_row, max_row=start_row + len(records) - 1,
                                 min_col=col_idx, max_col=col_idx):
             cell = row[0]
             row_num = cell.row
+            record_idx = row_num - start_row
+            record = records[record_idx] if 0 <= record_idx < len(records) else {}
             stored = ws.cell(row=row_num, column=col_uri).value
+            cell.value = None
+            cell.hyperlink = None
             if not stored or not isinstance(stored, str) or not stored.startswith("file:///"):
                 continue
-            col_letter = get_column_letter(col_idx)
-            cell.value = "Copy Path"
-            cell.hyperlink = f"#{sn}!${col_letter}${row_num}"
+            if not _is_first_row_for_order(
+                record,
+                record_idx,
+                records,
+                sheet_row=row_num,
+                ws=ws,
+                order_number_col_idx=order_number_col_idx,
+            ):
+                continue
+            cell.value = "Open File Location"
+            anchor_letter = get_column_letter(anchor_col_idx or col_idx)
+            _set_internal_hyperlink(cell, f"{sn}!${anchor_letter}${row_num}")
             cell.font = HYPERLINK_FONT
             cell.alignment = CENTER_ALIGN
 
@@ -658,7 +688,7 @@ def apply_shipping_summary_cells(
             if display:
                 cell.value = display
             if vba_friendly and display:
-                cell.hyperlink = f"#{sn}!${anchor_letter}${row_idx}"
+                _set_internal_hyperlink(cell, f"{sn}!${anchor_letter}${row_idx}")
                 cell.font = hub_u
             else:
                 cell.hyperlink = None
@@ -677,7 +707,7 @@ def apply_shipping_summary_cells(
         pct = _shipping_summary_color_percent(display)
 
         if nums and vba_friendly and display:
-            cell.hyperlink = f"#{sn}!${anchor_letter}${row_idx}"
+            _set_internal_hyperlink(cell, f"{sn}!${anchor_letter}${row_idx}")
             if pct is not None:
                 if pct < 33:
                     cell.font = red_u
@@ -865,7 +895,7 @@ def apply_gift_invoice_link_columns(
         gc.hyperlink = None
         if label:
             gc.value = label
-            gc.hyperlink = f"#{sn}!${anchor_letter}${row_idx}"
+            _set_internal_hyperlink(gc, f"{sn}!${anchor_letter}${row_idx}")
             gc.font = HYPERLINK_FONT
             gc.alignment = CENTER_ALIGN
             src = ws.cell(row=row_idx, column=cat_col)
@@ -901,7 +931,7 @@ def apply_open_tracking_list_column(
             continue
         if vba_friendly:
             cell.value = COLUMN_HEADERS["open_tracking_list"]
-            cell.hyperlink = f"#{sn}!${anchor_letter}${row_idx}"
+            _set_internal_hyperlink(cell, f"{sn}!${anchor_letter}${row_idx}")
             cell.font = HYPERLINK_FONT
             cell.alignment = CENTER_ALIGN
         else:
@@ -935,7 +965,7 @@ def apply_open_tracking_numbers_web_column(
             continue
         if vba_friendly:
             cell.value = COLUMN_HEADERS["open_tracking_numbers_web"]
-            cell.hyperlink = f"#{sn}!${anchor_letter}${row_idx}"
+            _set_internal_hyperlink(cell, f"{sn}!${anchor_letter}${row_idx}")
             cell.font = HYPERLINK_FONT
             cell.alignment = CENTER_ALIGN
         else:
@@ -973,7 +1003,7 @@ def apply_open_tracking_numbers_order_column(
             continue
         if vba_friendly:
             cell.value = label
-            cell.hyperlink = f"#{sn}!${anchor_letter}${row_idx}"
+            _set_internal_hyperlink(cell, f"{sn}!${anchor_letter}${row_idx}")
             cell.font = HYPERLINK_FONT
             cell.alignment = CENTER_ALIGN
         else:
@@ -1158,7 +1188,14 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
     apply_section_dividers(ws, section_boundary_cols)
     apply_table_outline(ws)
 
-    apply_copy_path_hyperlink_columns(ws, copy_cols, start_row=2, records=records)
+    apply_copy_path_hyperlink_columns(
+        ws,
+        copy_cols,
+        start_row=2,
+        records=records,
+        order_number_col_idx=column_keys.index("order_number") + 1,
+        anchor_col_idx=category_col_idx,
+    )
     apply_file_link_hyperlinks(ws, column_keys, start_row=2)
     apply_hidden_tracking_url_columns(ws, records, start_row=2, vba_friendly=vba_friendly)
     apply_hidden_tracking_number_columns(ws, records, start_row=2, vba_friendly=vba_friendly)
@@ -1322,7 +1359,7 @@ def rebuild_orders_workbook(excel_output_path: str | Path) -> None:
 
     Column layout — including whether **View HTML** and the tracking tool columns are visible —
     follows **current** ``DEBUG_MODE`` (see :func:`runLogger.is_debug`). Call
-    ``load_dotenv(..., override=True)`` before loading this module if ``.env`` may have changed.
+    ``apply_runtime_settings_from_json()`` before loading this module if settings may have changed.
     """
     _emit_excel_launcher_progress(2, "Loading results.json")
     records = load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=True)
@@ -1530,7 +1567,14 @@ def append_to_workbook(path: str, records: list[dict]):
     apply_section_dividers(ws, section_boundary_cols)
     apply_table_outline(ws)
 
-    apply_copy_path_hyperlink_columns(ws, copy_cols, start_row=next_row, records=records)
+    apply_copy_path_hyperlink_columns(
+        ws,
+        copy_cols,
+        start_row=next_row,
+        records=records,
+        order_number_col_idx=order_col_idx,
+        anchor_col_idx=category_col_idx,
+    )
     apply_file_link_hyperlinks(ws, desired_keys, start_row=next_row)
     apply_hidden_tracking_url_columns(
         ws, records, start_row=next_row, vba_friendly=vba_friendly
@@ -1621,7 +1665,7 @@ def main():
     print(f"Wrote '{out_path}' with {len(records)} row(s).")
     if not using_template:
         print(
-            "Note: No macro template - output is .xlsx; Copy Path cells open the file. "
+            "Note: No macro template - output is .xlsx; Open File Location cells open the file. "
             "On Windows, install pywin32 + Excel so the program can auto-create "
             f"'{ORDERS_TEMPLATE_PATH}', or add that file manually (CLIPBOARD_SETUP.txt)."
         )
@@ -1639,5 +1683,5 @@ if __name__ == "__main__":
         main()
         print("Excel creation finished successfully.")
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"\nERROR: {console_safe_text(e)}")
         sys.exit(1)

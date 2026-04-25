@@ -5,17 +5,21 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared import runLogger as RL
+
+from shared.settings_store import apply_runtime_settings_from_json
+
+apply_runtime_settings_from_json()
+from shared.stdio_utf8 import configure_stdio_utf8, console_safe_text  # noqa: E402
+
+configure_stdio_utf8()
+
+from shared import runLogger as RL  # noqa: E402 — sets BASE_DIR via project_paths
 
 _base_dir_raw = os.getenv("BASE_DIR")
 if not _base_dir_raw:
     raise ValueError(
-        'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
+        'BASE_DIR is not set — expected automatic detection from the "python_files" folder layout.'
     )
 
 PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
@@ -49,7 +53,7 @@ def main():
 
         apply_order_company_consensus_and_sync(data, PROJECT_ROOT)
     except Exception as e:
-        print(f"  WARNING: order-level company consensus skipped: {e}")
+        print(f"  WARNING: order-level company consensus skipped: {console_safe_text(e)}")
 
     data.sort(key=lambda x: (
         x.get("order_number") is None,
@@ -77,5 +81,5 @@ if __name__ == "__main__":
         main()
         print("Sort finished successfully.")
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"\nERROR: {console_safe_text(e)}")
         sys.exit(1)

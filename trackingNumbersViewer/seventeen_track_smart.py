@@ -16,10 +16,7 @@ _PYTHON_FILES = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PYTHON_FILES not in sys.path:
     sys.path.insert(0, _PYTHON_FILES)
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None  # type: ignore[assignment]
+from shared.settings_store import apply_runtime_settings_from_json  # noqa: E402
 
 from htmlHandler.carrier_urls import infer_carrier  # noqa: E402
 from trackingNumbersViewer import seventeen_track_api as api  # noqa: E402
@@ -35,8 +32,7 @@ _CACHE_SUBDIR = "tracking_status_cache"
 
 
 def _project_root() -> Path:
-    if load_dotenv:
-        load_dotenv(Path(_PYTHON_FILES) / ".env", override=False)
+    apply_runtime_settings_from_json()
     base = os.getenv("BASE_DIR")
     if base:
         return Path(base).expanduser().resolve()

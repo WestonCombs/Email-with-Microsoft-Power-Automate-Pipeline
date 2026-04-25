@@ -1,0 +1,9 @@
+{
+  "GRAPH_MAIL_FOLDER": "INBOX or your Outlook folder name",
+  "AZURE_CLIENT_ID": "Azure Portal → App registrations → Application (client) ID",
+  "AZURE_TENANT_ID": "consumers for Outlook.com, or common",
+  "OPENAI_API_KEY": "",
+  "SEVENTEEN_TRACK_API_KEY": "",
+  "DEBUG_MODE": "0",
+  "LOGIN_NEW_ACCOUNT_NEXT_RUN": "0"
+}

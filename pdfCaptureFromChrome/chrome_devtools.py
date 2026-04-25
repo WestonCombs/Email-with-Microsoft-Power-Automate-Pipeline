@@ -128,6 +128,25 @@ def inspect_page(ws_url: str) -> dict | None:
     return decoded if isinstance(decoded, dict) else None
 
 
+def page_has_focus(ws_url: str) -> bool:
+    """Return True if this page's top frame currently has input focus (active tab)."""
+    try:
+        with _CdpSession(ws_url) as cdp:
+            result = cdp.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "Boolean(document && document.hasFocus && document.hasFocus())",
+                    "returnByValue": True,
+                },
+            )
+    except Exception:
+        return False
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("value") is True
+
+
 def looks_like_print_preview(target: dict, page_info: dict | None) -> bool:
     url = str((page_info or {}).get("href") or target.get("url") or "").lower()
     title = str((page_info or {}).get("title") or target.get("title") or "").lower()

@@ -13,7 +13,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import webbrowser
 from datetime import datetime
@@ -31,7 +30,7 @@ from shared.gui_aux_singleton import detach_console_win32, register_current_aux_
 from shared.gui_treeview_copy import bind_treeview_copy_menu
 from shared import runLogger as RL
 from htmlHandler.carrier_urls import normalize_carrier_for_public_url, public_tracking_url
-from pdfCaptureFromChrome.paths import PDF_CAPTURE_SESSION_LOG
+from pdfCaptureFromChrome.html_capture import HtmlCaptureController
 from proofOfDelivery.pod_data import (
     POD_HUB_MODE,
     expected_pod_pdf_path,
@@ -237,12 +236,13 @@ class TrackingStatusViewerApp:
         self._row_infos = self._build_row_infos(numbers)
         self._numbers = [str(info["tracking_number"]) for info in self._row_infos]
         self._pdf_capture = self._hub_remaining_mode
+        self._capture_controller: HtmlCaptureController | None = None
 
         try:
-            from dotenv import load_dotenv
+            from shared.settings_store import apply_runtime_settings_from_json
 
-            load_dotenv(_PYTHON_FILES_DIR / ".env", override=False)
-        except ImportError:
+            apply_runtime_settings_from_json()
+        except Exception:
             pass
 
         self._root = tk.Tk()
@@ -284,16 +284,16 @@ class TrackingStatusViewerApp:
         else:
             ttk.Label(
                 hint_frame,
-                text="Double-click a row to open the tracking page,",
+                text=(
+                    "With Toggle PDF Capture on: double-click a row to open the tracking page in the capture "
+                    "Chrome; press Ctrl+Enter there to save the visible page as the proof-of-delivery PDF. "
+                ),
                 wraplength=920,
                 foreground=UI_FG,
             ).pack(fill=tk.X, anchor=tk.W)
             ttk.Label(
                 hint_frame,
-                text=(
-                    "Turn on Toggle PDF Capture to run that process. "
-                    "(Weston needs more time to perfect or adapt this feature.)"
-                ),
+                text="(Weston needs more time to perfect or adapt this feature.)",
                 wraplength=920,
                 foreground=UI_FG,
             ).pack(fill=tk.X, anchor=tk.W)
@@ -335,8 +335,8 @@ class TrackingStatusViewerApp:
             ttk.Label(
                 self._frm,
                 text=(
-                    "No SEVENTEEN_TRACK_API_KEY in .env — only cached tracking data will appear. "
-                    "Get a free key at 17track.net."
+                    "No SEVENTEEN_TRACK_API_KEY — only cached tracking data will appear. "
+                    "Set the 17TRACK key in Email Sorter Settings."
                 ),
                 wraplength=920,
                 foreground="#fbbf24",
@@ -449,6 +449,29 @@ class TrackingStatusViewerApp:
         if not self._row_infos:
             ttk.Label(self._frm, text="No tracking numbers in this file.", foreground=UI_FG_DIM).pack()
 
+        self._root.protocol("WM_DELETE_WINDOW", self._on_viewer_closing)
+
+    def _on_viewer_closing(self) -> None:
+        if self._capture_controller is not None:
+            self._capture_controller.stop()
+            self._capture_controller = None
+        self._root.destroy()
+
+    def _on_capture_notify(self, level: str, message: str) -> None:
+        def _ui() -> None:
+            if level == "error":
+                messagebox.showerror("PDF capture", message)
+            else:
+                messagebox.showinfo("PDF capture", message)
+
+        self._root.after(0, _ui)
+
+    def _on_capture_saved(self) -> None:
+        def _ui() -> None:
+            self._apply_pod_completion_layout()
+
+        self._root.after(0, _ui)
+
     def _build_row_infos(self, numbers: list[str]) -> list[dict[str, object]]:
         if self._hub_remaining_mode and self._project_root is not None:
             rows = remaining_pod_candidates(self._project_root)
@@ -503,9 +526,6 @@ class TrackingStatusViewerApp:
             return int(sel[0])
         except ValueError:
             return None
-
-    def _debug_positional_flag(self) -> str:
-        return "1" if RL.is_debug() else "0"
 
     def _info_for_index(self, idx: int) -> dict[str, object]:
         return self._row_infos[idx]
@@ -650,6 +670,9 @@ class TrackingStatusViewerApp:
             return
         if self._pdf_capture:
             self._pdf_capture = False
+            if self._capture_controller is not None:
+                self._capture_controller.stop()
+                self._capture_controller = None
             self._pdf_toggle_btn.config(bg=_PDF_TOGGLE_OFF, activebackground="#dc2626")
             self._cancel_pod_poll()
             if self._project_root is not None:
@@ -661,6 +684,15 @@ class TrackingStatusViewerApp:
         if not ok:
             messagebox.showerror("PDF capture", err or "Setup incomplete.")
             return
+        ctrl = HtmlCaptureController(
+            on_notify=self._on_capture_notify,
+            on_saved=self._on_capture_saved,
+            verbose=RL.is_debug(),
+        )
+        if not ctrl.start():
+            self._capture_controller = None
+            return
+        self._capture_controller = ctrl
         self._pdf_capture = True
         self._pdf_toggle_btn.config(bg=_PDF_TOGGLE_ON, activebackground="#16a34a")
         self._apply_pod_completion_layout()
@@ -717,39 +749,21 @@ class TrackingStatusViewerApp:
             if not url:
                 messagebox.showerror("Tracking", "Could not build a carrier URL for this number.")
                 return
-            base_raw = (os.getenv("BASE_DIR") or "").strip()
-            if not base_raw:
-                messagebox.showerror(
-                    "PDF capture",
-                    'BASE_DIR is not set.\nSet "Project folder on disk" in Email Sorter → Settings and Save.',
-                )
-                return
-            pdf_dir = expected_pdf.parent
+            from shared.project_paths import ensure_base_dir_in_environ
+
+            ensure_base_dir_in_environ()
             try:
                 expected_pdf.parent.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 messagebox.showerror("PDF capture", f"Could not create output folder:\n{e}")
                 return
-            stem = expected_pdf.name
-            dbg = self._debug_positional_flag()
-            script = _PYTHON_FILES_DIR / "pdfCaptureFromChrome" / "run_pdf_capture.py"
-            capture_cwd = _PYTHON_FILES_DIR / "pdfCaptureFromChrome"
-            log_hint = PDF_CAPTURE_SESSION_LOG
-            try:
-                proc = subprocess.Popen(
-                    [sys.executable, str(script), url, str(expected_pdf.parent), stem, dbg],
-                    cwd=str(capture_cwd),
+            if self._capture_controller is None:
+                messagebox.showerror(
+                    "PDF capture",
+                    "Turn on Toggle PDF Capture first, then double-click a row to open the page.",
                 )
-                try:
-                    with open(log_hint, "a", encoding="utf-8", newline="\n") as lf:
-                        lf.write(
-                            f"{datetime.now().isoformat(timespec='seconds')} "
-                            f"[viewer] spawned run_pdf_capture pid={proc.pid} dbg_flag={dbg}\n"
-                        )
-                except OSError:
-                    pass
-            except OSError as e:
-                messagebox.showerror("PDF capture", f"Could not start capture:\n{e}")
+                return
+            self._capture_controller.enqueue_capture(url, expected_pdf)
             return
 
         self._open_carrier_in_browser_only()
@@ -801,7 +815,7 @@ class TrackingStatusViewerApp:
         if not key:
             messagebox.showerror(
                 "Force Check Tracking Number",
-                "No SEVENTEEN_TRACK_API_KEY is configured in .env.",
+                "No 17TRACK API key is configured (set SEVENTEEN_TRACK_API_KEY in Email Sorter Settings).",
             )
             return
         info = self._info_for_index(idx)
@@ -851,10 +865,10 @@ def main() -> int:
     register_current_aux_gui()
 
     try:
-        from dotenv import load_dotenv
+        from shared.settings_store import apply_runtime_settings_from_json
 
-        load_dotenv(_PYTHON_FILES_DIR / ".env", override=False)
-    except ImportError:
+        apply_runtime_settings_from_json()
+    except Exception:
         pass
 
     parser = argparse.ArgumentParser(description="View shipping status (17TRACK smart cache).")

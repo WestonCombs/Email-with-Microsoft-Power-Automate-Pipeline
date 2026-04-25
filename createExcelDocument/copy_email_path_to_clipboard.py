@@ -1,14 +1,16 @@
 """
-Copy a file URI or Windows path to the clipboard as a decoded filesystem path.
+Decode a file URI or Windows path, then open File Explorer with that file selected.
 
 Usage:
-  python copy_email_path_to_clipboard.py "file:///C:/path/to/file.eml"
+  python copy_email_path_to_clipboard.py "file:///C:/path/to/file.pdf"
 
-Used from Excel VBA when the user clicks a \"Copy Path\" hyperlink.
+Used from Excel VBA when the user clicks an "Open File Location" hyperlink.
 """
+
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import urllib.parse
 
@@ -23,11 +25,11 @@ def file_uri_to_windows_path(uri: str) -> str:
     if not path:
         raise ValueError("Empty path in file URI")
 
-    # file:///C:/...  ->  urlparse path often "/C:/..."
+    # file:///C:/... -> urlparse path is often "/C:/..."
     if len(path) >= 3 and path[0] == "/" and path[2] == ":" and path[1].isalpha():
         path = path[1:]
 
-    # UNC: file://server/share/...  ->  netloc + path
+    # UNC: file://server/share/... -> netloc + path
     if parsed.netloc and not (len(path) >= 2 and path[1] == ":"):
         path = "//" + parsed.netloc + path
 
@@ -35,22 +37,29 @@ def file_uri_to_windows_path(uri: str) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("Usage: python copy_email_path_to_clipboard.py <file_uri_or_path>", file=sys.stderr)
+    if sys.platform != "win32":
+        print("Open file location is only supported on Windows.", file=sys.stderr)
         return 1
+    if len(sys.argv) < 2:
+        print(
+            "Usage: python copy_email_path_to_clipboard.py <file_uri_or_path>",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
-        text = file_uri_to_windows_path(sys.argv[1])
+        path = file_uri_to_windows_path(sys.argv[1])
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1
 
-    try:
-        import pyperclip
-    except ImportError:
-        print("pyperclip is required. Install with: pip install pyperclip", file=sys.stderr)
+    if not os.path.isfile(path):
+        print(f"File not found (cannot select in Explorer): {path}", file=sys.stderr)
         return 1
 
-    pyperclip.copy(text)
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    explorer = os.path.join(windir, "explorer.exe")
+    subprocess.run([explorer, f"/select,{path}"], check=False)
     return 0
 
 

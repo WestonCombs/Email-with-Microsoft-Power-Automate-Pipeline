@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from shared.settings_store import apply_runtime_settings_from_json
 
 if sys.platform == "win32":
     import winreg
@@ -19,7 +19,7 @@ else:
 
 CLIPBOARD_INI_NAME = "excel_clipboard_launch.ini"
 
-# Workbook_SheetFollowHyperlink: Copy Path uses # in-sheet links; file URI in column 29 (AC).
+# Workbook_SheetFollowHyperlink: Open File Location uses # in-sheet links; file URI in column 29 (AC).
 # Tracking URLs: 30…44. Tracking numbers: 45…59. Link-cross-check flags: 60…74 (1 = also found on tracking URL).
 # Reads UTF-8 ini (PY=, SCRIPT=, VIEWER=, TRACKING_NUMBERS_VIEWER=, TRACKING_STATUS_VIEWER=) from AA1 / excel_clipboard_launch.ini.
 THISWORKBOOK_VBA = r'''Option Explicit
@@ -673,7 +673,8 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
         Exit Sub
     End If
 
-    If StrComp(header, "Copy Path", vbTextCompare) <> 0 Then Exit Sub
+    If StrComp(header, "Open File Location", vbTextCompare) <> 0 _
+        And StrComp(header, "Copy Path", vbTextCompare) <> 0 Then Exit Sub
 
     uri = CStr(Sh.Cells(Target.Range.Row, COL_FILE_URI).Value)
     uri = Trim(uri)
@@ -930,16 +931,14 @@ def refresh_macro_template(dest: Path) -> bool:
 
 
 if __name__ == "__main__":
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
-    base_raw = (os.getenv("BASE_DIR") or "").strip()
-    if not base_raw:
-        print(
-            "macro_template: BASE_DIR is not set. Set it in Email Sorter → Settings "
-            '("Project folder on disk") and Save.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    default_tpl = Path(base_raw).expanduser().resolve() / "email_contents" / "orders_template.xlsm"
+    _PYTHON_FILES_MAIN = Path(__file__).resolve().parent.parent
+    if str(_PYTHON_FILES_MAIN) not in sys.path:
+        sys.path.insert(0, str(_PYTHON_FILES_MAIN))
+
+    apply_runtime_settings_from_json()
+    from shared.project_paths import ensure_base_dir_in_environ
+
+    default_tpl = ensure_base_dir_in_environ() / "email_contents" / "orders_template.xlsm"
     target = Path(os.getenv("EXCEL_TEMPLATE_PATH", str(default_tpl))).expanduser().resolve()
     ok = ensure_macro_template(target)
     sys.exit(0 if ok else 1)

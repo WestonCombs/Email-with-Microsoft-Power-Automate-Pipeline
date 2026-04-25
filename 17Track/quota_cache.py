@@ -4,7 +4,7 @@
 Quota **dialogs** run only from the Email Sorter launcher session: see
 :func:`quota_prefetch_gate` (start) and :func:`quota_session_end_notify` (after prefetch).
 
-Requires ``SEVENTEEN_TRACK_API_KEY`` or ``17TRACK_API_KEY`` (same as ``trackingNumbersViewer``).
+Requires ``SEVENTEEN_TRACK_API_KEY`` in the environment (set via Email Sorter Settings → ``email_sorter_settings.json``).
 
 Usage (from the ``python_files`` directory — the folder name starts with a digit so
 ``python -m 17Track…`` is not valid)::
@@ -25,9 +25,9 @@ _PYTHON_FILES = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES))
 
-from dotenv import load_dotenv
+from shared.settings_store import apply_runtime_settings_from_json
 
-load_dotenv(_PYTHON_FILES / ".env")
+apply_runtime_settings_from_json()
 
 from trackingNumbersViewer.seventeen_track_api import api_key_from_env  # noqa: E402
 
@@ -52,7 +52,7 @@ def get_quota(*, timeout: float = 25.0) -> dict:
     api_key = api_key_from_env()
     if not api_key:
         raise ValueError(
-            "No API key: set SEVENTEEN_TRACK_API_KEY or 17TRACK_API_KEY (e.g. in python_files/.env)."
+            "No API key: set SEVENTEEN_TRACK_API_KEY in Email Sorter Settings (email_sorter_settings.json)."
         )
 
     headers = {

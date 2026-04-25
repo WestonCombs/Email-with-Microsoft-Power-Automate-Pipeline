@@ -85,6 +85,7 @@ class PipelineProgressWindow(tk.Toplevel):
         self._pct = 0
         self._stopped = False
         self._show_log = show_log
+        self._on_error_dismiss: Callable[[], None] | None = None
 
         self.title(title)
         self.configure(bg=THEME["bg"])
@@ -345,6 +346,49 @@ class PipelineProgressWindow(tk.Toplevel):
             self._log_text.configure(state=tk.DISABLED)
         except tk.TclError:
             pass
+
+    def prepare_error_review_mode(
+        self,
+        *,
+        status_message: str,
+        on_dismiss: Callable[[], None],
+    ) -> None:
+        """
+        After a subprocess failure with show_log=True: keep the window open so the user
+        can read the log, then dismiss via Close (same as the window close button).
+        """
+        self._on_error_dismiss = on_dismiss
+        try:
+            self._status.config(text=status_message, fg=THEME["stop_fg"], justify=tk.LEFT)
+        except tk.TclError:
+            return
+        if self._skip_17track_btn is not None:
+            try:
+                self._skip_17track_btn.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+        self._stopped = True
+        self._on_stop = lambda: None
+        try:
+            self._stop_btn.config(
+                state=tk.NORMAL,
+                text="Close",
+                fg=THEME["fg"],
+                bg=THEME["surface"],
+                activeforeground=THEME["fg"],
+                activebackground=THEME["track"],
+                command=self._error_review_close,
+            )
+        except tk.TclError:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self._error_review_close)
+
+    def _error_review_close(self) -> None:
+        cb = self._on_error_dismiss
+        self._on_error_dismiss = None
+        if cb is not None:
+            cb()
+        self.close_window()
 
     def close_window(self) -> None:
         try:

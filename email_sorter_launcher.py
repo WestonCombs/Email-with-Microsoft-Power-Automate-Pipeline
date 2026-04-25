@@ -16,23 +16,531 @@ import webbrowser
 from pathlib import Path
 from tkinter import messagebox
 
-from dotenv import load_dotenv
-
 from launcher_progress_ui import (
     THEME,
     PipelineProgressWindow,
     parse_excel_progress_line,
     parse_run_progress_line,
 )
+from shared.project_paths import ensure_base_dir_in_environ
+from shared.settings_store import (
+    apply_runtime_settings_from_json,
+    read_settings_for_write_merge,
+    read_settings_json,
+    write_settings_json,
+)
 
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent
+_BASE_DIR = _PYTHON_FILES_DIR.parent
 _LAUNCHER_CANCEL_FILE = ".email_sorter_cancel"
-_ENV_PATH = _PYTHON_FILES_DIR / ".env"
-_PDF_CAPTURE_REQUIREMENTS = _PYTHON_FILES_DIR / "pdfCaptureFromChrome" / "requirements_mitmproxy.txt"
+_TITLEBAR_BG = "#1f1f23"
+_TITLEBAR_ACTIVE_BG = "#2a2a2f"
+_TITLEBAR_HEIGHT = 39
+_TITLEBAR_MIN_HOVER_BG = THEME["run_accent_dim"]
+_TITLEBAR_MAX_HOVER_BG = "#d97706"
+_DANGER_BG = THEME["stop_fg"]
+_DANGER_ACTIVE_BG = "#da3633"
+_UPDATE_BG = "#f59e0b"
+_UPDATE_ACTIVE_BG = "#d97706"
 
-_MITM_WIZARD_BG_OPACITY = 0.50  # 50/50 blend: gray base + image (image half visible)
 
-_KEY_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+def _font(name: str) -> tuple[str, int] | tuple[str, int, str]:
+    fonts = {
+        "titlebar": ("Segoe UI", 9),
+        "title": ("Segoe UI", 14, "bold"),
+        "body": ("Segoe UI", 10),
+        "button": ("Segoe UI", 10, "bold"),
+        "input": ("Segoe UI", 10),
+    }
+    return fonts[name]
+
+
+def _blend_hex_color(hex_color: str, target: str = "#ffffff", amount: float = 0.14) -> str:
+    try:
+        base = hex_color.strip().lstrip("#")
+        dest = target.strip().lstrip("#")
+        if len(base) != 6 or len(dest) != 6:
+            return hex_color
+        b = tuple(int(base[i : i + 2], 16) for i in (0, 2, 4))
+        d = tuple(int(dest[i : i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return hex_color
+    mixed = tuple(max(0, min(255, round(c + (t - c) * amount))) for c, t in zip(b, d))
+    return "#" + "".join(f"{c:02x}" for c in mixed)
+
+
+def _add_button_hover(btn: tk.Button, *, normal_bg: str, hover_bg: str | None = None) -> tk.Button:
+    hover = hover_bg or _blend_hex_color(normal_bg)
+
+    def on_enter(_event: tk.Event) -> None:
+        try:
+            if str(btn.cget("state")) != tk.DISABLED:
+                btn.configure(bg=hover)
+        except tk.TclError:
+            pass
+
+    def on_leave(_event: tk.Event) -> None:
+        try:
+            btn.configure(bg=normal_bg)
+        except tk.TclError:
+            pass
+
+    btn.bind("<Enter>", on_enter, add="+")
+    btn.bind("<Leave>", on_leave, add="+")
+    return btn
+
+
+def _attach_tooltip(widget: tk.Misc, text: str) -> None:
+    tip: dict[str, tk.Toplevel | None] = {"win": None}
+
+    def show(event: tk.Event) -> None:
+        if tip["win"] is not None:
+            return
+        try:
+            win = tk.Toplevel(widget)
+            win.overrideredirect(True)
+            win.configure(bg=THEME["border"])
+            tk.Label(
+                win,
+                text=text,
+                font=("Segoe UI", 9),
+                fg=THEME["fg"],
+                bg=THEME["surface"],
+                padx=8,
+                pady=4,
+            ).pack(padx=1, pady=1)
+            win.geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
+            tip["win"] = win
+        except tk.TclError:
+            tip["win"] = None
+
+    def hide(_event: tk.Event) -> None:
+        win = tip["win"]
+        tip["win"] = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<ButtonPress>", hide, add="+")
+
+
+def _make_file_explorer_icon(master: tk.Misc) -> tk.PhotoImage:
+    icon = tk.PhotoImage(master=master, width=36, height=28)
+    try:
+        for y in range(28):
+            for x in range(36):
+                icon.transparency_set(x, y, True)
+    except tk.TclError:
+        icon.put(THEME["excel_accent"], to=(0, 0, 36, 28))
+
+    icon.put("#92400e", to=(4, 9, 30, 23))
+    icon.put("#fbbf24", to=(5, 6, 15, 12))
+    icon.put("#f59e0b", to=(6, 9, 31, 22))
+    icon.put("#fde68a", to=(7, 12, 30, 20))
+    icon.put("#d97706", to=(6, 21, 31, 23))
+    icon.put("#2563eb", to=(18, 14, 27, 20))
+    icon.put("#60a5fa", to=(19, 15, 27, 18))
+    icon.put("#1d4ed8", to=(18, 19, 27, 21))
+    return icon
+
+
+def _make_button(
+    parent: tk.Misc,
+    *,
+    text: str,
+    command,
+    bg: str,
+    fg: str = "#ffffff",
+    active_bg: str | None = None,
+    active_fg: str | None = None,
+    padx: int = 18,
+    pady: int = 7,
+    width: int | None = None,
+) -> tk.Button:
+    opts: dict[str, object] = {
+        "text": text,
+        "command": command,
+        "font": _font("button"),
+        "bg": bg,
+        "fg": fg,
+        "activebackground": active_bg or bg,
+        "activeforeground": active_fg or fg,
+        "relief": tk.FLAT,
+        "bd": 0,
+        "highlightthickness": 0,
+        "cursor": "hand2",
+        "padx": padx,
+        "pady": pady,
+    }
+    if width is not None:
+        opts["width"] = width
+    btn = tk.Button(parent, **opts)
+    return _add_button_hover(btn, normal_bg=bg, hover_bg=active_bg)
+
+
+def _set_app_icon(win: tk.Toplevel | tk.Tk) -> None:
+    try:
+        icon = tk.PhotoImage(width=32, height=32)
+        icon.put("#0f1117", to=(0, 0, 32, 32))
+        icon.put("#3b82f6", to=(5, 6, 27, 13))
+        icon.put("#22c55e", to=(5, 15, 27, 22))
+        icon.put("#f59e0b", to=(5, 24, 27, 28))
+        win.iconphoto(True, icon)
+        win._email_sorter_icon = icon  # type: ignore[attr-defined]
+    except tk.TclError:
+        pass
+
+
+def _center_window(win: tk.Toplevel | tk.Tk, parent: tk.Misc | None = None) -> None:
+    try:
+        win.update_idletasks()
+        if parent is None:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            x = (sw // 2) - (win.winfo_width() // 2)
+            y = (sh // 2) - (win.winfo_height() // 2)
+        else:
+            parent.update_idletasks()
+            x = parent.winfo_rootx() + (parent.winfo_width() // 2) - (win.winfo_width() // 2)
+            y = parent.winfo_rooty() + (parent.winfo_height() // 2) - (win.winfo_height() // 2)
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+    except tk.TclError:
+        pass
+
+
+def _keep_window_above_parent(win: tk.Toplevel, parent: tk.Misc) -> None:
+    try:
+        parent_top = parent.winfo_toplevel()
+    except tk.TclError:
+        return
+    bindings: list[tuple[tk.Misc, str, str]] = []
+
+    def lift_child(_event: tk.Event | None = None) -> None:
+        try:
+            if win.winfo_exists():
+                win.lift(parent_top)
+        except tk.TclError:
+            pass
+
+    def cleanup(_event: tk.Event | None = None) -> None:
+        for widget, sequence, funcid in bindings:
+            try:
+                widget.unbind(sequence, funcid)
+            except tk.TclError:
+                pass
+        bindings.clear()
+
+    for widget, sequence in (
+        (parent_top, "<FocusIn>"),
+        (parent_top, "<Map>"),
+        (win, "<FocusIn>"),
+        (win, "<Map>"),
+    ):
+        try:
+            funcid = widget.bind(sequence, lift_child, add="+")
+            bindings.append((widget, sequence, funcid))
+        except tk.TclError:
+            pass
+    try:
+        win.bind("<Destroy>", cleanup, add="+")
+    except tk.TclError:
+        pass
+    lift_child()
+
+
+def _show_dialog(
+    win: tk.Toplevel,
+    *,
+    parent: tk.Misc,
+    focus_widget: tk.Misc | None = None,
+    modal: bool = True,
+) -> None:
+    try:
+        win.transient(parent.winfo_toplevel())
+    except tk.TclError:
+        pass
+    _center_window(win, parent)
+    try:
+        win.deiconify()
+        win.lift(parent.winfo_toplevel())
+        win.attributes("-topmost", True)
+        win.after(0, lambda: _clear_topmost(win))
+    except tk.TclError:
+        pass
+    _keep_window_above_parent(win, parent)
+    try:
+        if focus_widget is not None:
+            focus_widget.focus_set()
+        else:
+            win.focus_force()
+    except tk.TclError:
+        pass
+    if modal:
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+
+def _clear_topmost(win: tk.Toplevel) -> None:
+    try:
+        win.attributes("-topmost", False)
+    except tk.TclError:
+        pass
+
+
+def _make_titlebar_button(
+    parent: tk.Misc,
+    *,
+    text: str,
+    command,
+    hover_bg: str,
+    font: tuple[str, int] | tuple[str, int, str],
+) -> tk.Button:
+    btn = tk.Button(
+        parent,
+        text=text,
+        command=command,
+        font=font,
+        fg=THEME["fg"],
+        bg=_TITLEBAR_BG,
+        activeforeground="#ffffff",
+        activebackground=hover_bg,
+        relief=tk.FLAT,
+        bd=0,
+        width=4,
+        padx=3,
+        pady=2,
+        cursor="hand2",
+    )
+
+    def on_enter(_event: tk.Event) -> None:
+        try:
+            btn.configure(bg=hover_bg, fg="#ffffff")
+        except tk.TclError:
+            pass
+
+    def on_leave(_event: tk.Event) -> None:
+        try:
+            btn.configure(bg=_TITLEBAR_BG, fg=THEME["fg"])
+        except tk.TclError:
+            pass
+
+    btn.bind("<Enter>", on_enter)
+    btn.bind("<Leave>", on_leave)
+    return btn
+
+
+def _apply_frameless_window(
+    win: tk.Toplevel | tk.Tk,
+    *,
+    title: str,
+    on_close,
+    show_minimize: bool = True,
+) -> tk.Frame:
+    win.overrideredirect(True)
+    win.configure(bg=_TITLEBAR_BG)
+
+    shell = tk.Frame(win, bg=_TITLEBAR_BG, highlightthickness=0)
+    shell.pack(fill=tk.BOTH, expand=True)
+
+    titlebar = tk.Frame(shell, bg=_TITLEBAR_BG, height=_TITLEBAR_HEIGHT)
+    titlebar.pack(fill=tk.X, side=tk.TOP)
+    titlebar.pack_propagate(False)
+
+    title_label = tk.Label(
+        titlebar,
+        text=title,
+        font=_font("titlebar"),
+        fg=THEME["fg"],
+        bg=_TITLEBAR_BG,
+        anchor=tk.W,
+    )
+    title_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+
+    drag = {"x": 0, "y": 0}
+
+    def start_move(event: tk.Event) -> None:
+        drag["x"] = event.x
+        drag["y"] = event.y
+
+    def do_move(event: tk.Event) -> None:
+        try:
+            win.geometry(f"+{event.x_root - drag['x']}+{event.y_root - drag['y']}")
+        except tk.TclError:
+            pass
+
+    def minimize() -> None:
+        try:
+            win.overrideredirect(False)
+            win.iconify()
+        except tk.TclError:
+            return
+
+    def toggle_maximize() -> None:
+        try:
+            win.overrideredirect(False)
+            win.state("normal" if str(win.state()) == "zoomed" else "zoomed")
+            win.after(50, lambda: win.overrideredirect(True))
+        except tk.TclError:
+            pass
+
+    def restore_frameless(_event: tk.Event | None = None) -> None:
+        try:
+            if str(win.state()) == "normal":
+                win.overrideredirect(True)
+        except tk.TclError:
+            pass
+
+    win.bind("<Map>", restore_frameless, add="+")
+    for widget in (titlebar, title_label):
+        widget.bind("<ButtonPress-1>", start_move)
+        widget.bind("<B1-Motion>", do_move)
+
+    close_btn = _make_titlebar_button(
+        titlebar,
+        text="X",
+        command=on_close,
+        hover_bg=_DANGER_ACTIVE_BG,
+        font=("Segoe UI Symbol", 12, "bold"),
+    )
+    close_btn.pack(side=tk.RIGHT, fill=tk.Y)
+
+    if show_minimize:
+        max_btn = _make_titlebar_button(
+            titlebar,
+            text="□",
+            command=toggle_maximize,
+            hover_bg=_TITLEBAR_MAX_HOVER_BG,
+            font=("Segoe UI Symbol", 11),
+        )
+        max_btn.pack(side=tk.RIGHT, fill=tk.Y)
+
+        min_btn = _make_titlebar_button(
+            titlebar,
+            text="—",
+            command=minimize,
+            hover_bg=_TITLEBAR_MIN_HOVER_BG,
+            font=("Segoe UI Symbol", 12, "bold"),
+        )
+        min_btn.pack(side=tk.RIGHT, fill=tk.Y)
+
+    content = tk.Frame(shell, bg=THEME["bg"], highlightthickness=0)
+    content.pack(fill=tk.BOTH, expand=True, padx=1, pady=(0, 1))
+    win.protocol("WM_DELETE_WINDOW", on_close)
+    return content
+
+
+def _themed_message(
+    parent: tk.Misc,
+    *,
+    title: str,
+    message: str,
+    kind: str = "info",
+) -> None:
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.withdraw()
+    win.resizable(False, False)
+
+    def close() -> None:
+        win.destroy()
+
+    content = _apply_frameless_window(win, title=title, on_close=close, show_minimize=False)
+    outer = tk.Frame(content, bg=THEME["bg"], padx=22, pady=22)
+    outer.pack(fill=tk.BOTH, expand=True)
+    color = THEME["fg"] if kind != "error" else _DANGER_BG
+    tk.Label(
+        outer,
+        text=title,
+        font=_font("title"),
+        fg=color,
+        bg=THEME["bg"],
+        anchor=tk.W,
+    ).pack(anchor=tk.W, pady=(0, 10))
+    tk.Label(
+        outer,
+        text=message,
+        font=_font("body"),
+        fg=THEME["fg"],
+        bg=THEME["bg"],
+        justify=tk.LEFT,
+        wraplength=520,
+    ).pack(anchor=tk.W, fill=tk.X, pady=(0, 18))
+    row = tk.Frame(outer, bg=THEME["bg"])
+    row.pack(fill=tk.X)
+    _make_button(row, text="Close", command=close, bg=_DANGER_BG, active_bg=_DANGER_ACTIVE_BG).pack(
+        side=tk.RIGHT
+    )
+    win.update_idletasks()
+    win.geometry(f"{max(420, outer.winfo_reqwidth() + 4)}x{outer.winfo_reqheight() + _TITLEBAR_HEIGHT + 8}")
+    _show_dialog(win, parent=parent)
+    win.wait_window()
+
+
+def _themed_ask_yes_no(parent: tk.Misc, *, title: str, message: str) -> bool:
+    answer = [False]
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.withdraw()
+    win.resizable(False, False)
+
+    def finish(value: bool) -> None:
+        answer[0] = value
+        win.destroy()
+
+    content = _apply_frameless_window(
+        win,
+        title=title,
+        on_close=lambda: finish(False),
+        show_minimize=False,
+    )
+    outer = tk.Frame(content, bg=THEME["bg"], padx=22, pady=22)
+    outer.pack(fill=tk.BOTH, expand=True)
+    tk.Label(
+        outer,
+        text=title,
+        font=_font("title"),
+        fg=THEME["fg"],
+        bg=THEME["bg"],
+        anchor=tk.W,
+    ).pack(anchor=tk.W, pady=(0, 10))
+    tk.Label(
+        outer,
+        text=message,
+        font=_font("body"),
+        fg=THEME["fg"],
+        bg=THEME["bg"],
+        justify=tk.LEFT,
+        wraplength=520,
+    ).pack(anchor=tk.W, fill=tk.X, pady=(0, 18))
+    row = tk.Frame(outer, bg=THEME["bg"])
+    row.pack(fill=tk.X)
+    _make_button(
+        row,
+        text="No",
+        command=lambda: finish(False),
+        bg=_DANGER_BG,
+        active_bg=_DANGER_ACTIVE_BG,
+        width=10,
+    ).pack(side=tk.RIGHT, padx=(8, 0))
+    _make_button(
+        row,
+        text="Yes",
+        command=lambda: finish(True),
+        bg=THEME["excel_accent"],
+        active_bg=THEME["excel_accent_dim"],
+        width=10,
+    ).pack(side=tk.RIGHT)
+    win.update_idletasks()
+    win.geometry(f"{max(420, outer.winfo_reqwidth() + 4)}x{outer.winfo_reqheight() + _TITLEBAR_HEIGHT + 8}")
+    _show_dialog(win, parent=parent)
+    win.wait_window()
+    return answer[0]
 
 
 def _optional_path(env_name: str, default: Path) -> Path:
@@ -60,7 +568,7 @@ def _record_launcher_subprocess_error(
     log_tail: str | None = None,
 ) -> None:
     """Append to ``BASE_DIR/logs/program_errors.txt`` (independent of ``DEBUG_MODE``)."""
-    load_dotenv(_ENV_PATH, override=True)
+    apply_runtime_settings_from_json()
     parts: list[str] = []
     if err_msg:
         parts.append(err_msg)
@@ -88,7 +596,7 @@ def _record_launcher_subprocess_error(
 
 
 def _run_cancel_request_file() -> Path | None:
-    load_dotenv(_ENV_PATH, override=True)
+    apply_runtime_settings_from_json()
     base_raw = (os.getenv("BASE_DIR") or "").strip()
     if not base_raw:
         return None
@@ -118,7 +626,8 @@ def _subprocess_creationflags(*, show_console: bool) -> int:
 
 def resolve_orders_workbook_path() -> Path | None:
     """Match createExcelDocument output path (template -> .xlsm when applicable)."""
-    load_dotenv(_ENV_PATH, override=True)
+    apply_runtime_settings_from_json()
+    ensure_base_dir_in_environ()
     base_raw = (os.getenv("BASE_DIR") or "").strip()
     if not base_raw:
         return None
@@ -145,6 +654,38 @@ def resolve_orders_workbook_path() -> Path | None:
     if p.suffix.lower() == ".xlsm":
         return p.with_suffix(".xlsx")
     return p
+
+
+def resolve_pdf_folder_path() -> Path:
+    apply_runtime_settings_from_json()
+    return ensure_base_dir_in_environ() / "email_contents" / "pdf"
+
+
+def open_pdf_folder(parent: tk.Misc) -> None:
+    folder = resolve_pdf_folder_path()
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        messagebox.showerror(
+            "PDF folder",
+            f"Could not create the PDF folder:\n{folder}\n\n{e}",
+            parent=parent,
+        )
+        return
+
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(folder.resolve()))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder.resolve())])
+        else:
+            subprocess.Popen(["xdg-open", str(folder.resolve())])
+    except Exception as e:
+        messagebox.showerror(
+            "PDF folder",
+            f"Could not open the PDF folder:\n{folder}\n\n{e}",
+            parent=parent,
+        )
 
 
 def _ask_debug_run_mode(parent: tk.Tk) -> str | None:
@@ -249,29 +790,6 @@ def _ask_debug_custom_html_import(parent: tk.Tk, custom_dir: Path) -> bool | Non
     return choice[0]
 
 
-def merge_env_keys(env_path: Path, updates: dict[str, str]) -> None:
-    """Insert or replace KEY=value lines; leave all other lines unchanged."""
-    if not updates:
-        return
-    text = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
-    lines = text.splitlines(keepends=False)
-    seen: set[str] = set()
-    out: list[str] = []
-    for line in lines:
-        m = _KEY_LINE.match(line.strip())
-        if m:
-            key = m.group(1)
-            if key in updates:
-                out.append(f"{key}={updates[key]}")
-                seen.add(key)
-                continue
-        out.append(line)
-    for key, val in updates.items():
-        if key not in seen:
-            out.append(f"{key}={val}")
-    env_path.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
-
-
 def _find_workbook_by_path(excel_app, path: str):
     want = str(Path(path).resolve())
     try:
@@ -307,7 +825,7 @@ def focus_or_open_orders_workbook() -> None:
     if target is None:
         messagebox.showerror(
             "Excel",
-            'BASE_DIR is not set.\nOpen Settings, set "Project folder on disk", and click Save.',
+            "Could not resolve the project data folder. Restart the app or check Settings / email_sorter_settings.json.",
         )
         return
     if not target.is_file():
@@ -351,17 +869,20 @@ def focus_or_open_orders_workbook() -> None:
         messagebox.showerror("Excel", f"Could not open file:\n{e}")
 
 
-def prompt_update() -> None:
-    if not messagebox.askyesno(
-        "Update",
-        "Are you sure you want to force update from GitHub?\n\n"
-        "This overwrites local tracked code changes.",
+def prompt_update(parent: tk.Misc) -> None:
+    if not _themed_ask_yes_no(
+        parent,
+        title="Update",
+        message=(
+            "Are you sure you want to force update from GitHub?\n\n"
+            "This overwrites local tracked code changes."
+        ),
     ):
         return
 
     updater = _PYTHON_FILES_DIR / "tools" / "git" / "pull_latest.py"
     if not updater.is_file():
-        messagebox.showerror("Update", f"Update script not found:\n{updater}")
+        _themed_message(parent, title="Update", message=f"Update script not found:\n{updater}", kind="error")
         return
 
     try:
@@ -375,7 +896,7 @@ def prompt_update() -> None:
             creationflags=_subprocess_creationflags(show_console=False),
         )
     except Exception as e:
-        messagebox.showerror("Update", f"Could not start update:\n{e}")
+        _themed_message(parent, title="Update", message=f"Could not start update:\n{e}", kind="error")
         return
 
     details = "\n".join(
@@ -388,7 +909,7 @@ def prompt_update() -> None:
         msg = "Force update completed from GitHub.\nRestart the app to load latest code."
         if details:
             msg += f"\n\n{details}"
-        messagebox.showinfo("Update", msg)
+        _themed_message(parent, title="Update", message=msg)
         return
 
     msg = "Force update failed."
@@ -396,498 +917,293 @@ def prompt_update() -> None:
         msg += f"\n\n{details}"
     else:
         msg += f"\n\nProcess exited with code {result.returncode}."
-    messagebox.showerror("Update", msg)
+    _themed_message(parent, title="Update", message=msg, kind="error")
 
 
-class MitmInitializeWindow:
-    """Step-through MITM education; last step launches capture Chrome + mitmdump."""
-
-    _SLIDES: tuple[dict, ...] = (
-        {
-            "title": "PDF capture and MITM",
-            "body": (
-                "Email Sorter can capture carrier PDFs by running a local HTTPS proxy (mitmproxy) "
-                "and a dedicated Chrome profile. That proxy must decrypt TLS briefly so it can see "
-                "responses — which requires installing mitmproxy’s certificate authority (CA) "
-                "where your browser trusts it.\n\n"
-                "Only proceed if you accept the risk: any software that trusts that CA could be "
-                "fooled by a forged certificate if the CA or its private key were ever misused. "
-                "Use the → arrow (or Next) to read short background articles, then install the CA "
-                "on the last step using the same isolated Chrome this tool uses."
-            ),
-        },
-        {
-            "title": "How mitmproxy works (official)",
-            "body": (
-                "mitmproxy sits between your browser and the internet. For HTTPS it presents "
-                "its own certificate chain signed by its local CA. That is why you must install "
-                "that CA as trusted — otherwise the browser will warn or block the connection."
-            ),
-            "article_url": "https://docs.mitmproxy.org/stable/concepts/how-mitmproxy-works",
-        },
-        {
-            "title": "MITM and SSL/TLS hijacking",
-            "body": (
-                "A man-in-the-middle can decrypt traffic if the client trusts the attacker’s CA. "
-                "Debugging tools do this on purpose on your machine; attackers try to trick you "
-                "into trusting a malicious CA. Understand the parallel before you add a new root."
-            ),
-            "article_url": "https://www.invicti.com/learn/mitm-ssl-hijacking",
-        },
-        {
-            "title": "Trusted root certificates",
-            "body": (
-                "Operating systems and browsers ship with a set of trusted root CAs. Adding "
-                "another root increases what you implicitly trust. Remove or avoid installing "
-                "debugging CAs on machines where you do not need them."
-            ),
-            "article_url": "https://www.threatdown.com/blog/when-you-shouldnt-trust-a-trusted-root-certificate",
-        },
-        {
-            "title": "Before you install",
-            "body": (
-                "1. Install mitmproxy so mitmdump is on your PATH (e.g. pip install mitmproxy).\n"
-                "2. The next step opens https://mitm.it/ inside the same isolated Chrome profile "
-                "used for PDF capture, with mitmdump running — install the mitmproxy CA there so "
-                "HTTPS works for capture.\n"
-                "3. On Windows, you may also install the CA into the system Trusted Root store "
-                "if you need other tools to trust it; the wizard’s last step focuses on "
-                "capture Chrome."
-            ),
-        },
-        {
-            "title": "Install the CA (capture Chrome + mitmdump)",
-            "body": (
-                "Click the button below. Your Python environment will install/update PDF capture "
-                "dependencies (mitmproxy, PyMuPDF, Pillow) from requirements_mitmproxy.txt first; "
-                "then mitmdump starts and isolated Chrome opens https://mitm.it/ — install the "
-                "mitmproxy CA in that browser profile. Close Chrome when you are done; capture "
-                "runs again from the Shipping status window."
-            ),
-            "final_install": True,
-        },
+def _missing_run_config_message(*, require_mail_and_azure: bool) -> str | None:
+    """Return an error message if required Settings/.env values are missing."""
+    apply_runtime_settings_from_json()
+    missing: list[str] = []
+    if require_mail_and_azure:
+        if not (os.getenv("GRAPH_MAIL_FOLDER") or "").strip():
+            missing.append("Mailbox folder (GRAPH_MAIL_FOLDER)")
+        if not (os.getenv("AZURE_CLIENT_ID") or "").strip():
+            missing.append("Azure application client ID (AZURE_CLIENT_ID)")
+    if not (os.getenv("OPENAI_API_KEY") or "").strip():
+        missing.append("OpenAI API key (OPENAI_API_KEY)")
+    if not (os.getenv("SEVENTEEN_TRACK_API_KEY") or "").strip():
+        missing.append("17TRACK API key (SEVENTEEN_TRACK_API_KEY)")
+    if not missing:
+        return None
+    return (
+        "Required configuration is missing:\n\n"
+        + "\n".join(f"  - {m}" for m in missing)
+        + "\n\nFill these in Settings or in python_files/.env as fallback values."
     )
 
-    def __init__(self, parent: tk.Toplevel | tk.Tk) -> None:
-        self._dlg = tk.Toplevel(parent)
-        self._dlg.title("Initialize MITM (PDF capture)")
-        self._dlg.transient(parent)
-        self._dlg.grab_set()
-        self._dlg.minsize(560, 420)
-        self._dlg.geometry("600x480")
 
-        self._idx = 0
-        self._mitm_bg_photo: object | None = None
-        self._mitm_pil_original = None
-        self._outer_win_id: int | None = None
+def _missing_excel_menu_config_message() -> str | None:
+    """Excel workbook refresh (no mailbox fetch): OpenAI + 17TRACK only."""
+    return _missing_run_config_message(require_mail_and_azure=False)
 
-        load_dotenv(_ENV_PATH, override=True)
-        base_raw = (os.getenv("BASE_DIR") or "").strip()
-        bg_candidates: list[Path] = []
-        if base_raw:
-            bg_candidates.append(
-                Path(base_raw).expanduser().resolve() / "assets" / "images" / "shrek.png"
-            )
-        bg_candidates.append(_PYTHON_FILES_DIR / "assets" / "images" / "shrek.png")
-        self._mitm_pil_original = None
+
+def _settings_truthy(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes")
+
+
+class _SettingsSwitch(tk.Frame):
+    """Compact on/off control (IntVar 0/1) for Settings rows."""
+
+    def __init__(self, parent: tk.Misc, variable: tk.IntVar) -> None:
         try:
-            from PIL import Image as _PILImage
-
-            for cand in bg_candidates:
-                if cand.is_file():
-                    self._mitm_pil_original = _PILImage.open(cand).convert("RGB")
-                    break
-        except Exception:
-            self._mitm_pil_original = None
-
-        self._mitm_canvas = tk.Canvas(self._dlg, highlightthickness=0, bg="#ececec")
-        self._mitm_canvas.pack(fill=tk.BOTH, expand=True)
-
-        outer = tk.Frame(self._mitm_canvas, padx=14, pady=12, bg="#ececec")
-        self._outer = outer
-
-        self._counter_lbl = tk.Label(outer, text="", fg="#555", anchor=tk.W, bg="#ececec")
-        self._counter_lbl.pack(fill=tk.X, pady=(0, 4))
-
-        self._title_lbl = tk.Label(
-            outer, text="", font=("", 12, "bold"), anchor=tk.W, justify=tk.LEFT, bg="#ececec"
-        )
-        self._title_lbl.pack(fill=tk.X, pady=(0, 8))
-
-        body_frame = tk.Frame(outer, bg="#ececec")
-        body_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        self._body_text = tk.Text(
-            body_frame,
-            wrap=tk.WORD,
-            height=14,
-            width=68,
-            padx=4,
-            pady=4,
-            relief=tk.FLAT,
+            bg = parent.cget("bg")
+        except tk.TclError:
+            bg = "SystemButtonFace"
+        super().__init__(parent, bg=bg)
+        self._var = variable
+        self._cv = tk.Canvas(
+            self,
+            width=48,
+            height=26,
             highlightthickness=0,
-            cursor="arrow",
-            bg="#fafafa",
-            insertbackground="#222",
-        )
-        self._body_text.pack(fill=tk.BOTH, expand=True)
-
-        self._links_frame = tk.Frame(outer, bg="#ececec")
-
-        self._install_frame = tk.Frame(outer, bg="#ececec")
-        self._install_font = tkfont.Font(size=10, weight="bold", underline=True)
-        self._install_btn = tk.Button(
-            self._install_frame,
-            text="start mitm.it installation 😊",
-            command=self._launch_pdf_capture_helper,
+            bg=bg,
             cursor="hand2",
-            font=self._install_font,
-            bg="#2563eb",
-            fg="#ffffff",
-            activebackground="#1d4ed8",
-            activeforeground="#ffffff",
-            relief=tk.RAISED,
-            bd=2,
-            padx=14,
-            pady=8,
         )
-        self._install_btn.pack(anchor=tk.CENTER)
+        self._cv.pack(side=tk.LEFT)
+        self._var.trace_add("write", lambda *_: self._draw())
+        self._cv.bind("<Button-1>", self._toggle)
+        self._draw()
 
-        self._nav = tk.Frame(outer, bg="#ececec")
-        self._nav.pack(fill=tk.X, pady=(8, 0))
-        self._btn_prev = tk.Button(self._nav, text="← Previous", command=self._prev, cursor="hand2")
-        self._btn_prev.pack(side=tk.LEFT)
-        self._btn_next = tk.Button(self._nav, text="Next →", command=self._next, cursor="hand2")
-        self._btn_next.pack(side=tk.RIGHT)
+    def _toggle(self, _evt: object | None = None) -> None:
+        self._var.set(1 - (1 if self._var.get() else 0))
 
-        self._hint = tk.Frame(outer, bg="#ececec")
-        self._hint.pack(fill=tk.X, pady=(6, 0))
-        self._btn_close = tk.Button(self._hint, text="Close", command=self._dlg.destroy, cursor="hand2")
-        self._btn_close.pack(side=tk.RIGHT)
-
-        for w in (
-            self._dlg,
-            self._mitm_canvas,
-            outer,
-            body_frame,
-            self._body_text,
-            self._title_lbl,
-            self._counter_lbl,
-            self._nav,
-            self._hint,
-            self._links_frame,
-            self._install_frame,
-            self._btn_prev,
-            self._btn_next,
-            self._install_btn,
-            self._btn_close,
-        ):
-            self._apply_arrow_bindings(w)
-
-        self._mitm_canvas.bind("<Configure>", self._mitm_on_canvas_configure)
-
-        self._render()
-        self._dlg.after(50, lambda: self._body_text.focus_set())
-
-    def _mitm_on_canvas_configure(self, event: tk.Event) -> None:
-        w, h = max(event.width, 2), max(event.height, 2)
-
-        self._mitm_canvas.delete("mitm_bg")
-
-        if self._mitm_pil_original is not None and w >= 32 and h >= 32:
-            try:
-                from PIL import Image, ImageTk
-
-                base = Image.new("RGB", (w, h), (236, 236, 236))
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = Image.LANCZOS  # type: ignore[attr-defined]
-                fg = self._mitm_pil_original.resize((w, h), resample).convert("RGB")
-                blended = Image.blend(base, fg, _MITM_WIZARD_BG_OPACITY)
-                self._mitm_bg_photo = ImageTk.PhotoImage(blended)
-                self._mitm_canvas.create_image(
-                    0, 0, anchor=tk.NW, image=self._mitm_bg_photo, tags="mitm_bg"
-                )
-                self._mitm_canvas.tag_lower("mitm_bg")
-            except Exception:
-                self._mitm_bg_photo = None
-
-        # Inset so the blended image stays visible around the panel (Tk frames are opaque).
-        margin = 0.10
-        iw = max(int(w * (1 - 2 * margin)), 260)
-        ih = max(int(h * (1 - 2 * margin)), 200)
-        cx, cy = w // 2, h // 2
-
-        if self._outer_win_id is None:
-            self._outer_win_id = self._mitm_canvas.create_window(
-                cx,
-                cy,
-                window=self._outer,
-                anchor=tk.CENTER,
-                width=iw,
-                height=ih,
-            )
-        else:
-            self._mitm_canvas.coords(self._outer_win_id, cx, cy)
-            self._mitm_canvas.itemconfig(self._outer_win_id, width=iw, height=ih)
-
-        if self._outer_win_id is not None:
-            self._mitm_canvas.tag_raise(self._outer_win_id)
-
-    def _arrow_left(self, _e: tk.Event) -> str | None:
-        self._prev()
-        return "break"
-
-    def _arrow_right(self, _e: tk.Event) -> str | None:
-        self._next()
-        return "break"
-
-    def _apply_arrow_bindings(self, w: tk.Misc) -> None:
-        w.bind("<Left>", self._arrow_left)
-        w.bind("<Right>", self._arrow_right)
-
-    def _spawn_pdf_capture_process(self) -> None:
-        script = _PYTHON_FILES_DIR / "pdfCaptureFromChrome" / "run_pdf_capture.py"
-        cwd = _PYTHON_FILES_DIR / "pdfCaptureFromChrome"
-        if not script.is_file():
-            messagebox.showerror("PDF capture", f"Missing script:\n{script}")
-            return
-        try:
-            subprocess.Popen(
-                [sys.executable, str(script)],
-                cwd=str(cwd),
-            )
-        except OSError as e:
-            messagebox.showerror("PDF capture", f"Could not start:\n{e}")
-
-    def _launch_pdf_capture_helper(self) -> None:
-        script = _PYTHON_FILES_DIR / "pdfCaptureFromChrome" / "run_pdf_capture.py"
-        if not script.is_file():
-            messagebox.showerror("PDF capture", f"Missing script:\n{script}")
-            return
-        if not _PDF_CAPTURE_REQUIREMENTS.is_file():
-            messagebox.showerror(
-                "PDF capture",
-                f"Requirements file not found:\n{_PDF_CAPTURE_REQUIREMENTS}",
-            )
-            return
-
-        busy = tk.Toplevel(self._dlg)
-        busy.title("Installing dependencies")
-        busy.transient(self._dlg)
-        busy.resizable(False, False)
-        tk.Label(
-            busy,
-            text=(
-                "Installing PDF capture dependencies from\n"
-                "pdfCaptureFromChrome/requirements_mitmproxy.txt\n\n"
-                "(mitmproxy, PyMuPDF, Pillow)\n\n"
-                "Please wait — mitm.it opens after this finishes."
-            ),
-            justify=tk.CENTER,
-            padx=20,
-            pady=20,
-        ).pack()
-        busy.update_idletasks()
-        x = self._dlg.winfo_rootx() + (self._dlg.winfo_width() // 2) - (busy.winfo_reqwidth() // 2)
-        y = self._dlg.winfo_rooty() + (self._dlg.winfo_height() // 2) - (busy.winfo_reqheight() // 2)
-        busy.geometry(f"+{x}+{y}")
-
-        self._install_btn.config(state=tk.DISABLED)
-
-        def worker() -> None:
-            err: str | None = None
-            try:
-                run_kw: dict = {
-                    "args": [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        "-r",
-                        str(_PDF_CAPTURE_REQUIREMENTS),
-                    ],
-                    "cwd": str(_PYTHON_FILES_DIR),
-                    "capture_output": True,
-                    "text": True,
-                    "timeout": 900,
-                }
-                if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-                    run_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-                proc = subprocess.run(**run_kw)
-                if proc.returncode != 0:
-                    tail = (proc.stderr or proc.stdout or "").strip()
-                    err = tail[-6000:] if tail else f"pip exited with code {proc.returncode}"
-            except subprocess.TimeoutExpired:
-                err = "pip install timed out (over 15 minutes)."
-            except OSError as e:
-                err = str(e)
-
-            def finish() -> None:
-                try:
-                    busy.destroy()
-                except tk.TclError:
-                    pass
-                self._install_btn.config(state=tk.NORMAL)
-                if err is not None:
-                    messagebox.showerror(
-                        "Dependency install failed",
-                        "Could not install PDF capture dependencies.\n\n" + err,
-                    )
-                    return
-                self._spawn_pdf_capture_process()
-
-            self._dlg.after(0, finish)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _render(self) -> None:
-        slide = self._SLIDES[self._idx]
-        n = len(self._SLIDES)
-        self._counter_lbl.config(text=f"Step {self._idx + 1} of {n}")
-        self._title_lbl.config(text=slide["title"])
-
-        self._body_text.configure(state=tk.NORMAL)
-        self._body_text.delete("1.0", tk.END)
-        self._body_text.insert(tk.END, slide["body"])
-        self._body_text.configure(state=tk.DISABLED)
-
-        for c in self._links_frame.winfo_children():
-            c.destroy()
-
-        article_url = (slide.get("article_url") or "").strip()
-        if article_url:
-            self._links_frame.pack(fill=tk.X, pady=(0, 10), before=self._nav)
-            row = tk.Frame(self._links_frame, bg="#ececec")
-            row.pack(anchor=tk.W, pady=(4, 0))
-            tk.Label(
-                row,
-                text="click here to read an article about it: ",
-                anchor=tk.W,
-                fg="#333",
-                bg="#ececec",
-            ).pack(side=tk.LEFT)
-            url_lbl = tk.Label(
-                row,
-                text=article_url,
-                fg="#0066cc",
-                cursor="hand2",
-                anchor=tk.W,
-                bg="#ececec",
-            )
-            url_lbl.pack(side=tk.LEFT)
-            url_lbl.bind("<Button-1>", lambda e, u=article_url: webbrowser.open(u))
-            self._apply_arrow_bindings(row)
-            self._apply_arrow_bindings(url_lbl)
-        else:
-            self._links_frame.pack_forget()
-
-        if slide.get("final_install"):
-            self._install_frame.pack(fill=tk.X, pady=(0, 12), before=self._nav)
-        else:
-            self._install_frame.pack_forget()
-
-        self._btn_prev.config(state=tk.NORMAL if self._idx > 0 else tk.DISABLED)
-        self._btn_next.config(state=tk.NORMAL if self._idx < n - 1 else tk.DISABLED)
-
-    def _prev(self) -> None:
-        if self._idx > 0:
-            self._idx -= 1
-            self._render()
-
-    def _next(self) -> None:
-        if self._idx < len(self._SLIDES) - 1:
-            self._idx += 1
-            self._render()
+    def _draw(self) -> None:
+        self._cv.delete("all")
+        on = bool(self._var.get())
+        color = THEME["excel_accent"] if on else THEME["track"]
+        self._cv.create_rectangle(2, 6, 46, 20, fill=color, outline="", width=0)
+        cx = 33 if on else 15
+        self._cv.create_oval(cx - 9, 4, cx + 9, 22, fill="#ffffff", outline=THEME["border"], width=1)
 
 
 class SettingsDialog:
+    """Edit required app values; Save writes ``python_files/email_sorter_settings.json``."""
+
     def __init__(self, parent: tk.Tk) -> None:
+        self._saved_ok = False
         self._win = tk.Toplevel(parent)
         self._win.title("Settings")
-        self._win.transient(parent)
-        self._win.grab_set()
-        self._win.minsize(480, 280)
+        self._win.withdraw()
+        self._win.minsize(560, 520)
+        self._win.configure(bg=THEME["bg"])
+        self._win.protocol("WM_DELETE_WINDOW", self._cancel)
 
-        load_dotenv(_ENV_PATH, override=True)
-        mail = (os.getenv("GRAPH_MAIL_FOLDER") or "").strip()
-        base = (os.getenv("BASE_DIR") or "").strip()
+        apply_runtime_settings_from_json()
+        cfg = read_settings_json()
+        mail = (cfg.get("GRAPH_MAIL_FOLDER") or os.getenv("GRAPH_MAIL_FOLDER") or "").strip()
+        azure = (cfg.get("AZURE_CLIENT_ID") or os.getenv("AZURE_CLIENT_ID") or "").strip()
+        tenant = (cfg.get("AZURE_TENANT_ID") or os.getenv("AZURE_TENANT_ID") or "common").strip()
+        oa = (cfg.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+        t17 = (cfg.get("SEVENTEEN_TRACK_API_KEY") or os.getenv("SEVENTEEN_TRACK_API_KEY") or "").strip()
+        dbg = _settings_truthy(cfg.get("DEBUG_MODE") or os.getenv("DEBUG_MODE"))
+        login_next = _settings_truthy(cfg.get("LOGIN_NEW_ACCOUNT_NEXT_RUN"))
 
-        outer = tk.Frame(self._win, padx=16, pady=16)
+        content = self._win
+        outer = tk.Frame(content, padx=18, pady=18, bg=THEME["bg"])
         outer.pack(fill=tk.BOTH, expand=True)
+        label_opts = {"font": _font("body"), "fg": THEME["fg"], "bg": THEME["bg"]}
+        entry_opts = {
+            "font": _font("input"),
+            "fg": THEME["fg"],
+            "bg": THEME["surface"],
+            "insertbackground": THEME["fg"],
+            "relief": tk.FLAT,
+            "highlightthickness": 1,
+            "highlightbackground": THEME["border"],
+            "highlightcolor": THEME["run_accent"],
+        }
 
+        r = 0
         tk.Label(
             outer,
             text="Mailbox folder name (GRAPH_MAIL_FOLDER)",
             anchor=tk.W,
-        ).grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
-        self._mail = tk.Entry(outer, width=64)
-        self._mail.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 12))
+            **label_opts,
+        ).grid(
+            row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 4)
+        )
+        self._mail = tk.Entry(outer, width=64, **entry_opts)
+        self._mail.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
         self._mail.insert(0, mail)
+        r += 2
 
+        self._debug = tk.IntVar(value=1 if dbg else 0)
+        dbg_row = tk.Frame(outer, bg=THEME["bg"])
+        dbg_row.grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        _SettingsSwitch(dbg_row, self._debug).pack(side=tk.LEFT)
         tk.Label(
-            outer,
-            text="Project folder on disk (BASE_DIR)",
+            dbg_row,
+            text="Detailed debug logs and extra UI (DEBUG_MODE)",
             anchor=tk.W,
-        ).grid(row=2, column=0, sticky=tk.W, pady=(0, 4))
-        self._base = tk.Entry(outer, width=64)
-        self._base.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(0, 12))
-        self._base.insert(0, base)
+            **label_opts,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        r += 1
+
+        self._login_next = tk.IntVar(value=1 if login_next else 0)
+        login_row = tk.Frame(outer, bg=THEME["bg"])
+        login_row.grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        _SettingsSwitch(login_row, self._login_next).pack(side=tk.LEFT)
+        tk.Label(
+            login_row,
+            text="Login to new account on next run (clears saved Microsoft sign-in)",
+            anchor=tk.W,
+            **label_opts,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        r += 1
 
         tk.Label(
             outer,
-            text="Initialize MITM (for capturing tracking PDF documents from (UPS, FEDEX, etc.))",
+            text="Azure application (client) ID (AZURE_CLIENT_ID)",
+            anchor=tk.W,
+            **label_opts,
+        ).grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        self._azure = tk.Entry(outer, width=64, **entry_opts)
+        self._azure.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
+        self._azure.insert(0, azure)
+        r += 2
+
+        tk.Label(
+            outer,
+            text="Microsoft login tenant (AZURE_TENANT_ID)",
+            anchor=tk.W,
+            **label_opts,
+        ).grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        self._tenant = tk.Entry(outer, width=64, **entry_opts)
+        self._tenant.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 4))
+        self._tenant.insert(0, tenant)
+        tk.Label(
+            outer,
+            text="Use consumers for Outlook.com; use common if you need both personal and work/school accounts.",
             anchor=tk.W,
             wraplength=520,
             justify=tk.LEFT,
-        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+            fg=THEME["muted"],
+            bg=THEME["bg"],
+            font=_font("body"),
+        ).grid(row=r + 2, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        r += 3
 
-        tk.Button(
+        tk.Label(
             outer,
-            text="Begin",
-            command=lambda: MitmInitializeWindow(self._win),
-            cursor="hand2",
-        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(0, 12))
+            text="OpenAI API key (OPENAI_API_KEY)",
+            anchor=tk.W,
+            **label_opts,
+        ).grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        self._openai = tk.Entry(outer, width=64, **entry_opts)
+        self._openai.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
+        self._openai.insert(0, oa)
+        r += 2
 
-        btn_row = tk.Frame(outer)
-        btn_row.grid(row=6, column=0, columnspan=2, sticky=tk.E)
-        tk.Button(btn_row, text="Cancel", command=self._win.destroy).pack(
-            side=tk.RIGHT, padx=(8, 0)
-        )
-        tk.Button(btn_row, text="Save", command=self._save).pack(side=tk.RIGHT)
+        tk.Label(
+            outer,
+            text="17TRACK API key (SEVENTEEN_TRACK_API_KEY)",
+            anchor=tk.W,
+            **label_opts,
+        ).grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
+        self._track = tk.Entry(outer, width=64, **entry_opts)
+        self._track.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
+        self._track.insert(0, t17)
+        r += 2
+
+        btn_row = tk.Frame(outer, bg=THEME["bg"])
+        btn_row.grid(row=r, column=0, columnspan=2, sticky=tk.E)
+        _make_button(
+            btn_row,
+            text="Cancel",
+            command=self._cancel,
+            bg=_DANGER_BG,
+            active_bg=_DANGER_ACTIVE_BG,
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        _make_button(
+            btn_row,
+            text="Save",
+            command=self._save,
+            bg=THEME["excel_accent"],
+            active_bg=THEME["excel_accent_dim"],
+        ).pack(side=tk.RIGHT)
 
         outer.grid_columnconfigure(0, weight=1)
+        self._win.update_idletasks()
+        self._win.geometry(
+            f"{max(590, outer.winfo_reqwidth() + 4)}x{outer.winfo_reqheight() + 8}"
+        )
+        try:
+            self._win.transient(parent.winfo_toplevel())
+        except tk.TclError:
+            pass
+        _center_window(self._win, parent)
+        def focus_first_field() -> None:
+            try:
+                if self._win.winfo_exists():
+                    self._mail.focus_force()
+                    self._mail.icursor(tk.END)
+            except tk.TclError:
+                pass
+
+        try:
+            self._win.deiconify()
+            self._win.lift(parent.winfo_toplevel())
+            self._win.after(50, focus_first_field)
+        except tk.TclError:
+            pass
+
+    def _cancel(self) -> None:
+        self._win.destroy()
 
     def _save(self) -> None:
-        mail_new = self._mail.get().strip()
-        base_new = self._base.get().strip()
-        updates: dict[str, str] = {}
-        if mail_new:
-            updates["GRAPH_MAIL_FOLDER"] = mail_new
-        if base_new:
-            updates["BASE_DIR"] = base_new
-        if not updates:
-            messagebox.showinfo("Settings", "No changes to save (both fields were blank).")
-            self._win.destroy()
-            return
+        mail = self._mail.get().strip()
+        azure = self._azure.get().strip()
+        tenant = self._tenant.get().strip()
+        oa = self._openai.get().strip()
+        t17 = self._track.get().strip()
+
+        updates = {
+            "GRAPH_MAIL_FOLDER": mail,
+            "AZURE_CLIENT_ID": azure,
+            "AZURE_TENANT_ID": tenant,
+            "OPENAI_API_KEY": oa,
+            "SEVENTEEN_TRACK_API_KEY": t17,
+            "DEBUG_MODE": "1" if self._debug.get() else "0",
+            "LOGIN_NEW_ACCOUNT_NEXT_RUN": "1" if self._login_next.get() else "0",
+        }
         try:
-            if not _ENV_PATH.is_file():
-                _ENV_PATH.write_text("", encoding="utf-8")
-            merge_env_keys(_ENV_PATH, updates)
-            load_dotenv(_ENV_PATH, override=True)
+            write_settings_json(updates)
+            apply_runtime_settings_from_json()
         except OSError as e:
-            messagebox.showerror("Settings", f"Could not write .env:\n{e}")
+            _themed_message(self._win, title="Settings", message=f"Could not save settings:\n{e}", kind="error")
             return
-        messagebox.showinfo("Settings", "Saved.")
+        self._saved_ok = True
+        _themed_message(self._win, title="Settings", message="Saved.")
         self._win.destroy()
 
 
 def main() -> None:
     root = tk.Tk()
     root.title("Email Sorter")
+    _set_app_icon(root)
     root.configure(bg=THEME["bg"])
-    root.minsize(360, 500)
-    root.geometry("420x560")
+    apply_runtime_settings_from_json()
+    root.minsize(360, 535)
+    root.geometry("420x595")
+    if sys.platform == "win32":
+        # Windows taskbar integration is unreliable for overrideredirect root
+        # windows. Keep the main menu native so Explorer always has a real app
+        # button.
+        app = tk.Frame(root, bg=THEME["bg"], highlightthickness=0)
+        app.pack(fill=tk.BOTH, expand=True)
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+    else:
+        app = _apply_frameless_window(root, title="Email Sorter", on_close=root.destroy)
 
     title_font = tkfont.Font(family="Segoe UI", size=18, weight="bold")
     btn_font = tkfont.Font(family="Segoe UI", size=14, weight="bold")
@@ -903,7 +1219,7 @@ def main() -> None:
     }
 
     tk.Label(
-        root,
+        app,
         text="Welcome to Email Sorter",
         font=title_font,
         fg=THEME["fg"],
@@ -911,7 +1227,7 @@ def main() -> None:
         pady=20,
     ).pack()
 
-    inner = tk.Frame(root, padx=28, pady=8, bg=THEME["bg"])
+    inner = tk.Frame(app, padx=28, pady=8, bg=THEME["bg"])
     inner.pack(fill=tk.BOTH, expand=True)
 
     run_in_progress = False
@@ -928,11 +1244,19 @@ def main() -> None:
                 "Wait until Run finishes before opening the workbook in Excel.",
             )
             return
+        ex_err = _missing_excel_menu_config_message()
+        if ex_err:
+            messagebox.showerror(
+                "Excel — configuration required",
+                ex_err + "\n\nUse Settings to save the required values.",
+                parent=root,
+            )
+            return
         target = resolve_orders_workbook_path()
         if target is None:
             messagebox.showerror(
                 "Excel",
-                'BASE_DIR is not set.\nOpen Settings, set "Project folder on disk", and click Save.',
+                "Could not resolve the project data folder. Restart the app or check Settings / email_sorter_settings.json.",
             )
             return
         if orders_workbook_open_in_excel(target):
@@ -952,7 +1276,7 @@ def main() -> None:
             return
 
         excel_btn.config(state=tk.DISABLED)
-        load_dotenv(_ENV_PATH, override=True)
+        apply_runtime_settings_from_json()
         show_console = _env_debug_enabled()
 
         proc_holder: list[subprocess.Popen | None] = [None]
@@ -984,10 +1308,12 @@ def main() -> None:
 
         line_q: queue.Queue[tuple[str, object]] = queue.Queue()
         done_flag = [False]
+        excel_log_tail: deque[str] = deque(maxlen=40)
 
         def read_thread() -> None:
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
             env["EXCEL_LAUNCHER_PROGRESS"] = "1"
             env["EMAIL_SORTER_17TRACK_QUOTA_SESSION"] = "1"
             env["EMAIL_SORTER_17TRACK_SKIP_FLAG"] = skip17_flag_path
@@ -1000,6 +1326,8 @@ def main() -> None:
                     "stderr": subprocess.STDOUT,
                     "stdin": subprocess.DEVNULL,
                     "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
                 }
                 cf = _subprocess_creationflags(show_console=False)
                 if cf:
@@ -1014,7 +1342,13 @@ def main() -> None:
             except Exception as e:
                 line_q.put(("err", str(e)))
 
-        def finish_excel(stopped: bool, err_msg: str | None, code: int | None) -> None:
+        def finish_excel(
+            stopped: bool,
+            err_msg: str | None,
+            code: int | None,
+            *,
+            log_tail: list[str] | None = None,
+        ) -> None:
             try:
                 Path(skip17_flag_path).unlink(missing_ok=True)
             except OSError:
@@ -1033,8 +1367,14 @@ def main() -> None:
                     component="excel",
                     exit_code=None,
                     err_msg=err_msg,
+                    log_tail="\n".join(log_tail) if log_tail else None,
                 )
                 detail = "Could not update the orders workbook before opening.\n\n" + err_msg
+                if log_tail:
+                    tail = "\n".join(log_tail).strip()
+                    if len(tail) > 4000:
+                        tail = tail[-4000:]
+                    detail = f"{detail}\n\nRecent output:\n{tail}"
                 if show_console:
                     win.prepare_error_review_mode(
                         status_message=(
@@ -1057,8 +1397,14 @@ def main() -> None:
                     component="excel",
                     exit_code=int(code),
                     err_msg=f"Excel rebuild subprocess failed (exit code {code})",
+                    log_tail="\n".join(log_tail) if log_tail else None,
                 )
                 brief = f"Rebuild failed (exit code {code})."
+                if log_tail:
+                    tail = "\n".join(log_tail).strip()
+                    if len(tail) > 4000:
+                        tail = tail[-4000:]
+                    brief = f"{brief}\n\nRecent output:\n{tail}"
                 if show_console:
                     win.prepare_error_review_mode(
                         status_message=(
@@ -1091,19 +1437,41 @@ def main() -> None:
                         if parsed:
                             pct, msg = parsed
                             win.set_progress(pct, msg or None)
+                        else:
+                            one = line.rstrip("\n\r")
+                            if one.strip():
+                                excel_log_tail.append(one[-800:])
                         if show_console:
                             win.append_log(line)
                     elif kind == "code":
                         done_flag[0] = True
                         stopped = win.stop_requested
                         c = int(payload)
-                        root.after(0, lambda s=stopped, c=c: finish_excel(s, None, c))
+                        tail = list(excel_log_tail)
+                        root.after(
+                            0,
+                            lambda s=stopped, c=c, t=tail: finish_excel(
+                                s,
+                                None,
+                                c,
+                                log_tail=t,
+                            ),
+                        )
                         return
                     elif kind == "err":
                         done_flag[0] = True
                         stopped = win.stop_requested
                         msg = str(payload)
-                        root.after(0, lambda s=stopped, m=msg: finish_excel(s, m, None))
+                        tail = list(excel_log_tail)
+                        root.after(
+                            0,
+                            lambda s=stopped, m=msg, t=tail: finish_excel(
+                                s,
+                                m,
+                                None,
+                                log_tail=t,
+                            ),
+                        )
                         return
             except queue.Empty:
                 pass
@@ -1129,7 +1497,7 @@ def main() -> None:
             )
             return
 
-        load_dotenv(_ENV_PATH, override=True)
+        apply_runtime_settings_from_json()
         rebuild_helper = _PYTHON_FILES_DIR / "launcher_rebuild_excel.py"
         is_excel_rebuild_only = False
 
@@ -1140,12 +1508,9 @@ def main() -> None:
             if mode == "full":
                 run_args = [sys.executable, str(script)]
             else:
+                ensure_base_dir_in_environ()
                 base_raw = (os.getenv("BASE_DIR") or "").strip()
-                custom_dir = (
-                    Path(base_raw).expanduser().resolve() / "custom_import_html_files"
-                    if base_raw
-                    else Path("(set BASE_DIR in Settings)") / "custom_import_html_files"
-                )
+                custom_dir = Path(base_raw).expanduser().resolve() / "custom_import_html_files"
                 sub = _ask_debug_custom_html_import(root, custom_dir)
                 if sub is None:
                     return
@@ -1162,13 +1527,40 @@ def main() -> None:
                     if target_wb is None:
                         messagebox.showerror(
                             "Run",
-                            'BASE_DIR is not set.\nOpen Settings, set "Project folder on disk", and click Save.',
+                            "Could not resolve the orders workbook path. Restart the app or check Settings / email_sorter_settings.json.",
                         )
                         return
                     is_excel_rebuild_only = True
                     run_args = [sys.executable, str(rebuild_helper), str(target_wb.resolve())]
         else:
             run_args = [sys.executable, str(script)]
+
+        cfg_err = _missing_run_config_message(require_mail_and_azure=not is_excel_rebuild_only)
+        if cfg_err:
+            title = "Run — configuration required"
+            if is_excel_rebuild_only:
+                title = "Run (Excel-only) — configuration required"
+            messagebox.showerror(
+                title,
+                cfg_err + "\n\nUse Settings to save the required values.",
+                parent=root,
+            )
+            return
+
+        apply_runtime_settings_from_json()
+        if _settings_truthy(os.getenv("LOGIN_NEW_ACCOUNT_NEXT_RUN")):
+            try:
+                (_PYTHON_FILES_DIR / ".graph_token_cache.bin").unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                merged = read_settings_for_write_merge()
+                merged["LOGIN_NEW_ACCOUNT_NEXT_RUN"] = "0"
+                write_settings_json(merged)
+            except (OSError, ValueError):
+                os.environ["LOGIN_NEW_ACCOUNT_NEXT_RUN"] = "0"
+            else:
+                apply_runtime_settings_from_json()
 
         run_in_progress = True
         set_pipeline_ui_busy(True)
@@ -1217,6 +1609,7 @@ def main() -> None:
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         env["EMAIL_SORTER_17TRACK_QUOTA_SESSION"] = "1"
         if is_excel_rebuild_only:
             env["EXCEL_LAUNCHER_PROGRESS"] = "1"
@@ -1239,6 +1632,8 @@ def main() -> None:
                     "stderr": subprocess.STDOUT,
                     "stdin": subprocess.DEVNULL,
                     "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
                 }
                 cf = _subprocess_creationflags(show_console=False)
                 if cf:
@@ -1430,10 +1825,14 @@ def main() -> None:
         command=on_run,
         **common_btn,
     )
+    _add_button_hover(run_btn, normal_bg=THEME["run_accent"], hover_bg="#60a5fa")
     run_btn.pack(fill=tk.X, **pad)
 
+    excel_row = tk.Frame(inner, bg=THEME["bg"])
+    excel_row.pack(fill=tk.X, **pad)
+
     excel_btn = tk.Button(
-        inner,
+        excel_row,
         text="Excel",
         bg=THEME["excel_accent"],
         fg="#ffffff",
@@ -1442,20 +1841,44 @@ def main() -> None:
         command=on_excel,
         **common_btn,
     )
-    excel_btn.pack(fill=tk.X, **pad)
+    _add_button_hover(excel_btn, normal_bg=THEME["excel_accent"], hover_bg="#4ade80")
+    excel_btn.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    tk.Button(
+    tk.Frame(excel_row, bg=THEME["run_accent_dim"], width=2).pack(side=tk.LEFT, fill=tk.Y)
+
+    pdf_folder_icon = _make_file_explorer_icon(root)
+    pdf_folder_btn = tk.Button(
+        excel_row,
+        image=pdf_folder_icon,
+        bg=THEME["excel_accent"],
+        activebackground=THEME["excel_accent_dim"],
+        relief=tk.FLAT,
+        bd=0,
+        highlightthickness=0,
+        width=64,
+        height=54,
+        cursor="hand2",
+        command=lambda: open_pdf_folder(root),
+    )
+    pdf_folder_btn.image = pdf_folder_icon  # type: ignore[attr-defined]
+    _add_button_hover(pdf_folder_btn, normal_bg=THEME["excel_accent"], hover_bg="#4ade80")
+    _attach_tooltip(pdf_folder_btn, "Open PDF folder")
+    pdf_folder_btn.pack(side=tk.LEFT, fill=tk.Y)
+
+    update_btn = tk.Button(
         inner,
         text="Update",
-        bg="#f59e0b",
+        bg=_UPDATE_BG,
         fg="#0f1117",
-        activebackground="#d97706",
+        activebackground=_UPDATE_ACTIVE_BG,
         activeforeground="#0f1117",
-        command=prompt_update,
+        command=lambda: prompt_update(root),
         **common_btn,
-    ).pack(fill=tk.X, **pad)
+    )
+    _add_button_hover(update_btn, normal_bg=_UPDATE_BG, hover_bg="#fbbf24")
+    update_btn.pack(fill=tk.X, **pad)
 
-    tk.Button(
+    settings_btn = tk.Button(
         inner,
         text="Settings",
         bg=THEME["surface"],
@@ -1467,9 +1890,11 @@ def main() -> None:
         highlightcolor=THEME["border"],
         command=lambda: SettingsDialog(root),
         **common_btn,
-    ).pack(fill=tk.X, **pad)
+    )
+    _add_button_hover(settings_btn, normal_bg=THEME["surface"], hover_bg=THEME["track"])
+    settings_btn.pack(fill=tk.X, **pad)
 
-    tk.Button(
+    exit_btn = tk.Button(
         inner,
         text="Exit",
         bg=THEME["stop_fg"],
@@ -1478,7 +1903,9 @@ def main() -> None:
         activeforeground="#ffffff",
         command=root.destroy,
         **common_btn,
-    ).pack(fill=tk.X, **pad)
+    )
+    _add_button_hover(exit_btn, normal_bg=THEME["stop_fg"], hover_bg="#ff6b66")
+    exit_btn.pack(fill=tk.X, **pad)
 
     root.mainloop()
 

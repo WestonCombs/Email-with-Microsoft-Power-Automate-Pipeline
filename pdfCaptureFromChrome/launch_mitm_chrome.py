@@ -4,7 +4,7 @@ Launch Google Chrome in an isolated profile for mitmproxy capture.
 Uses ``--user-data-dir`` under ``<BASE_DIR>/logs/pdfCaptureFromChrome`` and
 ``--proxy-server`` for this process only.
 
-Typical use is via ``run_pdf_capture.py`` (starts mitmdump first).
+Typical use is via ``BASE_DIR/mitm_pdf_capture/run_pdf_capture.py`` (starts mitmdump first).
 
     python run_pdf_capture.py
 """
@@ -18,14 +18,24 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from paths import (  # noqa: E402
-    CHROME_USER_DATA_MITM,
-    DEFAULT_START_URL,
-    PDF_CAPTURE_SESSION_LOG,
-    PDF_CAPTURE_ROOT,
-    ensure_import_path,
-    normalize_start_url,
-)
+try:
+    from .paths import (  # type: ignore[import-not-found]
+        CHROME_USER_DATA_MITM,
+        DEFAULT_START_URL,
+        PDF_CAPTURE_SESSION_LOG,
+        PDF_CAPTURE_ROOT,
+        ensure_import_path,
+        normalize_start_url,
+    )
+except ImportError:
+    from paths import (  # type: ignore[no-redef]  # noqa: E402
+        CHROME_USER_DATA_MITM,
+        DEFAULT_START_URL,
+        PDF_CAPTURE_SESSION_LOG,
+        PDF_CAPTURE_ROOT,
+        ensure_import_path,
+        normalize_start_url,
+    )
 
 ensure_import_path()
 
@@ -33,7 +43,7 @@ _CAPTURE_LOG = PDF_CAPTURE_SESSION_LOG
 
 
 def _append_capture_log(message: str) -> None:
-    """Same file as ``run_pdf_capture._log_session`` — stderr is invisible when the viewer detaches the console."""
+    """Same file as ``mitm_pdf_capture/run_pdf_capture`` session log — stderr is invisible when the viewer detaches the console."""
     try:
         with open(_CAPTURE_LOG, "a", encoding="utf-8", newline="\n") as f:
             f.write(f"{datetime.now().isoformat(timespec='seconds')} [launch_chrome] {message}\n")
@@ -54,6 +64,11 @@ def _find_chrome_exe() -> Path | None:
         if p.is_file():
             return p
     return None
+
+
+def find_chrome_executable() -> Path | None:
+    """Path to ``chrome.exe`` for readiness checks and optional overrides."""
+    return _find_chrome_exe()
 
 
 def launch_isolated_chrome(
@@ -101,6 +116,52 @@ def launch_isolated_chrome(
         msg = f"Failed to start Chrome: {e}"
         _append_capture_log(msg)
         print(msg, file=sys.stderr)
+        return None
+
+
+def launch_isolated_chrome_no_proxy(
+    chrome_path: Path | None = None,
+    *,
+    start_url: str = "about:blank",
+    remote_debugging_port: int,
+    verbose: bool = False,
+) -> subprocess.Popen | None:
+    """
+    Isolated profile Chrome **without** mitmproxy. Used by HtmlCaptureController (Ctrl+Enter PDF snapshot).
+    Reuses the same user-data dir as the MITM launcher for shared CA / cookies.
+    """
+    chrome = chrome_path or _find_chrome_exe()
+    if not chrome:
+        msg = "Could not find chrome.exe. Install Google Chrome or pass a chrome path."
+        _append_capture_log(msg)
+        if verbose:
+            print(msg, file=sys.stderr)
+        return None
+
+    CHROME_USER_DATA_MITM.mkdir(parents=True, exist_ok=True)
+
+    args: list[object] = [
+        str(chrome),
+        f"--user-data-dir={CHROME_USER_DATA_MITM.resolve()}",
+        f"--remote-debugging-port={remote_debugging_port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--disable-background-mode",
+        start_url,
+    ]
+    if verbose:
+        _append_capture_log(
+            f"no_proxy: remote-debugging-port={remote_debugging_port} start_url={start_url!r}"
+        )
+    try:
+        return subprocess.Popen([str(x) for x in args], cwd=PDF_CAPTURE_ROOT)
+    except OSError as e:
+        msg = f"Failed to start Chrome (no proxy): {e}"
+        _append_capture_log(msg)
+        if verbose:
+            print(msg, file=sys.stderr)
         return None
 
 

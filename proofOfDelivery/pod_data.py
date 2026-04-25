@@ -18,12 +18,9 @@ PROOF_OF_DELIVERY_JSON_NAME = "proof_of_delivery.json"
 
 
 def project_root_from_env() -> Path:
-    base_raw = (os.getenv("BASE_DIR") or "").strip()
-    if not base_raw:
-        raise ValueError(
-            'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
-        )
-    return Path(base_raw).expanduser().resolve()
+    from shared.project_paths import ensure_base_dir_in_environ
+
+    return ensure_base_dir_in_environ()
 
 
 def results_json_path(project_root: Path) -> Path:
