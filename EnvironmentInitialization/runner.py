@@ -1,15 +1,11 @@
-"""Entry point for Power Automate: load BASE_DIR (from ``python_files/.env``, set via Email Sorter → Settings), then run the verification checklist below."""
+"""Entry point for Power Automate: apply Settings-backed config, then run the verification checklist below."""
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
-_ENV_PATH = _PYTHON_FILES_DIR / ".env"
-BASE_DIR_ENV = "BASE_DIR"
-
 sys.path.insert(0, str(_PYTHON_FILES_DIR))
 
 
@@ -34,21 +30,14 @@ def _run_verifications(root: Path) -> None:
 
 def main() -> int:
     import time
-    from dotenv import load_dotenv
+    from shared.settings_store import apply_runtime_settings_from_json
 
-    load_dotenv(_ENV_PATH)
+    apply_runtime_settings_from_json()
 
     from shared import runLogger as RL
+    from shared.project_paths import ensure_base_dir_in_environ
 
-    base_raw = os.getenv(BASE_DIR_ENV)
-    if not base_raw:
-        print(
-            f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
-            file=sys.stderr,
-        )
-        return 1
-
-    root = Path(base_raw).expanduser().resolve()
+    root = ensure_base_dir_in_environ()
 
     t = time.perf_counter()
     try:

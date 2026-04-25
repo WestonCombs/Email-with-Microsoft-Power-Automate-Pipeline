@@ -1,17 +1,17 @@
-Copy Path -> clipboard (automated on Windows)
-=============================================
+Open File Location -> File Explorer /select (automated on Windows)
+===================================================================
 
 Minimal test workbook
-----------------------
+---------------------
 
 To verify VBA + ini + Python without the full orders sheet, run (from python_files):
 
   python createExcelDocument/create_clipboard_test_xlsm.py
 
-That writes `email_contents/clipboard_test.xlsm`. Copy Path uses an in-workbook `#` link
-so Excel does not open a file; the real `file:///…` URI is in hidden column **AB** (28).
-Enable macros, click the blue **Copy Path** in B2; the clipboard should hold the ini’s
-Windows path (decoded), and Notepad should not open.
+That writes `email_contents/clipboard_test.xlsm`. Open File Location uses an in-workbook `#` link
+so Excel does not open a file; the real `file:///…` URI is in hidden column **AC** (29).
+Enable macros, click the blue **Open File Location** in B2; File Explorer should open with
+that file selected (the ini path used for the test).
 
 What runs automatically
 -----------------------
@@ -36,23 +36,23 @@ On **Windows**, when you run createExcelDocument (or the full pipeline):
    Override with `EXCEL_CLIPBOARD_INI_PATH` in `.env`.
 
 3. The workbook is saved as **`orders.xlsm`** (under `email_contents` by default) when
-   the template exists. Copy Path cells use **in-workbook `#` hyperlinks** only; the real
-   `file:///…` path is in hidden column **AB** (28).
+   the template exists. Open File Location cells use **in-workbook `#` hyperlinks** only; the real
+   `file:///…` path is in hidden column **AC** (29).
 
 4. **Tracking links (long URLs):** Up to **15** URLs per row from JSON ``tracking_links`` are stored in
-   **hidden** columns **AC** through **AQ** (29…43). There are no per-link cells in the visible grid;
+   **hidden** columns **AD** through **AR** (30…44). There are no per-link cells in the visible grid;
    use **View Link List** (below) to open them.
 
-   **Unhide URL columns (optional):** Select **AC:AQ** in the **Name Box**, press Enter, then
+   **Unhide URL columns (optional):** Select **AD:AR** in the **Name Box**, press Enter, then
    right‑click → **Unhide** if you want to inspect raw URLs in Excel.
 
 5. **View Link List:** When a row has tracking URLs, the **View Link List** cell is a `#` in-sheet link; VBA
-   collects AC–AQ for that row, writes a temp UTF-8 `.txt` (one URL per line) and a matching
+   collects AD–AR for that row, writes a temp UTF-8 `.txt` (one URL per line) and a matching
    `.ctx.tsv` with **Company**, **Order Number**, **Category**, etc. from that row, then runs
    `VIEWER=` from the ini **without showing a console window**. The **tracking link viewer** is a
    small grid (**#**, **Item**, **Description**, **Tracking link**): **single-click** expands the full
    URL in the last column; **double-click** opens the URL in your browser. Optional **Describe with
-   OpenAI** uses `OPENAI_API_KEY` from `.env` (override model with `TRACKING_VIEWER_OPENAI_MODEL`).
+   OpenAI** uses `OPENAI_API_KEY` from the environment (set via Email Sorter Settings → `email_sorter_settings.json`; override model with `TRACKING_VIEWER_OPENAI_MODEL`).
 
 You do **not** need to paste VBA by hand for normal use.
 
@@ -68,12 +68,11 @@ If auto-build fails (Excel missing, COM error, Group Policy blocks VBOM), the sc
 falls back to **`orders.xlsx`** only when no valid macro template is available. With a working
 template in `email_contents`, normal runs write **`orders.xlsm`**.
 
-Clipboard helper
-----------------
+Open File Location helper
+-------------------------
 
-Install **pyperclip** (included in `requirements.txt`):
-
-  pip install pyperclip
+`copy_email_path_to_clipboard.py` decodes the `file:///…` URI and runs **`explorer.exe /select,<path>`**
+(no extra Python packages for that step).
 
 Trust macros when you open `orders.xlsm` the first time (or use a Trusted Location).
 
@@ -83,7 +82,7 @@ Updating the embedded macro after a code change
 The VBA lives inside `orders_template.xlsm`. After pulling a fix, delete
 `email_contents/orders_template.xlsm` once and run createExcelDocument so Excel
 automation rebuilds it from `macro_template.py` (or paste the latest `THISWORKBOOK_VBA`
-into ThisWorkbook). This is required after VBA changes so **Copy Path** and **View Link List**
+into ThisWorkbook). This is required after VBA changes so **Open File Location** and **View Link List**
 keep working; the generated `orders.xlsm` keeps whatever VBA was in the template when
 it was loaded.
 

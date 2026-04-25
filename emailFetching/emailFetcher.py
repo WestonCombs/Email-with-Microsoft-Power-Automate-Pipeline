@@ -164,6 +164,8 @@ def fetch_emails(
     auth_flow: str = "interactive",
     token_cache_path: Path | None = None,
     force_full_graph_auth: bool = False,
+    cancel_check=None,
+    base_dir: Path | None = None,
 ):
     """Fetch every message in *mail_folder* using Microsoft Graph (see ``ms_graph_fetcher``)."""
     from . import ms_graph_fetcher
@@ -176,4 +178,6 @@ def fetch_emails(
         auth_flow=auth_flow,
         token_cache_path=token_cache_path,
         force_full_graph_auth=force_full_graph_auth,
+        cancel_check=cancel_check,
+        base_dir=base_dir,
     )

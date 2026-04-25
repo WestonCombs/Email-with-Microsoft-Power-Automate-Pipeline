@@ -5,7 +5,7 @@ Usage:
     python mainRunner.py --skip-email-fetch
     python mainRunner.py --custom-import-html
 
-Reads Microsoft Graph / OpenAI settings from ``python_files/.env`` (set ``BASE_DIR`` in Email Sorter → Settings — it is saved there), then:
+Reads Settings values first, with ``python_files/.env`` used only as an optional fallback for blank Settings fields, then:
   1. Runs environment initialization (folder/file verification)
   2. Fetches all emails from the configured mailbox folder (Microsoft Graph, OAuth 2.0),
      unless ``--skip-email-fetch`` (reprocess HTML already under ``email_contents/html/``
@@ -35,6 +35,10 @@ _PYTHON_FILES_DIR = Path(__file__).resolve().parent
 _MIN_PYTHON = (3, 9)
 _REQUIREMENTS_FILE = _PYTHON_FILES_DIR / "requirements.txt"
 
+from shared.stdio_utf8 import configure_stdio_utf8, console_safe_text
+
+configure_stdio_utf8()
+
 
 def _parse_requirement_lines(req_path: Path) -> list[str]:
     lines: list[str] = []
@@ -50,7 +54,7 @@ def _parse_requirement_lines(req_path: Path) -> list[str]:
 
 def _requirements_satisfied_fallback() -> bool:
     """If packaging is unavailable, verify the usual project imports exist."""
-    for mod in ("bs4", "dotenv", "openpyxl", "openai", "msal"):
+    for mod in ("bs4", "openpyxl", "openai", "msal"):
         try:
             __import__(mod)
         except ImportError:
@@ -100,10 +104,10 @@ def _pip_available() -> bool:
 def _record_runtime_error_and_exit(code: int, summary: str) -> None:
     """Log runtime/bootstrap errors to program_errors when possible, then exit."""
     try:
-        from dotenv import load_dotenv
+        from shared.settings_store import apply_runtime_settings_from_json
 
-        load_dotenv(_PYTHON_FILES_DIR / ".env")
-    except ImportError:
+        apply_runtime_settings_from_json()
+    except Exception:
         pass
     try:
         from shared import runLogger as _RL
@@ -153,13 +157,6 @@ def _ensure_runtime_ready() -> None:
     elif not _requirements_satisfied(_REQUIREMENTS_FILE):
         _run_pip_install()
 
-    _env_path = _PYTHON_FILES_DIR / ".env"
-    if not _env_path.is_file():
-        print(
-            f"WARNING: {_env_path.name} not found. Copy .env.example to .env, then set the project folder in Email Sorter → Settings and other keys as needed.",
-            file=sys.stderr,
-        )
-
 
 def _run_pip_install() -> None:
     """Install packages from requirements.txt (caller verified file exists and deps missing)."""
@@ -199,11 +196,19 @@ def _run_pip_install() -> None:
 if __name__ == "__main__":
     _ensure_runtime_ready()
 
-from dotenv import load_dotenv
+from shared.settings_store import apply_runtime_settings_from_json
 
-load_dotenv(_PYTHON_FILES_DIR / ".env")
+apply_runtime_settings_from_json()
 
 from shared import runLogger as RL
+from shared.cancel_control import (
+    CancelRequestedError,
+    clear_cancel_request,
+    ensure_not_cancelled,
+    is_cancel_requested,
+    run_subprocess_cancellable,
+)
+from shared.output_audit import audit_email_outputs
 from emailFetching.emailFetcher import (
     extract_email,
     extract_sender_name,
@@ -220,16 +225,15 @@ def _fatal(code: int, summary: str) -> None:
 
 
 def _warn(message: str, *, segment: str = "timing") -> None:
-    print(f"  WARNING: {message}")
+    print(f"  WARNING: {console_safe_text(message)}")
     RL.log(segment, f"{RL.ts()}  WARNING: {message}")
 
 
 def _nonfatal_error(message: str, *, segment: str = "timing") -> None:
-    print(f"  ERROR: {message}")
+    print(f"  ERROR: {console_safe_text(message)}")
     RL.log(segment, f"{RL.ts()}  ERROR: {message}")
 
 
-BASE_DIR_ENV = "BASE_DIR"
 OPENAI_USAGE_REL = Path("logs") / "openai usage"
 
 # Debug ``--custom-import-html``: substitute Graph envelope fields (not read from each file).
@@ -247,6 +251,10 @@ def _read_float_env(name: str, default: float) -> float:
     except ValueError:
         return default
     return v if v > 0 else default
+
+
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _custom_import_outlook_env() -> dict[str, str]:
@@ -336,24 +344,6 @@ def print_usage_summary(usage_log_path: Path) -> None:
 _OPENAI_FATAL_EXIT = 3
 
 _LAUNCHER_PROGRESS_ENV = "EMAIL_SORTER_LAUNCHER_PROGRESS"
-_LAUNCHER_CANCEL_FILE = ".email_sorter_cancel"
-
-
-def _launcher_cancel_path(base_dir: Path) -> Path:
-    return base_dir / "logs" / _LAUNCHER_CANCEL_FILE
-
-
-def _clear_launcher_cancel(base_dir: Path) -> None:
-    p = _launcher_cancel_path(base_dir)
-    try:
-        if p.is_file():
-            p.unlink()
-    except OSError:
-        pass
-
-
-def _launcher_cancel_requested(base_dir: Path) -> bool:
-    return _launcher_cancel_path(base_dir).is_file()
 
 
 def _emit_run_launcher_progress(pct: int, msg: str = "") -> None:
@@ -363,7 +353,7 @@ def _emit_run_launcher_progress(pct: int, msg: str = "") -> None:
     pct = max(0, min(100, int(pct)))
     line = f"EMAIL_SORTER_RUN_PROGRESS pct={pct}"
     if msg:
-        line += " msg=" + msg.replace("\n", " ").replace("\r", "")[:160]
+        line += " msg=" + console_safe_text(msg).replace("\n", " ").replace("\r", "")[:160]
     print(line, flush=True)
 
 
@@ -374,11 +364,31 @@ def _run_pct_after_email(i: int, n_emails: int) -> int:
     return 13 + int(72 * i / n_emails)
 
 
+def _log_audit_report(report: dict) -> None:
+    parts = (
+        f"html_only={len(report.get('html_only', []))}",
+        f"pdf_only={len(report.get('pdf_only', []))}",
+        f"malformed_pdf={len(report.get('malformed_pdf', []))}",
+        f"fixed_pdf={len(report.get('fixed_pdf', []))}",
+        f"needs_review={len(report.get('needs_review', []))}",
+    )
+    RL.log("htmlHandler", f"{RL.ts()}  output_audit  " + "  ".join(parts))
+    for key in ("html_only", "pdf_only", "malformed_pdf", "fixed_pdf", "needs_review"):
+        items = report.get(key) or []
+        if not items:
+            continue
+        for item in items[:20]:
+            RL.log("htmlHandler", f"{RL.ts()}  output_audit {key}: {item}")
+    print(
+        "Audit outputs: "
+        + ", ".join(parts)
+    )
+
 def _prompt_openai_moderator_action() -> None:
     """Tell the user (console + dialog) that OpenAI quota/rate must be fixed by a moderator."""
     msg = (
         "OpenAI failed after all automatic retries (rate limit / quota exhausted).\n\n"
-        "A moderator must fix the OPENAI_API_KEY and the OpenAI account it is tied to "
+        "A moderator must fix the OpenAI API key (Email Sorter Settings) and the OpenAI account it is tied to "
         "(billing, limits, and key scope at platform.openai.com).\n\n"
         "This run has been stopped. Remaining emails were not processed."
     )
@@ -433,7 +443,10 @@ def save_inbox_snapshot(
     flow_started_at: datetime,
     emails: list[object],
 ) -> Path | None:
-    """Write all fetched email HTML bodies to ``BASE_DIR/logs/<run timestamp>.../``."""
+    """Write all fetched email HTML bodies to ``BASE_DIR/logs/<run timestamp>.../``.
+
+    Called from ``main()`` only when ``DEBUG_MODE`` is truthy.
+    """
     snapshot_dir = inbox_snapshot_dir(base_dir, flow_started_at)
     try:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -484,15 +497,20 @@ def save_inbox_snapshot(
 # Step runners (each invokes its script as a subprocess so cwd and __main__
 # match standalone execution)
 # ──────────────────────────────────────────────
-def run_environment_init() -> float:
+def run_environment_init(base_dir: Path) -> float:
     """Returns elapsed seconds."""
     script = _PYTHON_FILES_DIR / "EnvironmentInitialization" / "runner.py"
     print("[Step 1] Environment initialization ...")
     t = time.perf_counter()
-    result = subprocess.run([sys.executable, str(script)], cwd=str(script.parent))
+    result_code = run_subprocess_cancellable(
+        [sys.executable, str(script)],
+        cwd=str(script.parent),
+        env=os.environ.copy(),
+        base_dir=base_dir,
+    )
     elapsed = time.perf_counter() - t
-    if result.returncode != 0:
-        raise RuntimeError(f"Environment initialization failed (exit {result.returncode})")
+    if result_code != 0:
+        raise RuntimeError(f"Environment initialization failed (exit {result_code})")
     print(f"[Step 1] Done  ({elapsed:.2f}s)\n")
     return elapsed
 
@@ -503,6 +521,7 @@ def run_grabbing_important_content(
     sender_email: str,
     sender_name: str,
     *,
+    base_dir: Path,
     usage_log_path: Path | None = None,
     timing_buffer_path: Path | None = None,
     outlook_pdf_header_env: dict[str, str] | None = None,
@@ -529,32 +548,42 @@ def run_grabbing_important_content(
         env["OUTLOOK_PREPEND_PDF_HEADER"] = "1"
         for key, value in outlook_pdf_header_env.items():
             env[key] = value
-    result = subprocess.run(cmd, cwd=str(_PYTHON_FILES_DIR), env=env)
-    if result.returncode == _OPENAI_FATAL_EXIT:
+    result_code = run_subprocess_cancellable(
+        cmd,
+        cwd=str(_PYTHON_FILES_DIR),
+        env=env,
+        base_dir=base_dir,
+    )
+    if result_code == _OPENAI_FATAL_EXIT:
         _prompt_openai_moderator_action()
         _fatal(_OPENAI_FATAL_EXIT, "OpenAI fatal error from grabbingImportantEmailContent (exit 3)")
-    if result.returncode != 0:
+    if result_code != 0:
         _warn(
-            f"extractor exited with code {result.returncode}",
+            f"extractor exited with code {result_code}",
             segment="grabbingImportantEmailContent",
         )
 
 
-def run_sort_json() -> float:
+def run_sort_json(base_dir: Path) -> float:
     """Returns elapsed seconds."""
     script = _PYTHON_FILES_DIR / "sortJSONByOrderNumber" / "sortJSONByOrderNumber.py"
     t = time.perf_counter()
-    result = subprocess.run([sys.executable, str(script)], cwd=str(_PYTHON_FILES_DIR))
+    result_code = run_subprocess_cancellable(
+        [sys.executable, str(script)],
+        cwd=str(_PYTHON_FILES_DIR),
+        env=os.environ.copy(),
+        base_dir=base_dir,
+    )
     elapsed = time.perf_counter() - t
-    if result.returncode != 0:
+    if result_code != 0:
         _warn(
-            f"sortJSONByOrderNumber exited with code {result.returncode}",
+            f"sortJSONByOrderNumber exited with code {result_code}",
             segment="sortJSONByOrderNumber",
         )
     return elapsed
 
 
-def run_create_excel() -> float:
+def run_create_excel(base_dir: Path) -> float:
     """Returns elapsed seconds."""
     script = _PYTHON_FILES_DIR / "createExcelDocument" / "createExcelDocument.py"
     warn_after_s = _read_float_env("EXCEL_STEP_WARN_SECONDS", _EXCEL_STEP_WARN_SECONDS_DEFAULT)
@@ -576,7 +605,13 @@ def run_create_excel() -> float:
     )
     t = time.perf_counter()
     try:
-        result = subprocess.run(cmd, cwd=str(_PYTHON_FILES_DIR), timeout=timeout_s)
+        result_code = run_subprocess_cancellable(
+            cmd,
+            cwd=str(_PYTHON_FILES_DIR),
+            env=os.environ.copy(),
+            base_dir=base_dir,
+            timeout_seconds=timeout_s,
+        )
     except subprocess.TimeoutExpired as e:
         elapsed = time.perf_counter() - t
         RL.log(
@@ -597,7 +632,7 @@ def run_create_excel() -> float:
         )
         raise
     elapsed = time.perf_counter() - t
-    status = "ok" if result.returncode == 0 else f"exit_{result.returncode}"
+    status = "ok" if result_code == 0 else f"exit_{result_code}"
     RL.log("timing", f"{RL.ts()}  step5_excel=end  status={status}  elapsed={elapsed:.2f}s")
     if elapsed >= warn_after_s:
         RL.log(
@@ -607,11 +642,11 @@ def run_create_excel() -> float:
         RL.debug(
             "timing",
             f"{RL.ts()}  step5_excel slow detail: elapsed={elapsed:.2f}s "
-            f"warn_after={warn_after_s:.1f}s returncode={result.returncode}",
+            f"warn_after={warn_after_s:.1f}s returncode={result_code}",
         )
-    if result.returncode != 0:
+    if result_code != 0:
         _warn(
-            f"createExcelDocument exited with code {result.returncode}",
+            f"createExcelDocument exited with code {result_code}",
             segment="timing",
         )
     return elapsed
@@ -833,25 +868,16 @@ def main() -> None:
         )
         _fatal(1, "Invalid CLI: both --skip-email-fetch and --custom-import-html")
 
-    base_dir_raw = os.getenv(BASE_DIR_ENV)
-    if not base_dir_raw:
-        print(
-            f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
-            file=sys.stderr,
-        )
-        _fatal(1, f"{BASE_DIR_ENV} is not set (Email Sorter → Settings)")
-    base_dir = Path(base_dir_raw).expanduser().resolve()
-    _clear_launcher_cancel(base_dir)
+    from shared.project_paths import ensure_base_dir_in_environ
+
+    base_dir = ensure_base_dir_in_environ()
+    clear_cancel_request(base_dir)
     _emit_run_launcher_progress(1, "Starting…")
 
     azure_client_id = (os.getenv("AZURE_CLIENT_ID") or "").strip()
     azure_tenant_id = (os.getenv("AZURE_TENANT_ID") or "common").strip()
     auth_flow = (os.getenv("GRAPH_AUTH_FLOW") or "interactive").strip()
-    mail_folder = (
-        os.getenv("GRAPH_MAIL_FOLDER")
-        or os.getenv("IMAP_MAIL_FOLDER")
-        or "INBOX"
-    ).strip()
+    mail_folder = (os.getenv("GRAPH_MAIL_FOLDER") or "").strip()
     token_cache_raw = os.getenv("GRAPH_TOKEN_CACHE_PATH")
     token_cache_path = (
         Path(token_cache_raw).expanduser().resolve()
@@ -860,14 +886,22 @@ def main() -> None:
     )
     debug_mode = RL.is_debug()
 
-    if not skip_email_fetch and not custom_import_html and not azure_client_id:
-        print(
-            "ERROR: AZURE_CLIENT_ID must be set in .env (Azure app registration client ID).",
-            file=sys.stderr,
-        )
-        _fatal(1, "AZURE_CLIENT_ID is not set in .env")
+    if not skip_email_fetch and not custom_import_html:
+        missing = []
+        if not mail_folder:
+            missing.append("GRAPH_MAIL_FOLDER")
+        if not azure_client_id:
+            missing.append("AZURE_CLIENT_ID")
+        if missing:
+            print(
+                "ERROR: Required Settings values are missing: "
+                + ", ".join(missing)
+                + ". Fill them in Settings or in python_files/.env.",
+                file=sys.stderr,
+            )
+            _fatal(1, "Required Settings values are missing: " + ", ".join(missing))
 
-    demo_mode = os.getenv("DEMO_MODE", "0").strip().lower() in ("1", "true", "yes")
+    demo_mode = _env_truthy("DEMO_MODE")
 
     W = 60
     print(f"\n{'=' * W}")
@@ -911,7 +945,7 @@ def main() -> None:
         print()
 
     # ── Step 1: Environment initialization ──────────────────────
-    init_s = run_environment_init()
+    init_s = run_environment_init(base_dir)
     _emit_run_launcher_progress(5, "Environment ready")
 
     # ── Step 2: Fetch emails ─────────────────────────────────────
@@ -950,8 +984,7 @@ def main() -> None:
         _rebuild_email_html_archive_folder(html_archive)
         t_process_start = time.perf_counter()
         for i, src_path in enumerate(sources, start=1):
-            if i > 1 and _launcher_cancel_requested(base_dir):
-                break
+            ensure_not_cancelled(base_dir, context="reprocessing saved HTML")
             dst_path = pdf_dir / f"file{i}.html"
             try:
                 shutil.copy2(src_path, dst_path)
@@ -970,9 +1003,11 @@ def main() -> None:
                 )
                 continue
             subj, sender_email, sender_name = _parse_saved_email_html_metadata(html_text)
-            subj_display = (subj or "(no subject)")[:60]
+            subj_display = console_safe_text((subj or "(no subject)")[:60])
+            sender_name_display = console_safe_text(sender_name or "")
+            sender_email_display = console_safe_text(sender_email or "")
             print(
-                f"[{i}/{n_emails}] \"{subj_display}\" — {sender_name} <{sender_email}>\n"
+                f"[{i}/{n_emails}] \"{subj_display}\" — {sender_name_display} <{sender_email_display}>\n"
                 f"         (from {src_path.name})"
             )
             t_email = time.perf_counter()
@@ -981,6 +1016,7 @@ def main() -> None:
                 subject=subj,
                 sender_email=sender_email,
                 sender_name=sender_name,
+                base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,
             )
@@ -1024,8 +1060,7 @@ def main() -> None:
         sender_name = _CUSTOM_IMPORT_LABEL
         outlook_env = _custom_import_outlook_env()
         for i, src_path in enumerate(sources, start=1):
-            if i > 1 and _launcher_cancel_requested(base_dir):
-                break
+            ensure_not_cancelled(base_dir, context="custom HTML import")
             dst_path = pdf_dir / f"file{i}.html"
             try:
                 shutil.copy2(src_path, dst_path)
@@ -1045,6 +1080,7 @@ def main() -> None:
                 subject=subj,
                 sender_email=sender_email,
                 sender_name=sender_name,
+                base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,
                 outlook_pdf_header_env=outlook_env,
@@ -1063,6 +1099,7 @@ def main() -> None:
                 f"  [DEMO_MODE] {'device_code' if auth_flow == 'device_code' else 'interactive'} "
                 "login forced.\n"
             )
+        ensure_not_cancelled(base_dir, context="before Microsoft Graph email fetch")
         emails = fetch_emails(
             mail_folder=mail_folder,
             attachments_dir=attachments_dir,
@@ -1071,6 +1108,8 @@ def main() -> None:
             auth_flow=auth_flow,
             token_cache_path=token_cache_path,
             force_full_graph_auth=demo_mode,
+            cancel_check=lambda: is_cancel_requested(base_dir),
+            base_dir=base_dir,
         )
         fetch_s = time.perf_counter() - t_fetch
 
@@ -1085,13 +1124,15 @@ def main() -> None:
             f"{RL.ts()}  folder={mail_folder!r}  tenant={azure_tenant_id}  "
             f"auth={auth_flow}  fetched={len(emails)}  time={fetch_s:.2f}s",
         )
-        snapshot_dir = save_inbox_snapshot(base_dir, flow_started_at, emails)
-        if snapshot_dir is not None:
-            print(
-                f"[Step 2] Raw inbox snapshot saved:\n"
-                f"         {snapshot_dir}\n"
-                "         (copy these *.html files into custom_import_html_files/ to replay this batch)\n"
-            )
+        if debug_mode:
+            snapshot_dir = save_inbox_snapshot(base_dir, flow_started_at, emails)
+            if snapshot_dir is not None:
+                print(
+                    f"[Step 2] Raw inbox snapshot saved:\n"
+                    f"         {snapshot_dir}\n"
+                    "         (copy these *.html files into custom_import_html_files/ "
+                    "to replay this batch)\n"
+                )
 
         # ── Step 3: Process each email ───────────────────────────────
         n_emails = len(emails)
@@ -1101,10 +1142,14 @@ def main() -> None:
         t_process_start = time.perf_counter()
 
         for i, msg in enumerate(emails, start=1):
-            if i > 1 and _launcher_cancel_requested(base_dir):
-                break
-            subj_display = (msg.subject or "(no subject)")[:60]
-            print(f"[{i}/{n_emails}] \"{subj_display}\" — {msg.sender_name} <{msg.sender_email}>")
+            ensure_not_cancelled(base_dir, context="processing fetched emails")
+            subj_display = console_safe_text((msg.subject or "(no subject)")[:60])
+            sender_name_display = console_safe_text(msg.sender_name or "")
+            sender_email_display = console_safe_text(msg.sender_email or "")
+            print(
+                f"[{i}/{n_emails}] \"{subj_display}\" — "
+                f"{sender_name_display} <{sender_email_display}>"
+            )
 
             email_html = pdf_dir / f"file{i}.html"
             email_html.write_text(msg.body_html, encoding="utf-8")
@@ -1115,6 +1160,7 @@ def main() -> None:
                 subject=msg.subject,
                 sender_email=msg.sender_email,
                 sender_name=msg.sender_name,
+                base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,
                 outlook_pdf_header_env={
@@ -1133,16 +1179,20 @@ def main() -> None:
 
         process_s = time.perf_counter() - t_process_start
 
+    ensure_not_cancelled(base_dir, context="before output audit")
+    audit_report = audit_email_outputs(base_dir / "email_contents")
+    _log_audit_report(audit_report)
+
     _emit_run_launcher_progress(85, "Sorting results…")
     # ── Step 4: Sort JSON ────────────────────────────────────────
     print("[Step 4] Sorting JSON by order number ...")
-    sort_s = run_sort_json()
+    sort_s = run_sort_json(base_dir)
     print(f"[Step 4] Done  ({sort_s:.2f}s)\n")
     _emit_run_launcher_progress(92, "Creating Excel…")
 
     # ── Step 5: Create Excel ─────────────────────────────────────
     print("[Step 5] Creating Excel document ...")
-    excel_s = run_create_excel()
+    excel_s = run_create_excel(base_dir)
     print(f"[Step 5] Done  ({excel_s:.2f}s)\n")
     _emit_run_launcher_progress(100, "Complete")
 
@@ -1174,8 +1224,19 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except CancelRequestedError:
+        print("\nRun cancelled by user request.")
+        try:
+            from shared.project_paths import ensure_base_dir_in_environ
+
+            ensure_base_dir_in_environ()
+            RL.log("timing", f"{RL.ts()}  run_cancelled_by_user=1")
+        except Exception:
+            pass
+        _emit_run_launcher_progress(100, "Stopped")
+        sys.exit(0)
     except Exception as e:
-        print(f"\nFATAL ERROR: {e}")
+        print(f"\nFATAL ERROR: {console_safe_text(e)}")
         import traceback
 
         tb = traceback.format_exc()

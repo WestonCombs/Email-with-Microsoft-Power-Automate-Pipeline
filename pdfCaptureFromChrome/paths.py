@@ -9,12 +9,26 @@ from pathlib import Path
 # Directory containing this file; still used as ``cwd`` for code-side resources.
 PDF_CAPTURE_ROOT = Path(__file__).resolve().parent
 
+_pf = PDF_CAPTURE_ROOT.parent
+if str(_pf) not in sys.path:
+    sys.path.insert(0, str(_pf))
 try:
-    from dotenv import load_dotenv
+    from shared.settings_store import apply_runtime_settings_from_json
 
-    load_dotenv(PDF_CAPTURE_ROOT.parent / ".env", override=False)
-except ImportError:
+    apply_runtime_settings_from_json()
+except Exception:
     pass
+
+
+def _infer_project_root() -> Path:
+    pf = PDF_CAPTURE_ROOT.parent
+    if pf.name.lower() == "python_files":
+        return pf.parent.resolve()
+    return pf.resolve()
+
+
+_BAS = _infer_project_root()
+os.environ["BASE_DIR"] = str(_BAS)
 
 DEFAULT_START_URL = "http://mitm.it"
 
@@ -23,11 +37,8 @@ PREVIEW_MAX_WIDTH = 448
 PREVIEW_MAX_HEIGHT = 576
 
 
-def _project_root() -> Path | None:
-    base_raw = (os.getenv("BASE_DIR") or "").strip()
-    if not base_raw:
-        return None
-    return Path(base_raw).expanduser().resolve()
+def _project_root() -> Path:
+    return Path(os.environ["BASE_DIR"]).expanduser().resolve()
 
 
 def _ensure_dir(path: Path) -> Path:
@@ -37,21 +48,17 @@ def _ensure_dir(path: Path) -> Path:
 
 def pdf_capture_runtime_dir() -> Path:
     project_root = _project_root()
-    if project_root is None:
-        return _ensure_dir(PDF_CAPTURE_ROOT)
     return _ensure_dir(project_root / "logs" / "pdfCaptureFromChrome")
 
 
 def default_pdf_output_dir() -> Path:
     project_root = _project_root()
-    if project_root is None:
-        return _ensure_dir(pdf_capture_runtime_dir() / "captured_pdfs")
     return _ensure_dir(project_root / "email_contents" / "pdf")
 
 
 PDF_CAPTURE_RUNTIME_DIR = pdf_capture_runtime_dir()
 
-# Written by the mitm addon when the first PDF is saved; ``run_pdf_capture.py`` watches this file.
+# Written by the mitm addon when the first PDF is saved; ``mitm_pdf_capture/run_pdf_capture.py`` watches this file.
 PDF_CAPTURE_DONE_FILE = PDF_CAPTURE_RUNTIME_DIR / ".pdfCaptureFromChrome_done.json"
 PDF_CAPTURE_SESSION_LOG = PDF_CAPTURE_RUNTIME_DIR / "pdf_capture_session.log"
 PDF_CAPTURE_STDOUT_LOG = PDF_CAPTURE_RUNTIME_DIR / "mitmdump.stdout.log"

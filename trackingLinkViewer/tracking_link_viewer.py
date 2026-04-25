@@ -157,12 +157,12 @@ def _load_context_tsv(path: Path) -> dict[str, str]:
 
 
 def _email_contents_project_root() -> Path | None:
-    """Project root containing ``email_contents`` (``BASE_DIR``, set in Email Sorter → Settings)."""
+    """Project root containing ``email_contents`` (``BASE_DIR``, inferred from ``python_files`` layout)."""
     try:
-        from dotenv import load_dotenv
+        from shared.settings_store import apply_runtime_settings_from_json
 
-        load_dotenv(_PYTHON_FILES_DIR / ".env", override=False)
-    except ImportError:
+        apply_runtime_settings_from_json()
+    except Exception:
         pass
     base = (os.getenv("BASE_DIR") or "").strip()
     if not base:
@@ -627,12 +627,12 @@ def main() -> int:
     detach_console_win32()
     register_current_aux_gui()
 
-    # Match project .env location when launched from Excel (cwd may be System32).
+    # Match project settings when launched from Excel (cwd may be System32).
     try:
-        from dotenv import load_dotenv
+        from shared.settings_store import apply_runtime_settings_from_json
 
-        load_dotenv(_PYTHON_FILES_DIR / ".env", override=False)
-    except ImportError:
+        apply_runtime_settings_from_json()
+    except Exception:
         pass
 
     parser = argparse.ArgumentParser(description="View tracking URLs in a small grid.")

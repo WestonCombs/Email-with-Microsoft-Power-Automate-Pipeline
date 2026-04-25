@@ -8,8 +8,6 @@ import tempfile
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 if sys.platform != "win32":
     print("This helper requires Windows + Excel.", file=sys.stderr)
     sys.exit(1)
@@ -18,9 +16,11 @@ _PYTHON_FILES = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES))
 
-load_dotenv(_PYTHON_FILES / ".env")
+from shared.settings_store import apply_runtime_settings_from_json
 
-from tkinter import BOTH, LEFT, RIGHT, W, Button, Frame, Label, Tk, Toplevel, messagebox
+apply_runtime_settings_from_json()
+
+from tkinter import BOTH, LEFT, RIGHT, W, Frame, Label, Tk, Toplevel, messagebox
 
 from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
 from giftcardInvoiceLink.excel_link_sync import find_workbook_by_path
@@ -33,7 +33,13 @@ from proofOfDelivery.pod_data import (
     project_root_from_env,
     sync_proof_of_delivery_records,
 )
-from shared.ui_dark_theme import UI_BG, UI_FG, UI_FG_DIM, UI_BTN, UI_BTN_ACTIVE
+from launcher_progress_ui import THEME
+from shared.tk_launcher_theme import (
+    apply_launcher_theme_root,
+    danger_colors,
+    make_flat_button,
+    settings_label_opts,
+)
 
 PROJECT_ROOT = project_root_from_env()
 
@@ -130,7 +136,7 @@ def _ask_sync_prompt(missing_count: int) -> bool:
     dlg.attributes("-topmost", True)
     dlg.resizable(False, False)
     dlg.grab_set()
-    dlg.configure(bg=UI_BG)
+    apply_launcher_theme_root(dlg)
 
     def finish(sync_now: bool) -> None:
         choice["sync_now"] = sync_now
@@ -138,7 +144,7 @@ def _ask_sync_prompt(missing_count: int) -> bool:
 
     dlg.protocol("WM_DELETE_WINDOW", lambda: finish(False))
 
-    outer = Frame(dlg, padx=16, pady=14, bg=UI_BG)
+    outer = Frame(dlg, padx=16, pady=14, bg=THEME["bg"])
     outer.pack(fill=BOTH, expand=True)
 
     Label(
@@ -151,35 +157,28 @@ def _ask_sync_prompt(missing_count: int) -> bool:
         justify=LEFT,
         wraplength=420,
         anchor=W,
-        bg=UI_BG,
-        fg=UI_FG,
+        **settings_label_opts(),
     ).pack(fill=BOTH, expand=True)
 
-    btn_row = Frame(outer, bg=UI_BG)
+    btn_row = Frame(outer, bg=THEME["bg"])
     btn_row.pack(fill=BOTH, pady=(12, 0))
-    Button(
+    make_flat_button(
         btn_row,
         text="Yes",
-        width=12,
         command=lambda: finish(True),
-        bg=UI_BTN,
-        fg=UI_FG,
-        activebackground=UI_BTN_ACTIVE,
-        activeforeground=UI_FG,
-        relief="flat",
-        bd=0,
+        bg=THEME["excel_accent"],
+        active_bg=THEME["excel_accent_dim"],
+        width=12,
     ).pack(side=LEFT, padx=(0, 8))
-    Button(
+    make_flat_button(
         btn_row,
         text="Maybe later",
-        width=12,
         command=lambda: finish(False),
-        bg="#475569",
-        fg=UI_FG,
-        activebackground="#334155",
-        activeforeground=UI_FG,
-        relief="flat",
-        bd=0,
+        bg=THEME["surface"],
+        active_bg=THEME["track"],
+        fg=THEME["fg"],
+        active_fg=THEME["fg"],
+        width=12,
     ).pack(side=RIGHT)
 
     root.wait_window(dlg)
@@ -198,9 +197,9 @@ def _show_status_dialog(title: str, body: str) -> None:
     dlg.attributes("-topmost", True)
     dlg.resizable(False, False)
     dlg.grab_set()
-    dlg.configure(bg=UI_BG)
+    apply_launcher_theme_root(dlg)
 
-    outer = Frame(dlg, padx=16, pady=14, bg=UI_BG)
+    outer = Frame(dlg, padx=16, pady=14, bg=THEME["bg"])
     outer.pack(fill=BOTH, expand=True)
     Label(
         outer,
@@ -208,21 +207,17 @@ def _show_status_dialog(title: str, body: str) -> None:
         justify=LEFT,
         wraplength=440,
         anchor=W,
-        bg=UI_BG,
-        fg=UI_FG,
+        **settings_label_opts(),
     ).pack(fill=BOTH, expand=True)
-    Label(outer, text="", bg=UI_BG, fg=UI_FG_DIM).pack()
-    Button(
+    Label(outer, text="", bg=THEME["bg"], fg=THEME["muted"]).pack()
+    d_bg, d_active = danger_colors()
+    make_flat_button(
         outer,
         text="Close",
-        width=12,
         command=dlg.destroy,
-        bg=UI_BTN,
-        fg=UI_FG,
-        activebackground=UI_BTN_ACTIVE,
-        activeforeground=UI_FG,
-        relief="flat",
-        bd=0,
+        bg=d_bg,
+        active_bg=d_active,
+        width=12,
     ).pack(anchor="e")
 
     root.wait_window(dlg)

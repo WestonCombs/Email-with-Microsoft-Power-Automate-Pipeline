@@ -8,6 +8,11 @@ from pathlib import Path
 
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent
 
+sys.path.insert(0, str(_PYTHON_FILES_DIR))
+from shared.stdio_utf8 import configure_stdio_utf8, console_safe_text  # noqa: E402
+
+configure_stdio_utf8()
+
 
 def _load_create_excel_module():
     mod_path = _PYTHON_FILES_DIR / "createExcelDocument" / "createExcelDocument.py"
@@ -24,9 +29,9 @@ def main() -> None:
         print("usage: launcher_rebuild_excel.py <excel_output_path>", file=sys.stderr)
         sys.exit(2)
     out = sys.argv[1]
-    from dotenv import load_dotenv
+    from shared.settings_store import apply_runtime_settings_from_json
 
-    load_dotenv(_PYTHON_FILES_DIR / ".env", override=True)
+    apply_runtime_settings_from_json()
     mod = _load_create_excel_module()
     mod.rebuild_orders_workbook(out)
 
@@ -35,5 +40,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"\nERROR: {e}", file=sys.stderr)
+        print(f"\nERROR: {console_safe_text(e)}", file=sys.stderr)
         sys.exit(1)

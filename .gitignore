@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 
+# Launcher Settings (secrets); optional copy as email_sorter_settings.example.json without values
+email_sorter_settings.json
+
 # MSAL delegated token cache (do not commit)
 .graph_token_cache.bin
 

@@ -1,16 +1,16 @@
 """
-Build email_contents/clipboard_test.xlsm — minimal workbook to debug Copy Path + VBA.
+Build email_contents/clipboard_test.xlsm — minimal workbook to debug Open File Location + VBA.
 
-Matches the main orders workbook: Copy Path cells use in-workbook # hyperlinks only;
-the real file:/// URI lives in hidden column AB (28). VBA uses
-Workbook_SheetFollowHyperlink and reads the URI from column 28.
+Matches the main orders workbook: Open File Location cells use in-workbook # hyperlinks only;
+the real file:/// URI lives in hidden column AC (29). VBA uses
+Workbook_SheetFollowHyperlink and reads the URI from column 29.
 
 Requires Windows + Excel + pywin32 (same as macro template).
 
 Usage (from python_files):
   python createExcelDocument/create_clipboard_test_xlsm.py
 
-Reads BASE_DIR (set in Email Sorter → Settings); writes:
+Writes:
   <BASE_DIR>/email_contents/clipboard_test.xlsm
 Uses the same clipboard ini as the main exporter (default: python_files/excel_clipboard_launch.ini).
 """
@@ -21,16 +21,22 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.hyperlink import Hyperlink
 
 _PYTHON_FILES = Path(__file__).resolve().parent.parent
-load_dotenv(_PYTHON_FILES / ".env")
+if str(_PYTHON_FILES) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_FILES))
+
+from shared.project_paths import ensure_base_dir_in_environ
+from shared.settings_store import apply_runtime_settings_from_json
+
+apply_runtime_settings_from_json()
 
 # Same as createExcelDocument.COPY_PATH_URI_COL and VBA COL_FILE_URI
-COL_FILE_URI = 28
+COL_FILE_URI = 29
 
 
 def _load_macro_template():
@@ -44,14 +50,7 @@ def _load_macro_template():
 
 
 def main() -> int:
-    base_raw = os.getenv("BASE_DIR")
-    if not base_raw:
-        print(
-            'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
-        )
-        return 1
-
-    email_contents = Path(base_raw).expanduser().resolve() / "email_contents"
+    email_contents = ensure_base_dir_in_environ() / "email_contents"
     email_contents.mkdir(parents=True, exist_ok=True)
 
     ini_path = Path(
@@ -72,17 +71,17 @@ def main() -> int:
     ws = wb.active
     ws.title = "Orders"
 
-    # Minimal grid: B = Copy Path header; AB (28) = plain file URI; B2 = internal link only.
+    # Minimal grid: B = Open File Location header; AC (29) = plain file URI; B2 = internal link only.
     ws["A1"] = "Note"
-    ws["B1"] = "Copy Path"
-    ws["A2"] = "Click B2: clipboard gets decoded path; Notepad should NOT open."
+    ws["B1"] = "Open File Location"
+    ws["A2"] = "Click B2: Explorer opens with this ini file selected."
     file_uri = ini_path.resolve().as_uri()
     ws.cell(row=2, column=COL_FILE_URI, value=file_uri)
     ws.column_dimensions[get_column_letter(COL_FILE_URI)].hidden = True
 
     cell = ws["B2"]
-    cell.value = "Copy Path"
-    cell.hyperlink = "#Orders!$B$2"
+    cell.value = "Open File Location"
+    cell.hyperlink = Hyperlink(ref=cell.coordinate, location="Orders!$B$2")
     cell.font = Font(name="Calibri", color="0563C1", underline="single")
 
     ws["AA1"] = str(ini_path.resolve())
@@ -97,7 +96,7 @@ def main() -> int:
         )
     else:
         print(f"Using ini: {ini_path}")
-    print("Open clipboard_test.xlsm, enable macros, click the blue Copy Path in B2.")
+    print("Open clipboard_test.xlsm, enable macros, click the blue Open File Location in B2.")
     return 0
 
 

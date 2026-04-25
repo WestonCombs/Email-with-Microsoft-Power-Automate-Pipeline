@@ -18,27 +18,20 @@ if sys.platform != "win32":
     print("This helper requires Windows + Excel.", file=sys.stderr)
     sys.exit(1)
 
-from dotenv import load_dotenv
-
 _PYTHON_FILES = Path(__file__).resolve().parent.parent
 if str(_PYTHON_FILES) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES))
 
-load_dotenv(_PYTHON_FILES / ".env")
+from shared.settings_store import apply_runtime_settings_from_json
+
+apply_runtime_settings_from_json()
 
 import os
 
 from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
+from shared.project_paths import ensure_base_dir_in_environ
 
-_base = os.getenv("BASE_DIR")
-if not _base:
-    print(
-        'BASE_DIR is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-PROJECT_ROOT = Path(_base).expanduser().resolve()
+PROJECT_ROOT = ensure_base_dir_in_environ()
 JSON_PATH = PROJECT_ROOT / "email_contents" / "json" / "results.json"
 
 _REFRESH_ATTEMPTS = 3

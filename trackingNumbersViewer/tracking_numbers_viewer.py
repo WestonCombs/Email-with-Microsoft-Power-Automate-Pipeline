@@ -418,10 +418,10 @@ def main() -> int:
     register_current_aux_gui()
 
     try:
-        from dotenv import load_dotenv
+        from shared.settings_store import apply_runtime_settings_from_json
 
-        load_dotenv(_PYTHON_FILES_DIR / ".env", override=False)
-    except ImportError:
+        apply_runtime_settings_from_json()
+    except Exception:
         pass
 
     parser = argparse.ArgumentParser(description="View tracking numbers (carrier web URLs).")

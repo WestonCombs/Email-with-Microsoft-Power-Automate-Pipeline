@@ -10,7 +10,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from shared.settings_store import apply_runtime_settings_from_json
 
 if sys.platform == "win32":
     import winreg
@@ -19,9 +19,41 @@ else:
 
 CLIPBOARD_INI_NAME = "excel_clipboard_launch.ini"
 
-# Workbook_SheetFollowHyperlink: Copy Path uses # in-sheet links; file URI in column 29 (AC).
+# Workbook_SheetFollowHyperlink: Open File Location uses # in-sheet links; file URI in column 29 (AC).
 # Tracking URLs: 30…44. Tracking numbers: 45…59. Link-cross-check flags: 60…74 (1 = also found on tracking URL).
 # Reads UTF-8 ini (PY=, SCRIPT=, VIEWER=, TRACKING_NUMBERS_VIEWER=, TRACKING_STATUS_VIEWER=) from AA1 / excel_clipboard_launch.ini.
+# Triple-Escape handler lives in standard module EMAIL_SORTER_HOTKEYS_VBA (Application.OnKey cannot target ThisWorkbook reliably).
+EMAIL_SORTER_HOTKEYS_VBA = r'''Option Explicit
+
+' Application.OnKey must reference a Public Sub in a standard module (not ThisWorkbook).
+Private escPresses As Long
+Private escLastAt As Date
+Private Const TRIPLE_ESC_MAX_GAP_SEC As Long = 2
+
+Public Sub EmailSorter_TripleEscapeHandler()
+    On Error GoTo CleanFail
+    If ActiveWorkbook Is Nothing Then Exit Sub
+    If Not ActiveWorkbook Is ThisWorkbook Then Exit Sub
+
+    Dim t As Date
+    t = Now
+    If escPresses > 0 Then
+        If DateDiff("s", escLastAt, t) > TRIPLE_ESC_MAX_GAP_SEC Then escPresses = 0
+    End If
+
+    escPresses = escPresses + 1
+    escLastAt = t
+
+    If escPresses >= 3 Then
+        escPresses = 0
+        MsgBox "hello world!", vbInformation, "Email Sorter"
+    End If
+    Exit Sub
+CleanFail:
+    escPresses = 0
+End Sub
+'''
+
 THISWORKBOOK_VBA = r'''Option Explicit
 
 Private Const COL_TRACK_URI_START As Long = 30
@@ -30,6 +62,23 @@ Private Const COL_TRACK_NUM_START As Long = 45
 Private Const COL_TRACK_NUM_END As Long = 59
 Private Const COL_TRACK_CONF_START As Long = 60
 Private Const COL_TRACK_CONF_END As Long = 74
+Private Const DEFAULT_HEADER_ROW As Long = 2
+
+' Triple-Escape: register OnKey to EmailSorterHotkeys.EmailSorter_TripleEscapeHandler while this workbook is active.
+Private Function EmailSorter_TripleEscapeBinding() As String
+    ' Workbook name may contain spaces or apostrophes — Excel requires doubled single quotes inside the book token.
+    EmailSorter_TripleEscapeBinding = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!EmailSorter_TripleEscapeHandler"
+End Function
+
+Private Sub EmailSorter_RegisterTripleEscapeHotkey()
+    On Error Resume Next
+    Application.OnKey "{ESC}", EmailSorter_TripleEscapeBinding()
+End Sub
+
+Private Sub EmailSorter_UnregisterTripleEscapeHotkey()
+    On Error Resume Next
+    Application.OnKey "{ESC}"
+End Sub
 
 Private Function ReadUtf8File(ByVal path As String) As String
     Dim stm As Object
@@ -126,16 +175,26 @@ NextTC:
     CollectTrackingNumbersAndConfirmForRow = body
 End Function
 
+Private Function HeaderRow(ByVal Sh As Object) As Long
+    If Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 1).Value)) = "Category" Then
+        HeaderRow = DEFAULT_HEADER_ROW
+    Else
+        HeaderRow = 1
+    End If
+End Function
+
 Private Function HeaderColumn(ByVal Sh As Object, ByVal want As String) As Long
     Dim c As Long
     Dim lastCol As Long
     Dim h As String
+    Dim rowNum As Long
+    rowNum = HeaderRow(Sh)
     On Error Resume Next
-    lastCol = Sh.Cells(1, Sh.Columns.Count).End(xlToLeft).Column
+    lastCol = Sh.Cells(rowNum, Sh.Columns.Count).End(xlToLeft).Column
     On Error GoTo 0
     If lastCol < 1 Then lastCol = 1
     For c = 1 To lastCol
-        h = Trim(CStr(Sh.Cells(1, c).Value))
+        h = Trim(CStr(Sh.Cells(rowNum, c).Value))
         If StrComp(h, want, vbTextCompare) = 0 Then
             HeaderColumn = c
             Exit Function
@@ -501,6 +560,22 @@ End Function
 Private Sub Workbook_Open()
     On Error Resume Next
     Call LaunchPodWorkflowWatcher
+    Call EmailSorter_RegisterTripleEscapeHotkey
+End Sub
+
+Private Sub Workbook_Activate()
+    On Error Resume Next
+    Call EmailSorter_RegisterTripleEscapeHotkey
+End Sub
+
+Private Sub Workbook_Deactivate()
+    On Error Resume Next
+    Call EmailSorter_UnregisterTripleEscapeHotkey
+End Sub
+
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    On Error Resume Next
+    Call EmailSorter_UnregisterTripleEscapeHotkey
 End Sub
 
 Private Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Long)
@@ -628,7 +703,7 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
 
     On Error GoTo CleanFail
 
-    header = Trim(CStr(Sh.Cells(1, Target.Range.Column).Value))
+    header = Trim(CStr(Sh.Cells(HeaderRow(Sh), Target.Range.Column).Value))
 
     If StrComp(header, "View Tracking Links", vbTextCompare) = 0 _
         Or StrComp(header, "View tracking links", vbTextCompare) = 0 _
@@ -673,7 +748,8 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
         Exit Sub
     End If
 
-    If StrComp(header, "Copy Path", vbTextCompare) <> 0 Then Exit Sub
+    If StrComp(header, "Open File Location", vbTextCompare) <> 0 _
+        And StrComp(header, "Copy Path", vbTextCompare) <> 0 Then Exit Sub
 
     uri = CStr(Sh.Cells(Target.Range.Row, COL_FILE_URI).Value)
     uri = Trim(uri)
@@ -777,7 +853,7 @@ def write_clipboard_launch_ini(
 
 def build_macro_template_file(dest: Path) -> bool:
     """
-    Create dest (.xlsm) with ThisWorkbook VBA using Excel automation.
+    Create dest (.xlsm) with ThisWorkbook VBA plus standard-module hotkeys using Excel automation.
     Temporarily sets AccessVBOM=1 if needed, then restores previous value.
     """
     if sys.platform != "win32":
@@ -815,7 +891,20 @@ def build_macro_template_file(dest: Path) -> bool:
                 wb = None
                 try:
                     wb = excel.Workbooks.Add()
-                    cm = wb.VBProject.VBComponents("ThisWorkbook").CodeModule
+                    vbp = wb.VBProject
+                    # vbext_ct_StdModule = 1 — Public Sub for Application.OnKey must not live in ThisWorkbook.
+                    try:
+                        std_kind = int(win32com.client.constants.vbext_ct_StdModule)
+                    except Exception:
+                        std_kind = 1
+                    hotkey_mod = vbp.VBComponents.Add(std_kind)
+                    hotkey_mod.Name = "EmailSorterHotkeys"
+                    hk_cm = hotkey_mod.CodeModule
+                    if hk_cm.CountOfLines > 0:
+                        hk_cm.DeleteLines(1, hk_cm.CountOfLines)
+                    hk_cm.AddFromString(EMAIL_SORTER_HOTKEYS_VBA)
+
+                    cm = vbp.VBComponents("ThisWorkbook").CodeModule
                     n = cm.CountOfLines
                     if n > 0:
                         cm.DeleteLines(1, n)
@@ -930,16 +1019,14 @@ def refresh_macro_template(dest: Path) -> bool:
 
 
 if __name__ == "__main__":
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
-    base_raw = (os.getenv("BASE_DIR") or "").strip()
-    if not base_raw:
-        print(
-            "macro_template: BASE_DIR is not set. Set it in Email Sorter → Settings "
-            '("Project folder on disk") and Save.',
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    default_tpl = Path(base_raw).expanduser().resolve() / "email_contents" / "orders_template.xlsm"
+    _PYTHON_FILES_MAIN = Path(__file__).resolve().parent.parent
+    if str(_PYTHON_FILES_MAIN) not in sys.path:
+        sys.path.insert(0, str(_PYTHON_FILES_MAIN))
+
+    apply_runtime_settings_from_json()
+    from shared.project_paths import ensure_base_dir_in_environ
+
+    default_tpl = ensure_base_dir_in_environ() / "email_contents" / "orders_template.xlsm"
     target = Path(os.getenv("EXCEL_TEMPLATE_PATH", str(default_tpl))).expanduser().resolve()
     ok = ensure_macro_template(target)
     sys.exit(0 if ok else 1)

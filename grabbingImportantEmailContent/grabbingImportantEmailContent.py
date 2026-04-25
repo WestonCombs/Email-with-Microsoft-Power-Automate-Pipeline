@@ -13,15 +13,19 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# python_files/ — .env must load before htmlHandler (BASE_DIR is set in Email Sorter → Settings)
+# python_files/ — .env must load before htmlHandler (BASE_DIR is set when shared.runLogger loads)
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PYTHON_FILES_DIR))
 # Same folder as this script (sibling modules: isGiftCard, grabTrackingLinks, …)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dotenv import load_dotenv
+from shared.stdio_utf8 import configure_stdio_utf8, console_safe_text
 
-load_dotenv(_PYTHON_FILES_DIR / ".env")
+configure_stdio_utf8()
+
+from shared.settings_store import apply_runtime_settings_from_json
+
+apply_runtime_settings_from_json()
 
 from openai import OpenAI, RateLimitError
 
@@ -521,7 +525,7 @@ def convert_html_to_pdf(
                 )
                 return pdf_path
         except Exception as e:
-            print(f"  Browser PDF conversion failed: {e}")
+            print(f"  Browser PDF conversion failed: {console_safe_text(e)}")
             _log_warning(
                 "htmlHandler",
                 f"Browser PDF conversion failed for {html_path.name}: {e}",
@@ -554,7 +558,7 @@ def convert_html_to_pdf(
                 )
                 return pdf_path
         except Exception as e:
-            print(f"  xhtml2pdf conversion failed: {e}")
+            print(f"  xhtml2pdf conversion failed: {console_safe_text(e)}")
             _log_warning(
                 "htmlHandler",
                 f"xhtml2pdf conversion failed for {html_path.name}: {e}",
@@ -784,7 +788,7 @@ def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
             )
             if RL.is_debug():
                 short, full = _openai_rate_limit_debug(e)
-                print(f"  {short}")
+                print(f"  {console_safe_text(short)}")
                 RL.debug(
                     "grabbingImportantEmailContent",
                     f"OpenAI RateLimitError (attempt {attempt}/{RATE_LIMIT_MAX_RETRIES}):\n{full}\n",
@@ -823,7 +827,7 @@ def _chat_completion_json_parsed(api_kwargs: dict) -> dict:
                 f"  OpenAI tokens this request: {tt} (cumulative this flow: {cumulative})"
             )
         except OSError as e:
-            print(f"  WARNING: Could not write OpenAI usage log: {e}")
+            print(f"  WARNING: Could not write OpenAI usage log: {console_safe_text(e)}")
             _log_warning("openai_extraction", f"Could not write OpenAI usage log: {e}")
 
     content = response.choices[0].message.content
@@ -986,7 +990,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Filename (or full path) of a single HTML file to process. "
-            "A bare filename is resolved under email_contents/pdf/ relative to BASE_DIR (Email Sorter → Settings) "
+            "A bare filename is resolved under email_contents/pdf/ relative to the project root "
             "(e.g. file1.html). When provided, only that file is processed and the result is appended "
             "to the output JSON."
         ),
@@ -1123,7 +1127,10 @@ def process_file(
             "none found" if n_track == 0
             else (f"{n_track} tracking links" if n_track > 1 else "1 link found")
         )
-        print(f"done  ({timings['step4_s']:.2f}s, {redirected} redirected, {ts_label})")
+        print(
+            f"done  ({timings['step4_s']:.2f}s, {redirected} redirected, "
+            f"{console_safe_text(ts_label)})"
+        )
         _write_tracking_log(file_path.name, subject, sender_name, email, href_pairs, tracking_links)
         RL.debug("grabbingImportantEmailContent",
             f"  [step4] tracking: candidates={tracking_cands}, count={n_track}, links={tracking_links!r}"
@@ -1149,7 +1156,7 @@ def process_file(
                 raise
             except Exception as e:
                 timings["step5_s"] = round(_time.perf_counter() - t5, 3)
-                print(f"FAILED  ({timings['step5_s']:.2f}s, {e})")
+                print(f"FAILED  ({timings['step5_s']:.2f}s, {console_safe_text(e)})")
                 _log_warning(
                     "grabbingImportantEmailContent",
                     f"{file_path.name}: OpenAI extraction failed after {timings['step5_s']:.2f}s: {e}",
@@ -1190,14 +1197,14 @@ def process_file(
                     "gift card" if gift_verdict is True
                     else ("items invoice" if gift_verdict is False else "inconclusive")
                 )
-                print(f"done  ({timings['step5b_s']:.2f}s, {gv_label})")
+                print(f"done  ({timings['step5b_s']:.2f}s, {console_safe_text(gv_label)})")
             except OpenAIRateLimitFatalError:
                 timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
                 print(f"FAILED  ({timings['step5b_s']:.2f}s)")
                 raise
             except Exception as e:
                 timings["step5b_s"] = round(_time.perf_counter() - t5b, 3)
-                print(f"FAILED  ({timings['step5b_s']:.2f}s, {e})")
+                print(f"FAILED  ({timings['step5b_s']:.2f}s, {console_safe_text(e)})")
                 _log_warning(
                     "grabbingImportantEmailContent",
                     f"{file_path.name}: Gift card check failed after {timings['step5b_s']:.2f}s: {e}",
@@ -1284,7 +1291,7 @@ def process_file(
     except Exception as e:
         timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
         timings["error"] = str(e)
-        print(f"  ERROR in pipeline: {e}")
+        print(f"  ERROR in pipeline: {console_safe_text(e)}")
         _log_error("grabbingImportantEmailContent", f"{file_path.name}: {e}")
         return {
             "source_file": clean_text(file_path),
@@ -1394,6 +1401,17 @@ def _extract_date_str(purchase_datetime: str | None) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _extract_order_last4(order_number: str | None) -> str:
+    """Return last 4 digits from order_number, with safe fallback."""
+    raw = clean_text(order_number) or ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) >= 4:
+        return digits[-4:]
+    if digits:
+        return digits.zfill(4)
+    return "0000"
+
+
 def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     """Build a filename following the mom's naming convention.
 
@@ -1406,15 +1424,16 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     category = record.get("email_category", "Unknown")
     store = _sanitize_for_filename(record.get("company") or "Unknown")
     date_str = _extract_date_str(record.get("purchase_datetime"))
+    order_last4 = _extract_order_last4(record.get("order_number"))
 
     suffix = _CATEGORY_SUFFIX_MAP.get(category)
 
     if category == "Gift Card":
-        name = f"{store} {date_str}"
+        name = f"{store} {date_str}_{order_last4}"
     elif suffix:
-        name = f"DOC {store} {date_str} {suffix}"
+        name = f"DOC {store} {date_str} {suffix}_{order_last4}"
     else:
-        name = f"DOC {store} {date_str}"
+        name = f"DOC {store} {date_str}_{order_last4}"
 
     return name + extension
 
@@ -1540,9 +1559,11 @@ def unify_company_names_by_order(results: list[dict]) -> None:
 
         if any(b != winner_display for b in before_vals):
             print(
-                f"  Company consensus (order {order_key}): {winner_display!r} "
-                f"— {key_votes[winning_vote_key]} vote(s) for winning label, "
-                f"{len(group)} row(s) updated"
+                console_safe_text(
+                    f"  Company consensus (order {order_key}): {winner_display!r} "
+                    f"— {key_votes[winning_vote_key]} vote(s) for winning label, "
+                    f"{len(group)} row(s) updated"
+                )
             )
 
 
@@ -1600,7 +1621,10 @@ def apply_order_company_consensus_and_sync(
         try:
             rename_assets_to_match_record(r, pdf_folder, html_folder)
         except OSError as e:
-            print(f"  WARNING: could not sync filenames for {r.get('source_file')}: {e}")
+            print(
+                f"  WARNING: could not sync filenames for "
+                f"{console_safe_text(r.get('source_file'))}: {console_safe_text(e)}"
+            )
 
 
 def _write_results_with_consensus(
@@ -1651,7 +1675,7 @@ def _print_openai_fatal_banner() -> None:
         + "\n"
         "FATAL: OpenAI API — could not complete after all automatic retries.\n"
         "\n"
-        "A moderator must fix the OPENAI_API_KEY and the OpenAI account it belongs to\n"
+        "A moderator must fix the OpenAI API key (set in the launcher Settings) and the account\n"
         "(billing, quota, and key/project scope at platform.openai.com).\n"
         "\n"
         "This run stops here. Remaining emails were not processed.\n"
@@ -1679,13 +1703,9 @@ def main(flow_started_at: datetime | None = None):
         args.sender_name = "John Doe"
         print("DEMO MODE: sender overridden to John Doe <johndoe123@gmail.com>")
 
-    base_dir = os.getenv(BASE_DIR_ENV)
-    if not base_dir:
-        raise ValueError(
-            f'{BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.'
-        )
+    from shared.project_paths import ensure_base_dir_in_environ
 
-    base = Path(base_dir).expanduser().resolve()
+    base = ensure_base_dir_in_environ()
     pdf_folder = base / "email_contents" / "pdf"
     html_archive_folder = base / "email_contents" / "html"
     output_path = base / "email_contents" / "json" / "results.json"
@@ -1703,13 +1723,13 @@ def main(flow_started_at: datetime | None = None):
         try:
             init_flow_usage_log(base, started)
         except OSError as e:
-            print(f"WARNING: Could not create OpenAI usage log file: {e}")
+            print(f"WARNING: Could not create OpenAI usage log file: {console_safe_text(e)}")
             _log_warning("openai_extraction", f"Could not create OpenAI usage log file: {e}")
 
     if not API_KEY:
         print(
-            f"WARNING: {OPENAI_API_KEY_ENV} is not set. "
-            "Structured extraction will be skipped (empty fields only)."
+            f"WARNING: {OPENAI_API_KEY_ENV} is not set (use Email Sorter Settings — email_sorter_settings.json). "
+            "Structured extraction will be skipped."
         )
         _log_warning(
             "openai_extraction",
@@ -1842,25 +1862,16 @@ def main(flow_started_at: datetime | None = None):
 if __name__ == "__main__":
     strip_bom_from_argv(sys.argv)
 
-    _base_for_log = os.getenv(BASE_DIR_ENV)
-    if not _base_for_log:
-        print(
-            f'ERROR: {BASE_DIR_ENV} is not set. Set it in Email Sorter → Settings ("Project folder on disk") and Save.',
-            file=sys.stderr,
-        )
-        _record_fatal_exit(
-            exit_code=1,
-            summary=f"{BASE_DIR_ENV} is not set",
-            source="grabbingImportantEmailContent.__main__",
-        )
-        sys.exit(1)
+    from shared.project_paths import ensure_base_dir_in_environ
+
+    ensure_base_dir_in_environ()
 
     _start_time = time.time()
     _flow_started_at = datetime.now()
 
     print(f"\n{'='*60}")
     print(f"Run started: {_flow_started_at.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Args: {sys.argv[1:]}")
+    print("Args: " + console_safe_text(repr(sys.argv[1:])))
     print(f"{'='*60}")
 
     try:
@@ -1872,10 +1883,7 @@ if __name__ == "__main__":
         print(f"Total operation time: {_elapsed:.2f}s")
         if e.code == EXIT_BAD_ARGS:
             print("\nERROR: Invalid or missing arguments.")
-            print(
-                'Set BASE_DIR in Email Sorter → Settings ("Project folder on disk"). '
-                "Set OPENAI_API_KEY in python_files/.env."
-            )
+            print("Check command-line arguments. Set OPENAI_API_KEY via Email Sorter Settings if needed.")
             print("Optional args: --file, --subject, --sender-name, --email")
         _exit_code = e.code if isinstance(e.code, int) else (0 if e.code in (None, False) else 1)
         if _exit_code != 0:
@@ -1888,7 +1896,7 @@ if __name__ == "__main__":
     except OpenAIRateLimitFatalError as e:
         _elapsed = time.time() - _start_time
         _print_openai_fatal_banner()
-        print(f"Detail: {e}", file=sys.stderr)
+        print(f"Detail: {console_safe_text(e)}", file=sys.stderr)
         print(f"Total operation time: {_elapsed:.2f}s")
         _record_fatal_exit(
             exit_code=EXIT_OPENAI_RATE_LIMIT_FATAL,
@@ -1898,7 +1906,7 @@ if __name__ == "__main__":
         sys.exit(EXIT_OPENAI_RATE_LIMIT_FATAL)
     except Exception as e:
         _elapsed = time.time() - _start_time
-        print(f"\nERROR: {e}")
+        print(f"\nERROR: {console_safe_text(e)}")
         print(f"Total operation time: {_elapsed:.2f}s")
         _record_fatal_exit(
             exit_code=1,

@@ -6,6 +6,7 @@ import base64
 import concurrent.futures
 import json
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +15,7 @@ from pathlib import Path
 import msal
 
 from .emailFetcher import EmailMessage, format_graph_datetime_local, save_attachments
+from .graph_browser_signin_hint import run_blocking_task_with_browser_signin_hint
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 # Silent MSAL refresh can block indefinitely; cap it so stale/expired sessions fail fast.
@@ -54,6 +56,8 @@ def _graph_get_all_pages(first_url: str, access_token: str) -> list[dict]:
     rows: list[dict] = []
     url: str | None = first_url
     while url:
+        if _cancel_check and _cancel_check():
+            raise RuntimeError("Login/fetch cancelled by user")
         data = _graph_get(url, access_token)
         if isinstance(data, list):
             rows.extend(data)
@@ -63,6 +67,9 @@ def _graph_get_all_pages(first_url: str, access_token: str) -> list[dict]:
     return rows
 
 
+_cancel_check = None
+
+
 def _acquire_token(
     *,
     client_id: str,
@@ -70,6 +77,7 @@ def _acquire_token(
     cache_path: Path,
     auth_flow: str,
     force_interactive: bool = False,
+    base_dir: Path | None = None,
 ) -> str:
     cache = msal.SerializableTokenCache()
     if cache_path.exists():
@@ -88,6 +96,8 @@ def _acquire_token(
     scopes = ["Mail.Read"]
 
     if not force_interactive:
+        if _cancel_check and _cancel_check():
+            raise RuntimeError("Login cancelled by user")
         accounts = app.get_accounts()
         if accounts:
             result: dict | None
@@ -129,6 +139,8 @@ def _acquire_token(
 
     auth_flow_norm = (auth_flow or "interactive").strip().lower()
     if auth_flow_norm == "device_code":
+        if _cancel_check and _cancel_check():
+            raise RuntimeError("Login cancelled by user")
         flow = app.initiate_device_flow(scopes=scopes)
         if "user_code" not in flow:
             raise RuntimeError(
@@ -136,22 +148,77 @@ def _acquire_token(
                 + json.dumps(flow, indent=2)
             )
         print(flow["message"], file=sys.stderr)
-        result = app.acquire_token_by_device_flow(flow)
+        result = run_blocking_task_with_browser_signin_hint(
+            lambda: app.acquire_token_by_device_flow(flow),
+            cancel_check=_cancel_check,
+            cancel_message="Login cancelled by user during device code sign-in",
+            timeout_seconds=None,
+            base_dir=base_dir,
+        )
     else:
         # prompt=login: skip SSO for this request so the user can pick another
         # account and complete MFA (used when DEMO_MODE forces full sign-in).
+        if _cancel_check and _cancel_check():
+            raise RuntimeError("Login cancelled by user")
         interactive_kw: dict = {"scopes": scopes}
         if force_interactive:
             interactive_kw["prompt"] = "login"
-        result = app.acquire_token_interactive(**interactive_kw)
 
-    if cache.has_state_changed:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(cache.serialize(), encoding="utf-8")
+        def _clear_cached_signin() -> None:
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        def _interactive_attempt() -> dict:
+            attempt_cache = msal.SerializableTokenCache()
+            if cache_path.exists():
+                try:
+                    attempt_cache.deserialize(cache_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    pass
+            attempt_app = msal.PublicClientApplication(
+                client_id,
+                authority=authority,
+                token_cache=attempt_cache,
+                timeout=MSAL_HTTP_TIMEOUT_S,
+            )
+            attempt_result = attempt_app.acquire_token_interactive(**interactive_kw)
+            return {
+                "result": attempt_result,
+                "token_cache": (
+                    attempt_cache.serialize()
+                    if attempt_cache.has_state_changed
+                    else ""
+                ),
+            }
+
+        wrapped_result = run_blocking_task_with_browser_signin_hint(
+            _interactive_attempt,
+            cancel_check=_cancel_check,
+            cancel_message="Login cancelled by user during interactive sign-in",
+            timeout_seconds=None,
+            base_dir=base_dir,
+            allow_retry=True,
+            on_retry=_clear_cached_signin,
+        )
+        result = (
+            wrapped_result.get("result")
+            if isinstance(wrapped_result.get("result"), dict)
+            else wrapped_result
+        )
+        interactive_cache_payload = str(wrapped_result.get("token_cache") or "")
 
     if not result or not result.get("access_token"):
         err = result.get("error_description") or result.get("error") if result else "unknown"
         raise RuntimeError(f"Could not acquire Graph token: {err}")
+
+    if interactive_cache_payload:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(interactive_cache_payload, encoding="utf-8")
+    elif cache.has_state_changed:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(cache.serialize(), encoding="utf-8")
 
     return result["access_token"]
 
@@ -301,86 +368,99 @@ def fetch_emails(
     auth_flow: str = "interactive",
     token_cache_path: Path | None = None,
     force_full_graph_auth: bool = False,
+    cancel_check=None,
+    base_dir: Path | None = None,
 ) -> list[EmailMessage]:
     """List every message in *mail_folder*, build :class:`EmailMessage` instances.
 
     Authentication is delegated (interactive browser or device code). Tokens are
-    cached on disk for subsequent runs.
+    cached on disk for subsequent runs; silent refresh from the cache is always
+    tried before any browser or device-code prompt.
 
     If *force_full_graph_auth* is True (e.g. when ``DEMO_MODE=1`` in ``mainRunner``),
     silent token refresh is skipped and interactive login uses ``prompt=login`` so
     each run goes through full sign-in and account/MFA as required by Microsoft.
+
+    *base_dir* enables the sign-in hint window's Cancel button to request a pipeline
+    stop via the same cancel file as the launcher Stop control.
     """
-    if not azure_client_id.strip():
-        raise ValueError("azure_client_id is required")
+    global _cancel_check
+    _cancel_check = cancel_check
+    try:
+        if not azure_client_id.strip():
+            raise ValueError("azure_client_id is required")
 
-    cache_path = token_cache_path or Path(".graph_token_cache.bin")
-    token = _acquire_token(
-        client_id=azure_client_id.strip(),
-        tenant_id=(azure_tenant_id or "common").strip(),
-        cache_path=cache_path,
-        auth_flow=auth_flow,
-        force_interactive=force_full_graph_auth,
-    )
-
-    folder_id = urllib.parse.quote(_resolve_folder_id(token, mail_folder), safe="")
-    list_url = (
-        f"{GRAPH_ROOT}/me/mailFolders/{folder_id}/messages"
-        f"?$select=id,subject,from,hasAttachments"
-        f"&$orderby=receivedDateTime%20asc"
-        f"&$top=50"
-    )
-    summaries = _graph_get_all_pages(list_url, token)
-
-    messages: list[EmailMessage] = []
-    for summary in summaries:
-        mid = summary.get("id")
-        if not mid:
-            continue
-        safe_mid = urllib.parse.quote(mid, safe="")
-        detail_url = (
-            f"{GRAPH_ROOT}/me/messages/{safe_mid}"
-            f"?$select=body,from,subject,hasAttachments,sentDateTime,receivedDateTime,toRecipients"
+        cache_path = token_cache_path or Path(".graph_token_cache.bin")
+        token = _acquire_token(
+            client_id=azure_client_id.strip(),
+            tenant_id=(azure_tenant_id or "common").strip(),
+            cache_path=cache_path,
+            auth_flow=auth_flow,
+            force_interactive=force_full_graph_auth,
+            base_dir=base_dir,
         )
-        detail = _graph_get(detail_url, token)
 
-        from_raw = _recipient_to_from_raw(detail.get("from"))
-        subject = detail.get("subject") or ""
-        body_html = _message_body_html(detail.get("body"))
-
-        to_recs = detail.get("toRecipients") or []
-        to_line = ", ".join(
-            x for x in (_recipient_to_from_raw(r) for r in to_recs) if x
+        folder_id = urllib.parse.quote(_resolve_folder_id(token, mail_folder), safe="")
+        list_url = (
+            f"{GRAPH_ROOT}/me/mailFolders/{folder_id}/messages"
+            f"?$select=id,subject,from,hasAttachments"
+            f"&$orderby=receivedDateTime%20asc"
+            f"&$top=50"
         )
-        header_title = ""
-        if to_recs:
-            ea0 = (to_recs[0].get("emailAddress") or {})
-            header_title = (ea0.get("name") or "").strip() or (
-                ea0.get("address") or ""
-            ).strip()
+        summaries = _graph_get_all_pages(list_url, token)
 
-        sent_iso = detail.get("sentDateTime") or detail.get("receivedDateTime")
-        sent_line = format_graph_datetime_local(sent_iso)
-
-        attachments: list[tuple[str, bytes]] = []
-        if detail.get("hasAttachments"):
-            attachments = _collect_attachments(token, mid)
-
-        if attachments_dir and attachments:
-            saved = save_attachments(attachments, attachments_dir)
-            for p in saved:
-                print(f"    Saved attachment: {p.name}")
-
-        messages.append(
-            EmailMessage(
-                from_raw=from_raw,
-                subject=subject,
-                body_html=body_html,
-                attachments=attachments,
-                to_line=to_line,
-                sent_line=sent_line,
-                header_title=header_title,
+        messages: list[EmailMessage] = []
+        for summary in summaries:
+            if _cancel_check and _cancel_check():
+                raise RuntimeError("Email fetch cancelled by user")
+            mid = summary.get("id")
+            if not mid:
+                continue
+            safe_mid = urllib.parse.quote(mid, safe="")
+            detail_url = (
+                f"{GRAPH_ROOT}/me/messages/{safe_mid}"
+                f"?$select=body,from,subject,hasAttachments,sentDateTime,receivedDateTime,toRecipients"
             )
-        )
+            detail = _graph_get(detail_url, token)
 
-    return messages
+            from_raw = _recipient_to_from_raw(detail.get("from"))
+            subject = detail.get("subject") or ""
+            body_html = _message_body_html(detail.get("body"))
+
+            to_recs = detail.get("toRecipients") or []
+            to_line = ", ".join(
+                x for x in (_recipient_to_from_raw(r) for r in to_recs) if x
+            )
+            header_title = ""
+            if to_recs:
+                ea0 = (to_recs[0].get("emailAddress") or {})
+                header_title = (ea0.get("name") or "").strip() or (
+                    ea0.get("address") or ""
+                ).strip()
+
+            sent_iso = detail.get("sentDateTime") or detail.get("receivedDateTime")
+            sent_line = format_graph_datetime_local(sent_iso)
+
+            attachments: list[tuple[str, bytes]] = []
+            if detail.get("hasAttachments"):
+                attachments = _collect_attachments(token, mid)
+
+            if attachments_dir and attachments:
+                saved = save_attachments(attachments, attachments_dir)
+                for p in saved:
+                    print(f"    Saved attachment: {p.name}")
+
+            messages.append(
+                EmailMessage(
+                    from_raw=from_raw,
+                    subject=subject,
+                    body_html=body_html,
+                    attachments=attachments,
+                    to_line=to_line,
+                    sent_line=sent_line,
+                    header_title=header_title,
+                )
+            )
+        return messages
+    finally:
+        _cancel_check = None
