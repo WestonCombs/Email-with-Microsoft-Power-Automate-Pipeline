@@ -26,6 +26,8 @@ if str(_PCAP) not in sys.path:
 try:
     from ..chrome_devtools import (
         export_page_pdf,
+        extract_outer_html_snippet,
+        inspect_page,
         list_page_targets,
         page_has_focus,
         reserve_free_port,
@@ -36,6 +38,8 @@ try:
 except ImportError:
     from chrome_devtools import (  # type: ignore[no-redef]  # noqa: E402
         export_page_pdf,
+        extract_outer_html_snippet,
+        inspect_page,
         list_page_targets,
         page_has_focus,
         reserve_free_port,
@@ -147,6 +151,8 @@ class HtmlCaptureController:
     - Each ``enqueue_capture`` opens a new tab (or the first load after a fresh launch) to ``url`` and
       records the target id → expected output ``.pdf`` path.
     - On Ctrl+Enter, the focused page is printed to PDF and written to the mapped path.
+    - With ``auto_print_pdf=True``, a background thread waits for the tab to settle (CDP ``inspect_page``),
+      then prints to PDF without requiring Ctrl+Enter, and writes an optional HTML snapshot beside the PDF.
     """
 
     def __init__(
@@ -227,7 +233,9 @@ class HtmlCaptureController:
         if c is not None:
             _terminate_chrome_process(c)
 
-    def enqueue_capture(self, url: str, expected_pdf: Path) -> bool:
+    def enqueue_capture(
+        self, url: str, expected_pdf: Path, *, auto_print_pdf: bool = False
+    ) -> bool:
         if not self._active:
             self._emit("error", "HTML capture is not started (toggle PDF capture on first).")
             return False
@@ -286,7 +294,108 @@ class HtmlCaptureController:
         _log_line(f"enqueued target_id={target_id} -> {expected_pdf} url={u[:120]}")
         if self._verbose:
             _log_line("enqueue: ok")
+        if auto_print_pdf:
+            tid_s = str(target_id)
+            pdf_p = Path(expected_pdf)
+
+            def _run() -> None:
+                self._thread_auto_pod_capture(tid_s, pdf_p)
+
+            threading.Thread(
+                target=_run,
+                name="html-capture-auto-pod",
+                daemon=True,
+            ).start()
         return True
+
+    def _websocket_for_target_id(self, target_id: str) -> str | None:
+        with self._lock:
+            dport = self._debug_port
+        if not dport:
+            return None
+        try:
+            for t in list_page_targets(dport):
+                if str(t.get("id") or "") != target_id:
+                    continue
+                w = t.get("webSocketDebuggerUrl")
+                if isinstance(w, str) and w:
+                    return w
+        except OSError:
+            return None
+        return None
+
+    def _thread_auto_pod_capture(self, target_id: str, expected_pdf: Path) -> None:
+        self._emit(
+            "info",
+            "Capture: opened carrier tab — waiting for the page to settle, then saving PDF …",
+        )
+        min_ready = time.monotonic() + 1.25
+        deadline = time.monotonic() + 75.0
+        last_sig: tuple[int, str] | None = None
+        stable = 0
+        try:
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if not self._active:
+                        return
+                ws_url = self._websocket_for_target_id(target_id)
+                if not ws_url:
+                    time.sleep(0.45)
+                    continue
+                info = inspect_page(ws_url, text_preview_chars=16000)
+                if info and str(info.get("readyState") or "") == "complete":
+                    text = str(info.get("text") or "")
+                    if len(text) >= 220:
+                        sig = (len(text), str(info.get("title") or "")[:120])
+                        if sig == last_sig:
+                            stable += 1
+                        else:
+                            stable = 0
+                        last_sig = sig
+                        if stable >= 2 and time.monotonic() >= min_ready:
+                            break
+                time.sleep(0.72)
+            else:
+                self._emit(
+                    "error",
+                    "Timed out waiting for the tracking page to finish loading.",
+                )
+                return
+
+            time.sleep(0.4)
+            ws_url = self._websocket_for_target_id(target_id)
+            if not ws_url:
+                self._emit("error", "Lost the capture tab before saving the PDF.")
+                return
+
+            if expected_pdf.is_file() and not self._verbose:
+                self._emit("info", f"File already exists:\n{expected_pdf.name}")
+                return
+            expected_pdf.parent.mkdir(parents=True, exist_ok=True)
+
+            pdf_bytes = export_page_pdf(ws_url)
+            expected_pdf.write_bytes(pdf_bytes)
+            _log_line(f"auto-saved PDF {expected_pdf} ({len(pdf_bytes)} bytes)")
+
+            html_path = expected_pdf.with_name(expected_pdf.stem + "_capture.html")
+            html_snip = extract_outer_html_snippet(ws_url, max_chars=350_000)
+            if html_snip:
+                try:
+                    html_path.write_text(html_snip, encoding="utf-8", errors="replace")
+                    _log_line(f"auto-saved HTML snapshot {html_path}")
+                except OSError as exc:
+                    _log_line(f"html snapshot write failed: {exc!r}")
+
+            if self._on_saved is not None:
+                try:
+                    self._on_saved()
+                except Exception:
+                    pass
+            extra = f"\nHTML snapshot:\n{html_path.name}" if html_snip else ""
+            self._emit("info", f"Proof-of-delivery PDF saved:\n{expected_pdf.name}{extra}")
+        except Exception as e:
+            _log_line("auto pod capture error:\n" + traceback.format_exc())
+            self._emit("error", f"Automatic print to PDF failed: {e!s}")
 
     def _schedule_snapshot(self) -> None:
         threading.Thread(target=self._do_snapshot, name="html-capture-cdp", daemon=True).start()

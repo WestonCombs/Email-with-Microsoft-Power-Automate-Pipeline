@@ -247,7 +247,7 @@ UNKNOWN_ORDER_FILL = CATEGORY_FILLS["Unknown"]
 
 HAIR_SIDE = Side(style="hair", color="000000")
 AUTOMATION_HUB_FONT = Font(name="Calibri", color="5A2500", bold=True)
-AUTOMATION_HUB_LINK_FONT = Font(name="Calibri", color="7C2D12", underline="single", bold=True)
+AUTOMATION_HUB_LINK_FONT = HYPERLINK_FONT
 
 
 def load_json(path: str) -> list[dict]:

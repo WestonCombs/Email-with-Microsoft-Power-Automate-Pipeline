@@ -98,17 +98,18 @@ class _CdpSession:
         self.close()
 
 
-def inspect_page(ws_url: str) -> dict | None:
-    expr = """
-(() => {
+def inspect_page(ws_url: str, *, text_preview_chars: int = 4000) -> dict | None:
+    n = max(200, min(int(text_preview_chars), 500_000))
+    expr = f"""
+(() => {{
   const body = document.body ? document.body.innerText : "";
-  return JSON.stringify({
+  return JSON.stringify({{
     href: location.href,
     title: document.title || "",
     readyState: document.readyState || "",
-    text: body.slice(0, 4000)
-  });
-})()
+    text: body.slice(0, {n})
+  }});
+}})()
 """
     try:
         with _CdpSession(ws_url) as cdp:
@@ -126,6 +127,37 @@ def inspect_page(ws_url: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return decoded if isinstance(decoded, dict) else None
+
+
+def extract_outer_html_snippet(ws_url: str, *, max_chars: int = 400_000) -> str | None:
+    """Return a UTF-8 HTML slice of ``document.documentElement.outerHTML`` (for archival beside PDF)."""
+    n = max(1000, min(int(max_chars), 1_500_000))
+    expr = f"""
+(() => {{
+  const el = document.documentElement;
+  const h = el ? el.outerHTML : "";
+  return JSON.stringify({{ html: h.slice(0, {n}) }});
+}})()
+"""
+    try:
+        with _CdpSession(ws_url) as cdp:
+            result = cdp.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+    except Exception:
+        return None
+    payload = result.get("result")
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("value")
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    html = decoded.get("html")
+    return str(html) if isinstance(html, str) and html else None
 
 
 def page_has_focus(ws_url: str) -> bool:

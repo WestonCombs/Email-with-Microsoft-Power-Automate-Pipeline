@@ -47,19 +47,20 @@ from trackingNumbersViewer.seventeen_track_smart import (
     quick_status_from_cache,
     tracking_is_greyed_out,
 )
-from shared.ui_dark_theme import (
-    UI_BG,
-    UI_BG_PANEL,
-    UI_FG,
-    UI_FG_DIM,
-    UI_TREE_BG,
-    dark_tk_scrollbar,
-    setup_dark_theme,
-    style_text_widget,
+from launcher_progress_ui import THEME
+from shared.tk_launcher_theme import (
+    apply_launcher_theme_root,
+    configure_launcher_ttk_styles,
+    danger_colors,
+    launcher_scrollbar,
+    make_flat_button,
+    settings_label_opts,
+    style_scrolled_text,
+    theme_font,
 )
 
-_PDF_TOGGLE_ON = "#22c55e"
-_PDF_TOGGLE_OFF = "#ef4444"
+_PDF_TOGGLE_ON = THEME["excel_accent"]
+_PDF_TOGGLE_OFF = THEME["stop_fg"]
 _PDF_TOGGLE_FG = "#ffffff"
 
 _ROW_GREYED = "greyed_out"
@@ -246,12 +247,17 @@ class TrackingStatusViewerApp:
             pass
 
         self._root = tk.Tk()
-        self._root.title("Shipping status (17TRACK)")
+        self._root.title(
+            "Remaining PODs — proof of delivery"
+            if self._hub_remaining_mode
+            else "Shipping status (17TRACK)"
+        )
         self._root.minsize(760, 400)
         self._root.geometry("960x520")
-        setup_dark_theme(self._root)
+        apply_launcher_theme_root(self._root)
+        configure_launcher_ttk_styles(self._root)
 
-        self._frm = ttk.Frame(self._root, padding=8)
+        self._frm = ttk.Frame(self._root, style="Launcher.TFrame", padding=8)
         self._frm.pack(fill=tk.BOTH, expand=True)
 
         bits = []
@@ -264,63 +270,71 @@ class TrackingStatusViewerApp:
             bits.append(f"tracking numbers: {tn}")
         ctx_line = "  |  ".join(bits) if bits else ""
         if ctx_line:
-            ttk.Label(self._frm, text=ctx_line, wraplength=920, foreground=UI_FG_DIM).pack(
-                fill=tk.X, anchor=tk.W, pady=(0, 6)
-            )
+            tk.Label(
+                self._frm,
+                text=ctx_line,
+                wraplength=920,
+                anchor=tk.W,
+                fg=THEME["muted"],
+                bg=THEME["bg"],
+                font=theme_font("body"),
+            ).pack(fill=tk.X, anchor=tk.W, pady=(0, 6))
 
-        hint_frame = ttk.Frame(self._frm)
+        hint_frame = tk.Frame(self._frm, bg=THEME["bg"])
         hint_frame.pack(fill=tk.X, anchor=tk.W, pady=(0, 4))
 
         if self._hub_remaining_mode:
-            ttk.Label(
+            tk.Label(
                 hint_frame,
                 text=(
-                    "This view lists every tracking number that still needs a proof-of-delivery PDF. "
-                    "(Weston needs more time to perfect or adapt this feature.)"
+                    "This list shows tracking numbers that still need a proof-of-delivery PDF. "
+                    "Double-click a row: Chrome opens the carrier page, the app waits for the page to settle, "
+                    "then saves the PDF automatically (plus an HTML snapshot beside it). No Ctrl+Enter."
                 ),
                 wraplength=920,
-                foreground=UI_FG,
+                anchor=tk.W,
+                justify=tk.LEFT,
+                **settings_label_opts(),
             ).pack(fill=tk.X, anchor=tk.W)
         else:
-            ttk.Label(
+            tk.Label(
                 hint_frame,
                 text=(
-                    "With Toggle PDF Capture on: double-click a row to open the tracking page in the capture "
-                    "Chrome; press Ctrl+Enter there to save the visible page as the proof-of-delivery PDF. "
+                    "With PDF capture on: double-click a row to open the tracking page in capture Chrome; "
+                    "press Ctrl+Enter there to save the visible page as the proof-of-delivery PDF."
                 ),
                 wraplength=920,
-                foreground=UI_FG,
-            ).pack(fill=tk.X, anchor=tk.W)
-            ttk.Label(
-                hint_frame,
-                text="(Weston needs more time to perfect or adapt this feature.)",
-                wraplength=920,
-                foreground=UI_FG,
+                anchor=tk.W,
+                justify=tk.LEFT,
+                **settings_label_opts(),
             ).pack(fill=tk.X, anchor=tk.W)
 
-        ttk.Label(
+        tk.Label(
             hint_frame,
             text=(
-                #"Tracking numbers that were already processed appear with a green row highlight. "
                 "NotFound tracking numbers appear with a grey row highlight for two weeks and expire "
                 "after a final retry occurs two weeks after their first check."
             ),
             wraplength=920,
-            foreground=UI_FG,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            fg=THEME["muted"],
+            bg=THEME["bg"],
+            font=theme_font("body"),
         ).pack(fill=tk.X, anchor=tk.W, pady=(4, 0))
 
-        demo = ttk.Frame(hint_frame)
+        demo = tk.Frame(hint_frame, bg=THEME["bg"])
         demo.pack(fill=tk.X, anchor=tk.W, pady=(6, 0))
-        ttk.Label(demo, text="Sample row colors: ").pack(side=tk.LEFT)
+        tk.Label(demo, text="Sample row colors: ", **settings_label_opts()).pack(side=tk.LEFT)
         tk.Label(
             demo,
             text=" GREEN ",
             bg="#166534",
-            fg=UI_FG,
+            fg=THEME["fg"],
             padx=6,
             pady=2,
         ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(demo, text="processed (beta feature)").pack(side=tk.LEFT, padx=(0, 12))
+        tk.Label(demo, text="processed", **settings_label_opts()).pack(side=tk.LEFT, padx=(0, 12))
         tk.Label(
             demo,
             text=" GREY ",
@@ -329,39 +343,80 @@ class TrackingStatusViewerApp:
             padx=6,
             pady=2,
         ).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(demo, text="NotFound / temporary").pack(side=tk.LEFT)
+        tk.Label(demo, text="NotFound / temporary", **settings_label_opts()).pack(side=tk.LEFT)
 
         if not api_key_from_env():
-            ttk.Label(
+            tk.Label(
                 self._frm,
                 text=(
                     "No SEVENTEEN_TRACK_API_KEY — only cached tracking data will appear. "
                     "Set the 17TRACK key in Email Sorter Settings."
                 ),
                 wraplength=920,
-                foreground="#fbbf24",
+                anchor=tk.W,
+                fg="#fbbf24",
+                bg=THEME["bg"],
+                font=theme_font("body"),
             ).pack(fill=tk.X, anchor=tk.W, pady=(0, 6))
 
-        btn_row = ttk.Frame(self._frm)
+        btn_row = tk.Frame(self._frm, bg=THEME["bg"])
         btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        ttk.Button(btn_row, text="View more", command=self._view_more).pack(side=tk.LEFT, padx=(0, 8))
-        self._pdf_toggle_btn = tk.Button(
+        make_flat_button(
             btn_row,
-            text="PDF Capture Locked On" if self._hub_remaining_mode else "Toggle PDF Capture",
-            command=self._toggle_pdf_capture,
-            bg=_PDF_TOGGLE_ON if self._pdf_capture else _PDF_TOGGLE_OFF,
-            fg=_PDF_TOGGLE_FG,
-            activebackground="#16a34a" if self._pdf_capture else "#dc2626",
-            activeforeground=_PDF_TOGGLE_FG,
-            relief=tk.RAISED,
-            bd=2,
-            cursor="hand2",
-            state=tk.DISABLED if self._hub_remaining_mode else tk.NORMAL,
-        )
-        self._pdf_toggle_btn.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(btn_row, text="Close", command=self._root.destroy).pack(side=tk.RIGHT)
+            text="View more",
+            command=self._view_more,
+            bg=THEME["run_accent"],
+            active_bg=THEME["run_accent_dim"],
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self._pdf_toggle_btn: tk.Button | None = None
+        if self._hub_remaining_mode:
+            self._pdf_toggle_btn = tk.Button(
+                btn_row,
+                text="Hands-free PDF Capture",
+                command=lambda: None,
+                font=theme_font("button"),
+                bg=_PDF_TOGGLE_ON,
+                fg=_PDF_TOGGLE_FG,
+                activebackground=THEME["excel_accent_dim"],
+                activeforeground=_PDF_TOGGLE_FG,
+                relief=tk.FLAT,
+                bd=0,
+                highlightthickness=0,
+                cursor="arrow",
+                padx=14,
+                pady=7,
+            )
+            self._pdf_toggle_btn.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            self._pdf_toggle_btn = tk.Button(
+                btn_row,
+                text="Toggle PDF Capture",
+                command=self._toggle_pdf_capture,
+                font=theme_font("button"),
+                bg=_PDF_TOGGLE_ON if self._pdf_capture else _PDF_TOGGLE_OFF,
+                fg=_PDF_TOGGLE_FG,
+                activebackground=THEME["excel_accent_dim"]
+                if self._pdf_capture
+                else "#dc2626",
+                activeforeground=_PDF_TOGGLE_FG,
+                relief=tk.FLAT,
+                bd=0,
+                highlightthickness=0,
+                cursor="hand2",
+                padx=14,
+                pady=7,
+            )
+            self._pdf_toggle_btn.pack(side=tk.LEFT, padx=(8, 0))
+        d_bg, d_active = danger_colors()
+        make_flat_button(
+            btn_row,
+            text="Close",
+            command=self._root.destroy,
+            bg=d_bg,
+            active_bg=d_active,
+        ).pack(side=tk.RIGHT)
 
-        tree_outer = tk.Frame(self._frm, bg=UI_BG)
+        tree_outer = tk.Frame(self._frm, bg=THEME["bg"])
         tree_outer.pack(fill=tk.BOTH, expand=True)
 
         cols = (
@@ -375,6 +430,7 @@ class TrackingStatusViewerApp:
             show="headings",
             selectmode="browse",
             height=min(18, max(6, len(self._row_infos) or 6)),
+            style="Launcher.Treeview",
         )
         self._tree.heading("idx", text="#")
         self._tree.heading("tracking_number", text="Tracking number")
@@ -397,10 +453,10 @@ class TrackingStatusViewerApp:
         self._tree.tag_configure(
             _ROW_POD_COMPLETE,
             background="#166534",
-            foreground=UI_FG,
+            foreground=THEME["fg"],
         )
 
-        scroll = dark_tk_scrollbar(tree_outer, tk.VERTICAL, self._tree.yview)
+        scroll = launcher_scrollbar(tree_outer, tk.VERTICAL, self._tree.yview)
         self._tree.configure(yscrollcommand=scroll.set)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -447,9 +503,35 @@ class TrackingStatusViewerApp:
         )
 
         if not self._row_infos:
-            ttk.Label(self._frm, text="No tracking numbers in this file.", foreground=UI_FG_DIM).pack()
+            tk.Label(
+                self._frm,
+                text="No tracking numbers in this file.",
+                fg=THEME["muted"],
+                bg=THEME["bg"],
+                font=theme_font("body"),
+            ).pack()
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_viewer_closing)
+
+        if self._hub_remaining_mode and self._project_root is not None:
+            ok, err = pdf_capture_environment_ready()
+            if ok:
+                ctrl = HtmlCaptureController(
+                    on_notify=self._on_capture_notify,
+                    on_saved=self._on_capture_saved,
+                    verbose=RL.is_debug(),
+                )
+                if ctrl.start():
+                    self._capture_controller = ctrl
+                else:
+                    self._pdf_capture = False
+            else:
+                self._pdf_capture = False
+                messagebox.showwarning(
+                    "Proof of delivery capture",
+                    (err or "Chrome and websocket-client on Windows are required for hands-free capture.")
+                    + "\n\nDouble-click will open the carrier site in your default browser only.",
+                )
 
     def _on_viewer_closing(self) -> None:
         if self._capture_controller is not None:
@@ -461,8 +543,11 @@ class TrackingStatusViewerApp:
         def _ui() -> None:
             if level == "error":
                 messagebox.showerror("PDF capture", message)
-            else:
-                messagebox.showinfo("PDF capture", message)
+                return
+            if self._hub_remaining_mode:
+                # Hands-free mode: avoid stacking info popups while pages load.
+                return
+            messagebox.showinfo("PDF capture", message)
 
         self._root.after(0, _ui)
 
@@ -673,7 +758,10 @@ class TrackingStatusViewerApp:
             if self._capture_controller is not None:
                 self._capture_controller.stop()
                 self._capture_controller = None
-            self._pdf_toggle_btn.config(bg=_PDF_TOGGLE_OFF, activebackground="#dc2626")
+            if self._pdf_toggle_btn is not None:
+                self._pdf_toggle_btn.config(
+                    bg=_PDF_TOGGLE_OFF, activebackground="#dc2626"
+                )
             self._cancel_pod_poll()
             if self._project_root is not None:
                 self._schedule_pod_poll()
@@ -694,7 +782,10 @@ class TrackingStatusViewerApp:
             return
         self._capture_controller = ctrl
         self._pdf_capture = True
-        self._pdf_toggle_btn.config(bg=_PDF_TOGGLE_ON, activebackground="#16a34a")
+        if self._pdf_toggle_btn is not None:
+            self._pdf_toggle_btn.config(
+                bg=_PDF_TOGGLE_ON, activebackground=THEME["excel_accent_dim"]
+            )
         self._apply_pod_completion_layout()
         if self._project_root is not None:
             self._schedule_pod_poll()
@@ -763,7 +854,11 @@ class TrackingStatusViewerApp:
                     "Turn on Toggle PDF Capture first, then double-click a row to open the page.",
                 )
                 return
-            self._capture_controller.enqueue_capture(url, expected_pdf)
+            self._capture_controller.enqueue_capture(
+                url,
+                expected_pdf,
+                auto_print_pdf=self._hub_remaining_mode,
+            )
             return
 
         self._open_carrier_in_browser_only()
@@ -789,23 +884,46 @@ class TrackingStatusViewerApp:
 
         dlg = tk.Toplevel(self._root)
         dlg.title(f"Details — {num}")
-        setup_dark_theme(dlg)
-        dlg.configure(bg=UI_BG_PANEL)
+        apply_launcher_theme_root(dlg)
         dlg.geometry("720x480")
-        ttk.Label(dlg, text="Milestones / events", foreground=UI_FG).pack(anchor=tk.W, padx=8, pady=(8, 4))
+        tk.Label(
+            dlg,
+            text="Milestones / events",
+            anchor=tk.W,
+            padx=8,
+            pady=(8, 4),
+            **settings_label_opts(),
+        ).pack(anchor=tk.W)
         t1 = scrolledtext.ScrolledText(dlg, height=12, width=86)
-        style_text_widget(t1)
+        style_scrolled_text(t1)
         t1.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         t1.insert(tk.END, body)
         t1.configure(state=tk.DISABLED)
 
-        ttk.Label(dlg, text="Cached gettrackinfo (JSON)", foreground=UI_FG_DIM).pack(anchor=tk.W, padx=8)
+        tk.Label(
+            dlg,
+            text="Cached gettrackinfo (JSON)",
+            anchor=tk.W,
+            padx=8,
+            fg=THEME["muted"],
+            bg=THEME["bg"],
+            font=theme_font("body"),
+        ).pack(anchor=tk.W)
         t2 = scrolledtext.ScrolledText(dlg, height=10, width=86)
-        style_text_widget(t2)
+        style_scrolled_text(t2)
         t2.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
         t2.insert(tk.END, json.dumps(raw_get, indent=2, ensure_ascii=False) if raw_get else "{}")
         t2.configure(state=tk.DISABLED)
-        ttk.Button(dlg, text="Close", command=dlg.destroy).pack(anchor=tk.E, padx=8, pady=(0, 8))
+        btn_bar = tk.Frame(dlg, bg=THEME["bg"])
+        btn_bar.pack(fill=tk.X, padx=8, pady=(0, 8))
+        d_bg, d_active = danger_colors()
+        make_flat_button(
+            btn_bar,
+            text="Close",
+            command=dlg.destroy,
+            bg=d_bg,
+            active_bg=d_active,
+        ).pack(side=tk.RIGHT)
 
     def _force_check_selected_tracking_number(self) -> None:
         idx = self._selected_index()

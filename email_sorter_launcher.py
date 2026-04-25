@@ -29,6 +29,14 @@ from shared.settings_store import (
     read_settings_json,
     write_settings_json,
 )
+from shared.tk_launcher_theme import (
+    SettingsStyleSwitch as _SettingsSwitch,
+    add_button_hover as _add_button_hover,
+    make_flat_button as _make_button,
+    settings_entry_opts,
+    settings_label_opts,
+    theme_font as _font,
+)
 
 _PYTHON_FILES_DIR = Path(__file__).resolve().parent
 _BASE_DIR = _PYTHON_FILES_DIR.parent
@@ -42,52 +50,6 @@ _DANGER_BG = THEME["stop_fg"]
 _DANGER_ACTIVE_BG = "#da3633"
 _UPDATE_BG = "#f59e0b"
 _UPDATE_ACTIVE_BG = "#d97706"
-
-
-def _font(name: str) -> tuple[str, int] | tuple[str, int, str]:
-    fonts = {
-        "titlebar": ("Segoe UI", 9),
-        "title": ("Segoe UI", 14, "bold"),
-        "body": ("Segoe UI", 10),
-        "button": ("Segoe UI", 10, "bold"),
-        "input": ("Segoe UI", 10),
-    }
-    return fonts[name]
-
-
-def _blend_hex_color(hex_color: str, target: str = "#ffffff", amount: float = 0.14) -> str:
-    try:
-        base = hex_color.strip().lstrip("#")
-        dest = target.strip().lstrip("#")
-        if len(base) != 6 or len(dest) != 6:
-            return hex_color
-        b = tuple(int(base[i : i + 2], 16) for i in (0, 2, 4))
-        d = tuple(int(dest[i : i + 2], 16) for i in (0, 2, 4))
-    except ValueError:
-        return hex_color
-    mixed = tuple(max(0, min(255, round(c + (t - c) * amount))) for c, t in zip(b, d))
-    return "#" + "".join(f"{c:02x}" for c in mixed)
-
-
-def _add_button_hover(btn: tk.Button, *, normal_bg: str, hover_bg: str | None = None) -> tk.Button:
-    hover = hover_bg or _blend_hex_color(normal_bg)
-
-    def on_enter(_event: tk.Event) -> None:
-        try:
-            if str(btn.cget("state")) != tk.DISABLED:
-                btn.configure(bg=hover)
-        except tk.TclError:
-            pass
-
-    def on_leave(_event: tk.Event) -> None:
-        try:
-            btn.configure(bg=normal_bg)
-        except tk.TclError:
-            pass
-
-    btn.bind("<Enter>", on_enter, add="+")
-    btn.bind("<Leave>", on_leave, add="+")
-    return btn
 
 
 def _attach_tooltip(widget: tk.Misc, text: str) -> None:
@@ -146,40 +108,6 @@ def _make_file_explorer_icon(master: tk.Misc) -> tk.PhotoImage:
     icon.put("#60a5fa", to=(19, 15, 27, 18))
     icon.put("#1d4ed8", to=(18, 19, 27, 21))
     return icon
-
-
-def _make_button(
-    parent: tk.Misc,
-    *,
-    text: str,
-    command,
-    bg: str,
-    fg: str = "#ffffff",
-    active_bg: str | None = None,
-    active_fg: str | None = None,
-    padx: int = 18,
-    pady: int = 7,
-    width: int | None = None,
-) -> tk.Button:
-    opts: dict[str, object] = {
-        "text": text,
-        "command": command,
-        "font": _font("button"),
-        "bg": bg,
-        "fg": fg,
-        "activebackground": active_bg or bg,
-        "activeforeground": active_fg or fg,
-        "relief": tk.FLAT,
-        "bd": 0,
-        "highlightthickness": 0,
-        "cursor": "hand2",
-        "padx": padx,
-        "pady": pady,
-    }
-    if width is not None:
-        opts["width"] = width
-    btn = tk.Button(parent, **opts)
-    return _add_button_hover(btn, normal_bg=bg, hover_bg=active_bg)
 
 
 def _set_app_icon(win: tk.Toplevel | tk.Tk) -> None:
@@ -951,41 +879,6 @@ def _settings_truthy(raw: str | None) -> bool:
     return (raw or "").strip().lower() in ("1", "true", "yes")
 
 
-class _SettingsSwitch(tk.Frame):
-    """Compact on/off control (IntVar 0/1) for Settings rows."""
-
-    def __init__(self, parent: tk.Misc, variable: tk.IntVar) -> None:
-        try:
-            bg = parent.cget("bg")
-        except tk.TclError:
-            bg = "SystemButtonFace"
-        super().__init__(parent, bg=bg)
-        self._var = variable
-        self._cv = tk.Canvas(
-            self,
-            width=48,
-            height=26,
-            highlightthickness=0,
-            bg=bg,
-            cursor="hand2",
-        )
-        self._cv.pack(side=tk.LEFT)
-        self._var.trace_add("write", lambda *_: self._draw())
-        self._cv.bind("<Button-1>", self._toggle)
-        self._draw()
-
-    def _toggle(self, _evt: object | None = None) -> None:
-        self._var.set(1 - (1 if self._var.get() else 0))
-
-    def _draw(self) -> None:
-        self._cv.delete("all")
-        on = bool(self._var.get())
-        color = THEME["excel_accent"] if on else THEME["track"]
-        self._cv.create_rectangle(2, 6, 46, 20, fill=color, outline="", width=0)
-        cx = 33 if on else 15
-        self._cv.create_oval(cx - 9, 4, cx + 9, 22, fill="#ffffff", outline=THEME["border"], width=1)
-
-
 class SettingsDialog:
     """Edit required app values; Save writes ``python_files/email_sorter_settings.json``."""
 
@@ -1011,17 +904,8 @@ class SettingsDialog:
         content = self._win
         outer = tk.Frame(content, padx=18, pady=18, bg=THEME["bg"])
         outer.pack(fill=tk.BOTH, expand=True)
-        label_opts = {"font": _font("body"), "fg": THEME["fg"], "bg": THEME["bg"]}
-        entry_opts = {
-            "font": _font("input"),
-            "fg": THEME["fg"],
-            "bg": THEME["surface"],
-            "insertbackground": THEME["fg"],
-            "relief": tk.FLAT,
-            "highlightthickness": 1,
-            "highlightbackground": THEME["border"],
-            "highlightcolor": THEME["run_accent"],
-        }
+        label_opts = settings_label_opts()
+        entry_opts = settings_entry_opts()
 
         r = 0
         tk.Label(
