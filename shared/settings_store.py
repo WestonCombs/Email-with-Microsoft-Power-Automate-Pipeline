@@ -42,8 +42,16 @@ ENV_FALLBACK_SETTING_KEYS = frozenset(
     }
 )
 
+ENV_RUNTIME_KEYS = frozenset(
+    {
+        "HTML_CAPTURE_DEBUG_PORT",
+    }
+)
+
+_ENV_FILE_KEYS = ENV_FALLBACK_SETTING_KEYS | ENV_RUNTIME_KEYS
+
 _PROCESS_ENV_FALLBACKS = {
-    key: (os.environ.get(key) or "").strip() for key in ENV_FALLBACK_SETTING_KEYS
+    key: (os.environ.get(key) or "").strip() for key in _ENV_FILE_KEYS
 }
 
 _DEFAULT_ENV: dict[str, str] = {
@@ -100,7 +108,7 @@ def _read_env_file_settings() -> dict[str, str]:
             continue
         key, raw_value = line.split("=", 1)
         key = key.strip()
-        if key not in ENV_FALLBACK_SETTING_KEYS:
+        if key not in _ENV_FILE_KEYS:
             continue
         value = _unquote_env_value(raw_value)
         if value:
@@ -185,6 +193,11 @@ def apply_runtime_settings_from_json() -> None:
             os.environ[key] = _DEFAULT_ENV[key]
         else:
             os.environ.pop(key, None)
+
+    for key in ENV_RUNTIME_KEYS:
+        value = (env_data.get(key) or "").strip()
+        if value:
+            os.environ[key] = value
 
     login_next = (json_data.get("LOGIN_NEW_ACCOUNT_NEXT_RUN") or "").strip()
     if login_next:

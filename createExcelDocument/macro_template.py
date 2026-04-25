@@ -30,6 +30,7 @@ Private Const COL_TRACK_NUM_START As Long = 45
 Private Const COL_TRACK_NUM_END As Long = 59
 Private Const COL_TRACK_CONF_START As Long = 60
 Private Const COL_TRACK_CONF_END As Long = 74
+Private Const DEFAULT_HEADER_ROW As Long = 2
 
 Private Function ReadUtf8File(ByVal path As String) As String
     Dim stm As Object
@@ -126,16 +127,26 @@ NextTC:
     CollectTrackingNumbersAndConfirmForRow = body
 End Function
 
+Private Function HeaderRow(ByVal Sh As Object) As Long
+    If Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 1).Value)) = "Category" Then
+        HeaderRow = DEFAULT_HEADER_ROW
+    Else
+        HeaderRow = 1
+    End If
+End Function
+
 Private Function HeaderColumn(ByVal Sh As Object, ByVal want As String) As Long
     Dim c As Long
     Dim lastCol As Long
     Dim h As String
+    Dim rowNum As Long
+    rowNum = HeaderRow(Sh)
     On Error Resume Next
-    lastCol = Sh.Cells(1, Sh.Columns.Count).End(xlToLeft).Column
+    lastCol = Sh.Cells(rowNum, Sh.Columns.Count).End(xlToLeft).Column
     On Error GoTo 0
     If lastCol < 1 Then lastCol = 1
     For c = 1 To lastCol
-        h = Trim(CStr(Sh.Cells(1, c).Value))
+        h = Trim(CStr(Sh.Cells(rowNum, c).Value))
         If StrComp(h, want, vbTextCompare) = 0 Then
             HeaderColumn = c
             Exit Function
@@ -628,7 +639,7 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
 
     On Error GoTo CleanFail
 
-    header = Trim(CStr(Sh.Cells(1, Target.Range.Column).Value))
+    header = Trim(CStr(Sh.Cells(HeaderRow(Sh), Target.Range.Column).Value))
 
     If StrComp(header, "View Tracking Links", vbTextCompare) = 0 _
         Or StrComp(header, "View tracking links", vbTextCompare) = 0 _

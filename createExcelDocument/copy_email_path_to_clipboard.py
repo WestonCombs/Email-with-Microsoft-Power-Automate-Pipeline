@@ -15,6 +15,11 @@ import sys
 import urllib.parse
 
 
+def explorer_select_command(explorer: str, path: str) -> str:
+    """Explorer requires quotes after /select, for paths with spaces."""
+    return f'"{explorer}" /select,"{path}"'
+
+
 def file_uri_to_windows_path(uri: str) -> str:
     raw = uri.strip()
     if not raw.lower().startswith("file:"):
@@ -59,7 +64,7 @@ def main() -> int:
 
     windir = os.environ.get("WINDIR", r"C:\Windows")
     explorer = os.path.join(windir, "explorer.exe")
-    subprocess.run([explorer, f"/select,{path}"], check=False)
+    subprocess.Popen(explorer_select_command(explorer, path), shell=False)
     return 0
 
 
