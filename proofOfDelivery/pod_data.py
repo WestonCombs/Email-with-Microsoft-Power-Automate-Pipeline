@@ -379,6 +379,12 @@ def _pod_record_identity(record: dict) -> str:
 
 
 def discover_proof_of_delivery_records(project_root: Path, base_records: list[dict]) -> list[dict]:
+    try:
+        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
+    except Exception:
+        def tracking_is_greyed_out(_tracking_number: str) -> bool:
+            return False
+
     discovered: list[dict] = []
     seen_links: set[str] = set()
     for source_index, record in enumerate(base_records):
@@ -390,6 +396,8 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
         source_category = clean_value(record.get("email_category"))
         source_email = clean_value(record.get("email"))
         for tracking_number in tracking_numbers_for_record(record):
+            if tracking_is_greyed_out(tracking_number):
+                continue
             carrier_display = _carrier_display_for_number(tracking_number)
             pdf_path = expected_pod_pdf_path(
                 project_root,

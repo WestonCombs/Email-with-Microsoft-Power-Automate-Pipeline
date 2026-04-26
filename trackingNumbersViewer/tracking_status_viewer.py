@@ -681,6 +681,8 @@ class TrackingStatusViewerApp:
         return None
 
     def _processed_pdf_path_for_info(self, info: dict[str, object]) -> Path | None:
+        if self._has_grey_status(info):
+            return None
         expected_pdf = self._expected_pdf_path_for_info(info)
         if expected_pdf is not None and expected_pdf.is_file():
             return expected_pdf

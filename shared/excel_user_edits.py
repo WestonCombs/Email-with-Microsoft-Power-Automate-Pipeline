@@ -11,6 +11,7 @@ ALLOWED_EXCEL_USER_EDIT_FIELDS = ("company", "total_amount_paid", "tax_paid")
 ALLOWED_EXCEL_USER_EDIT_LABELS = ("Company", "Total Paid", "Tax Paid")
 EXCEL_USER_EDITS_JSON_NAME = "excel_user_edits.json"
 LLM_OBTAINED_COMPANY_FIELD = "llm_obtained_company"
+ORIGINAL_LLM_OBTAINED_COMPANY_FIELD = "original_llm_obtained_company"
 
 
 def excel_user_edits_path(project_root: Path) -> Path:
@@ -136,26 +137,47 @@ def _company_consensus_value(values: list[str]) -> str | None:
     originals = Counter(originals_by_vote_key[winning_vote_key])
     return sorted(
         originals.items(),
-        key=lambda item: (-item[1], -len(item[0]), item[0]),
+        key=_company_display_sort_key,
     )[0][0]
 
 
-def _company_baseline_candidate(record: dict, overlay: dict | None = None) -> str | None:
-    llm_company = _clean_record_value(record.get(LLM_OBTAINED_COMPANY_FIELD))
-    if isinstance(llm_company, str) and llm_company:
-        return llm_company
+def _company_display_sort_key(item: tuple[str, int]) -> tuple[int, int, int, str, str]:
+    value, count = item
+    has_alpha = any(ch.isalpha() for ch in value)
+    all_caps_penalty = 1 if has_alpha and value.upper() == value else 0
+    return (-count, all_caps_penalty, -len(value), value.casefold(), value)
+
+
+def _company_baseline_candidates(
+    record: dict, overlay: dict | None = None
+) -> list[str]:
+    candidates: list[str] = []
+    seen_vote_keys: set[str] = set()
+
+    values: list[Any] = [
+        record.get(ORIGINAL_LLM_OBTAINED_COMPANY_FIELD),
+        record.get(LLM_OBTAINED_COMPANY_FIELD),
+    ]
     if overlay is not None:
-        original_company = _clean_record_value(_original_value_for_clear(overlay, record, "company"))
-        if isinstance(original_company, str) and original_company:
-            return original_company
-    explicit_company = _clean_record_value(record.get("company"))
-    if isinstance(explicit_company, str) and explicit_company:
-        return explicit_company
-    for key in ("source_file",):
-        source_company = _infer_company_from_source_file(record.get(key))
-        if source_company:
-            return source_company
-    return _infer_company_from_subject(record.get("subject"))
+        values.append(_original_value_for_clear(overlay, record, "company"))
+    if not is_modified(record, "company"):
+        values.append(record.get("company"))
+    values.append(_infer_company_from_subject(record.get("subject")))
+
+    if not any(_normalized_company_vote_key(v) for v in values):
+        values.append(_infer_company_from_source_file(record.get("source_file")))
+
+    for value in values:
+        cleaned = _clean_record_value(value)
+        if not isinstance(cleaned, str) or not cleaned:
+            continue
+        vote_key = _normalized_company_vote_key(cleaned)
+        if not vote_key or vote_key in seen_vote_keys:
+            continue
+        seen_vote_keys.add(vote_key)
+        candidates.append(cleaned)
+
+    return candidates
 
 
 def ensure_llm_obtained_company_fields(
@@ -168,11 +190,19 @@ def ensure_llm_obtained_company_fields(
     for record in records:
         if not isinstance(record, dict):
             continue
-        candidate = _company_baseline_candidate(record, overlay)
-        record_candidates[id(record)] = candidate
+        if (
+            ORIGINAL_LLM_OBTAINED_COMPANY_FIELD not in record
+            and _clean_record_value(record.get(LLM_OBTAINED_COMPANY_FIELD))
+        ):
+            record[ORIGINAL_LLM_OBTAINED_COMPANY_FIELD] = _clean_record_value(
+                record.get(LLM_OBTAINED_COMPANY_FIELD)
+            )
+            changed = True
+        candidates = _company_baseline_candidates(record, overlay)
+        record_candidates[id(record)] = candidates[0] if candidates else None
         order_number = str(record.get("order_number") or "").strip()
-        if order_number and candidate:
-            order_candidates[order_number].append(candidate)
+        if order_number:
+            order_candidates[order_number].extend(candidates)
 
     order_winners = {
         order_number: _company_consensus_value(values)
@@ -336,10 +366,41 @@ def apply_user_edits_to_records(project_root: Path, records: list[dict]) -> list
     if not isinstance(order_company, dict):
         order_company = {}
     ensure_llm_obtained_company_fields(records, overlay)
+    overlay_changed = False
+
+    records_by_order: dict[str, list[dict]] = defaultdict(list)
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        order_number = str(record.get("order_number") or "").strip()
+        if order_number:
+            records_by_order[order_number].append(record)
+
+    for order_number, company_edit in list(order_company.items()):
+        if not isinstance(company_edit, dict) or company_edit.get("value") is None:
+            continue
+        order_records = records_by_order.get(str(order_number))
+        if order_records and all(
+            _company_value_matches_stored_unmodified(
+                record, overlay, company_edit.get("value")
+            )
+            for record in order_records
+        ):
+            order_company.pop(order_number, None)
+            overlay_changed = True
 
     for record in records:
         if not isinstance(record, dict):
             continue
+        if is_modified(record, "company") and _company_value_matches_stored_unmodified(
+            record, overlay, record.get("company")
+        ):
+            restored_company = _clean_record_value(record.get(LLM_OBTAINED_COMPANY_FIELD))
+            if restored_company is None:
+                restored_company = _original_value_for_clear(overlay, record, "company")
+            record["company"] = restored_company
+            _clear_modified_field_state(record, "company")
+
         order_number = str(record.get("order_number") or "").strip()
         company_edit = order_company.get(order_number)
         if (
@@ -347,9 +408,12 @@ def apply_user_edits_to_records(project_root: Path, records: list[dict]) -> list
             and "value" in company_edit
             and company_edit.get("value") is not None
         ):
-            record["company"] = company_edit.get("value")
-            record[modified_key("company")] = True
-            record["user_modified"] = True
+            if not _company_value_matches_stored_unmodified(
+                record, overlay, company_edit.get("value")
+            ):
+                record["company"] = company_edit.get("value")
+                record[modified_key("company")] = True
+                record["user_modified"] = True
 
         item = records_overlay.get(record_identity(record))
         if not isinstance(item, dict):
@@ -359,9 +423,18 @@ def apply_user_edits_to_records(project_root: Path, records: list[dict]) -> list
             continue
         for field in ALLOWED_EXCEL_USER_EDIT_FIELDS:
             if field in values and values[field] is not None:
+                if field == "company" and _company_value_matches_stored_unmodified(
+                    record, overlay, values[field]
+                ):
+                    _clear_record_overlay(overlay, record, field)
+                    overlay_changed = True
+                    continue
                 record[field] = values[field]
                 record[modified_key(field)] = True
                 record["user_modified"] = True
+
+    if overlay_changed:
+        save_user_edit_overlay(project_root, overlay)
 
     return records
 
@@ -404,6 +477,17 @@ def _refresh_user_modified_state(record: dict, timestamp: str) -> None:
     record.pop("user_modified_at", None)
 
 
+def _clear_modified_field_state(record: dict, field: str) -> None:
+    record.pop(modified_key(field), None)
+    any_modified = any(
+        str(key).startswith("modified_") and bool(value)
+        for key, value in record.items()
+    )
+    if not any_modified:
+        record.pop("user_modified", None)
+        record.pop("user_modified_at", None)
+
+
 def _restore_unmodified_value(
     record: dict, field: str, value: Any, timestamp: str
 ) -> None:
@@ -442,6 +526,29 @@ def _original_value_for_clear(overlay: dict, record: dict, field: str) -> Any:
     if field not in original_values:
         return record.get(field)
     return original_values.get(field)
+
+
+def _company_stored_unmodified_values(record: dict, overlay: dict) -> list[Any]:
+    values: list[Any] = [
+        record.get(ORIGINAL_LLM_OBTAINED_COMPANY_FIELD),
+        record.get(LLM_OBTAINED_COMPANY_FIELD),
+        _original_value_for_clear(overlay, record, "company"),
+    ]
+    if not is_modified(record, "company"):
+        values.append(record.get("company"))
+    return values
+
+
+def _company_value_matches_stored_unmodified(
+    record: dict, overlay: dict, value: Any
+) -> bool:
+    wanted = _normalized_company_vote_key(value)
+    if not wanted:
+        return False
+    return any(
+        _normalized_company_vote_key(candidate) == wanted
+        for candidate in _company_stored_unmodified_values(record, overlay)
+    )
 
 
 def _update_record_overlay(overlay: dict, record: dict, field: str, value: Any, timestamp: str) -> None:
@@ -494,10 +601,12 @@ def record_excel_user_edit(
     changed_files: list[str] = []
     result_record: dict | None = None
     result_record_source_match = False
+    changed_by_path: dict[Path, bool] = {}
+    matched_entries: list[tuple[Path, dict]] = []
 
     clean_order = str(order_number or "").strip()
     for path, records in file_records:
-        changed = ensure_llm_obtained_company_fields(records, overlay)
+        changed_by_path[path] = ensure_llm_obtained_company_fields(records, overlay)
         for record in records:
             if field == "company" and clean_order:
                 match = str(record.get("order_number") or "").strip() == clean_order
@@ -505,7 +614,27 @@ def record_excel_user_edit(
                 match = record_matches_source_uri(record, source_uri)
             if not match:
                 continue
-            if clear_requested:
+            matched_entries.append((path, record))
+
+    if not matched_entries:
+        raise ValueError("Could not match the edited Excel row to a JSON record.")
+
+    reset_requested = clear_requested or (
+        field == "company"
+        and any(
+            _company_value_matches_stored_unmodified(record, overlay, value)
+            for _path, record in matched_entries
+        )
+    )
+
+    matched_by_path: dict[Path, list[dict]] = defaultdict(list)
+    for path, record in matched_entries:
+        matched_by_path[path].append(record)
+
+    for path, records in file_records:
+        changed = changed_by_path.get(path, False)
+        for record in matched_by_path.get(path, []):
+            if reset_requested:
                 if field == "company":
                     restored_value = _clean_record_value(record.get(LLM_OBTAINED_COMPANY_FIELD))
                     if restored_value is None:
@@ -528,10 +657,7 @@ def record_excel_user_edit(
             save_json_records(path, records)
             changed_files.append(str(path))
 
-    if matched == 0:
-        raise ValueError("Could not match the edited Excel row to a JSON record.")
-
-    if clear_requested:
+    if reset_requested:
         order_company = overlay.get("order_company")
         if field == "company" and clean_order and isinstance(order_company, dict):
             order_company.pop(clean_order, None)
@@ -544,12 +670,12 @@ def record_excel_user_edit(
     display_value = display_value_for_field(result_record or {}, field)
     return {
         "field": field,
-        "value": value,
+        "value": None if reset_requested else value,
         "order_number": clean_order,
         "source_uri": source_uri,
         "matched_records": matched,
         "changed_files": changed_files,
-        "mode": "cleared" if clear_requested else "modified",
+        "mode": "cleared" if reset_requested else "modified",
         "display_value": display_value,
         "display_value_kind": display_value_kind(display_value),
     }

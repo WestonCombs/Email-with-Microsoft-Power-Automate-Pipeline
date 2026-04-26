@@ -43,7 +43,7 @@ Private editRainbowPalette As Variant
 
 Private Const TRIPLE_ESC_MAX_GAP_SEC As Long = 2
 Private Const EDIT_MODE_SECONDS As Long = 10
-Private Const EDIT_RAINBOW_FRAME_STEP As Long = 3
+Private Const EDIT_RAINBOW_FRAME_SECONDS As Double = 0.12
 Private Const TOP_ROW As Long = 1
 Private Const DEFAULT_HEADER_ROW As Long = 2
 Private Const COL_FILE_URI As Long = 29
@@ -108,16 +108,15 @@ Public Sub EmailSorter_StartEditMode()
     editEventsBusy = False
     editOldStatusBar = Application.StatusBar
     editExpiresAt = Now + TimeSerial(0, 0, EDIT_MODE_SECONDS)
-    Application.OnTime editExpiresAt, EmailSorter_ProcedureBinding("EmailSorter_EditModeTimeout")
 
     editRainbowFrame = 0
     editRainbowPalette = EmailSorter_RainbowPalette()
     EmailSorter_ApplyTopRowRainbowCycle ActiveSheet
-    EmailSorter_ScheduleTopRowRainbowCycle
     Application.StatusBar = "Edit mode armed for 10 seconds. Allowed: " & USER_EDIT_ALLOWED_LABELS
     If TypeName(Selection) = "Range" Then
         EmailSorter_HandleSelectionChange ActiveSheet, Selection
     End If
+    EmailSorter_RunTopRowRainbowLoop ActiveSheet
     Exit Sub
 CleanFail:
     EmailSorter_EndEditMode False
@@ -220,7 +219,7 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
     EmailSorter_ReadUserEditSyncResult lastUserEditContextTsv, resultMode, resultValue, resultValueKind
     editEventsBusy = True
     Application.EnableEvents = False
-    If Len(cleanValue) = 0 And LCase$(resultMode) = "cleared" Then
+    If LCase$(resultMode) = "cleared" Then
         If fieldKey = "company" And Len(orderNumber) > 0 Then
             EmailSorter_ApplyCompanyEditToOrder Sh, orderNumber, resultValue, False, resultValueKind
         Else
@@ -303,35 +302,40 @@ End Sub
 
 Private Sub EmailSorter_CancelScheduledTimeout()
     On Error Resume Next
-    If editExpiresAt <> 0 Then
-        Application.OnTime editExpiresAt, EmailSorter_ProcedureBinding("EmailSorter_EditModeTimeout"), , False
-        editExpiresAt = 0
-    End If
+    editExpiresAt = 0
 End Sub
 
-Private Sub EmailSorter_ScheduleTopRowRainbowCycle()
-    On Error Resume Next
-    If Not editModeEnabled Then Exit Sub
-    editCycleAt = Now + TimeSerial(0, 0, 1)
-    Application.OnTime editCycleAt, EmailSorter_ProcedureBinding("EmailSorter_TopRowRainbowCycleTick")
-End Sub
+Private Sub EmailSorter_RunTopRowRainbowLoop(ByVal ws As Worksheet)
+    Dim startedAt As Double
+    Dim frameStartedAt As Double
 
-Public Sub EmailSorter_TopRowRainbowCycleTick()
-    On Error Resume Next
-    If Not editModeEnabled Then Exit Sub
-    If TypeName(ActiveSheet) = "Worksheet" Then
-        editRainbowFrame = editRainbowFrame + EDIT_RAINBOW_FRAME_STEP
-        EmailSorter_ApplyTopRowRainbowCycle ActiveSheet
-    End If
-    EmailSorter_ScheduleTopRowRainbowCycle
+    On Error GoTo CleanFail
+    startedAt = Timer
+    Do While editModeEnabled And EmailSorter_ElapsedSeconds(startedAt) < EDIT_MODE_SECONDS
+        editRainbowFrame = editRainbowFrame + 1
+        If TypeName(ActiveSheet) = "Worksheet" Then
+            EmailSorter_ApplyTopRowRainbowCycle ActiveSheet
+        Else
+            EmailSorter_ApplyTopRowRainbowCycle ws
+        End If
+
+        frameStartedAt = Timer
+        Do While editModeEnabled _
+            And EmailSorter_ElapsedSeconds(frameStartedAt) < EDIT_RAINBOW_FRAME_SECONDS _
+            And EmailSorter_ElapsedSeconds(startedAt) < EDIT_MODE_SECONDS
+            DoEvents
+        Loop
+    Loop
+
+    If editModeEnabled Then EmailSorter_EndEditMode False
+    Exit Sub
+CleanFail:
+    If editModeEnabled Then EmailSorter_EndEditMode False
 End Sub
 
 Private Sub EmailSorter_CancelScheduledCycle()
     On Error Resume Next
-    If editCycleAt <> 0 Then
-        Application.OnTime editCycleAt, EmailSorter_ProcedureBinding("EmailSorter_TopRowRainbowCycleTick"), , False
-        editCycleAt = 0
-    End If
+    editCycleAt = 0
 End Sub
 
 Private Function EmailSorter_ProcedureBinding(ByVal procName As String) As String
@@ -714,6 +718,13 @@ Private Sub EmailSorter_SetTopRowColor(ByVal ws As Worksheet, ByVal colorValue A
         End If
     Next cell
 End Sub
+
+Private Function EmailSorter_ElapsedSeconds(ByVal startedAt As Double) As Double
+    Dim t As Double
+    t = Timer
+    If t < startedAt Then t = t + 86400#
+    EmailSorter_ElapsedSeconds = t - startedAt
+End Function
 '''
 
 THISWORKBOOK_VBA = r'''Option Explicit
