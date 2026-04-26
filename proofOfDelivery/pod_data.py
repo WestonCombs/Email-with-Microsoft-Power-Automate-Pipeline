@@ -6,6 +6,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 from trackingNumbersViewer.mitm_readiness import sanitize_filename_token
 
@@ -47,6 +49,63 @@ def clean_value(value: Any) -> Any:
     if isinstance(value, str) and value.strip().lower() == "null":
         return None
     return value
+
+
+def _normalized_text(value: object) -> str:
+    return " ".join(str(clean_value(value) or "").strip().split()).casefold()
+
+
+def _normalize_tracking_number(value: object) -> str:
+    text = str(clean_value(value) or "").strip()
+    return "".join(ch for ch in text if not ch.isspace())
+
+
+def _record_tracking_number(record: dict) -> str:
+    pod_num = _normalize_tracking_number(record.get("pod_tracking_number"))
+    if pod_num:
+        return pod_num
+    nums = tracking_numbers_for_record(record)
+    if nums:
+        return _normalize_tracking_number(nums[0])
+    return ""
+
+
+def _path_key(path: Path) -> str:
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser()
+    return str(resolved).replace("/", "\\").casefold()
+
+
+def _safe_path(value: object) -> Path | None:
+    raw = str(clean_value(value) or "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _path_from_file_uri(value: object) -> Path | None:
+    raw = str(clean_value(value) or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+    if parsed.scheme != "file":
+        return None
+    try:
+        local_path = url2pathname(unquote(parsed.path))
+    except Exception:
+        return None
+    try:
+        return Path(local_path).expanduser().resolve()
+    except OSError:
+        return None
 
 
 def is_pod_record(record: object) -> bool:
@@ -196,6 +255,22 @@ def first_existing_pdf_named(project_root: Path, basename: str) -> Path | None:
     return None
 
 
+def _all_existing_pdf_named(project_root: Path, basename: str) -> list[Path]:
+    out_dir = pdf_output_dir(project_root)
+    out: list[Path] = []
+    exact = out_dir / f"{basename}.pdf"
+    if exact.is_file():
+        out.append(exact)
+    collision_re = re.compile(rf"^{re.escape(basename)} \(\d+\)\.pdf$", re.IGNORECASE)
+    try:
+        for path in out_dir.glob("*.pdf"):
+            if path.is_file() and collision_re.match(path.name):
+                out.append(path)
+    except OSError:
+        pass
+    return out
+
+
 def first_existing_legacy_email_capture_pdf_path(
     project_root: Path,
     company: object,
@@ -289,7 +364,14 @@ def automation_hub_record() -> dict:
 
 
 def _base_record_company(record: dict) -> str:
-    return str(clean_value(record.get("company")) or "").strip() or "Unknown"
+    return (
+        str(
+            clean_value(record.get("company"))
+            or clean_value(record.get("llm_obtained_company"))
+            or ""
+        ).strip()
+        or "Unknown"
+    )
 
 
 def _pod_record_identity(record: dict) -> str:
@@ -375,6 +457,18 @@ def sync_proof_of_delivery_records(project_root: Path) -> tuple[list[dict], bool
     base_records = load_results_records(project_root)
     desired = discover_proof_of_delivery_records(project_root, base_records)
     current = load_proof_of_delivery_records(project_root)
+    desired_ids = {_pod_record_identity(r) for r in desired if _pod_record_identity(r)}
+    for record in current:
+        if not isinstance(record, dict):
+            continue
+        if not record.get("user_modified") and not any(
+            str(k).startswith("modified_") and bool(v) for k, v in record.items()
+        ):
+            continue
+        ident = _pod_record_identity(record)
+        if ident and ident not in desired_ids:
+            desired.append(record)
+            desired_ids.add(ident)
     changed = json.dumps(current, sort_keys=True, ensure_ascii=False) != json.dumps(
         desired,
         sort_keys=True,
@@ -539,6 +633,148 @@ def pod_status_viewer_rows(project_root: Path) -> list[dict]:
                 }
             )
     return out
+
+
+def delete_processed_tracking_artifacts(
+    project_root: Path,
+    *,
+    tracking_number: object,
+    company: object = "",
+    purchase_datetime: object = "",
+    carrier_display: object = "",
+    order_number: object = "",
+    category: object = "",
+    processed_pdf_path: str | Path | None = None,
+) -> dict[str, int]:
+    """Delete capture artifacts for one tracking row and forget related JSON references."""
+    target_tracking = _normalize_tracking_number(tracking_number)
+    target_order = _normalized_text(order_number)
+    target_category = _normalized_text(category)
+    candidate_paths: dict[str, Path] = {}
+
+    def add_candidate(path: Path | None) -> None:
+        if path is None:
+            return
+        key = _path_key(path)
+        candidate_paths[key] = path
+
+    if isinstance(processed_pdf_path, Path):
+        add_candidate(processed_pdf_path)
+    elif processed_pdf_path:
+        add_candidate(_safe_path(processed_pdf_path))
+
+    add_candidate(
+        first_existing_capture_pdf_path(
+            project_root,
+            company,
+            purchase_datetime,
+            tracking_number,
+            carrier_display,
+            order_number,
+            category,
+        )
+    )
+    for basename in (
+        pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display),
+        legacy_pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display),
+        legacy_email_capture_pdf_basename(company, purchase_datetime, order_number, category),
+    ):
+        for path in _all_existing_pdf_named(project_root, basename):
+            add_candidate(path)
+
+    pod_records = load_proof_of_delivery_records(project_root)
+    for record in pod_records:
+        record_tracking = _record_tracking_number(record)
+        if target_tracking and record_tracking != target_tracking:
+            continue
+        if target_order and _normalized_text(record.get("order_number")) not in ("", target_order):
+            continue
+        if target_category and _normalized_text(record.get("pod_source_category") or record.get("email_category")) not in ("", target_category):
+            continue
+        add_candidate(_safe_path(record.get("source_file")))
+        add_candidate(_path_from_file_uri(record.get("source_file_link")))
+
+    audit_file = project_root / "email_contents" / "json" / "tracking_pdf_audit.json"
+    if audit_file.is_file():
+        try:
+            payload = json.loads(audit_file.read_text(encoding="utf-8"))
+            audit_entries = [entry for entry in payload if isinstance(entry, dict)] if isinstance(payload, list) else []
+        except (OSError, json.JSONDecodeError):
+            audit_entries = []
+    else:
+        audit_entries = []
+    for entry in audit_entries:
+        entry_tracking = _normalize_tracking_number(entry.get("tracking_number"))
+        if target_tracking and entry_tracking != target_tracking:
+            continue
+        if target_order and _normalized_text(entry.get("order_number")) not in ("", target_order):
+            continue
+        if target_category and _normalized_text(entry.get("category")) not in ("", target_category):
+            continue
+        add_candidate(_safe_path(entry.get("path")))
+
+    deleted_paths: set[str] = set()
+    deleted_pdf_count = 0
+    for key, path in list(candidate_paths.items()):
+        try:
+            if path.is_file():
+                path.unlink()
+                deleted_pdf_count += 1
+                deleted_paths.add(key)
+        except OSError:
+            continue
+
+    if not deleted_paths:
+        for key in candidate_paths:
+            deleted_paths.add(key)
+
+    kept_pod_records: list[dict] = []
+    removed_pod_records = 0
+    for record in pod_records:
+        record_path = _safe_path(record.get("source_file"))
+        record_uri_path = _path_from_file_uri(record.get("source_file_link"))
+        record_tracking = _record_tracking_number(record)
+        path_match = (
+            (record_path is not None and _path_key(record_path) in deleted_paths)
+            or (record_uri_path is not None and _path_key(record_uri_path) in deleted_paths)
+        )
+        tracking_match = bool(target_tracking) and record_tracking == target_tracking
+        order_match = (not target_order) or (_normalized_text(record.get("order_number")) == target_order)
+        if (path_match or tracking_match) and order_match:
+            removed_pod_records += 1
+            continue
+        kept_pod_records.append(record)
+
+    if removed_pod_records:
+        save_json_records(proof_of_delivery_json_path(project_root), kept_pod_records)
+
+    kept_audit_entries: list[dict[str, Any]] = []
+    removed_audit_entries = 0
+    for entry in audit_entries:
+        entry_path = _safe_path(entry.get("path"))
+        entry_tracking = _normalize_tracking_number(entry.get("tracking_number"))
+        path_match = entry_path is not None and _path_key(entry_path) in deleted_paths
+        tracking_match = bool(target_tracking) and entry_tracking == target_tracking
+        order_match = (not target_order) or (
+            _normalized_text(entry.get("order_number")) in ("", target_order)
+        )
+        if (path_match or tracking_match) and order_match:
+            removed_audit_entries += 1
+            continue
+        kept_audit_entries.append(entry)
+
+    if removed_audit_entries:
+        audit_file.parent.mkdir(parents=True, exist_ok=True)
+        audit_file.write_text(
+            json.dumps(kept_audit_entries, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    return {
+        "deleted_pdfs": deleted_pdf_count,
+        "removed_pod_records": removed_pod_records,
+        "removed_audit_entries": removed_audit_entries,
+    }
 
 
 def parse_sortable_datetime(value: object) -> datetime | None:

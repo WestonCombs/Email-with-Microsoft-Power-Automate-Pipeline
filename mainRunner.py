@@ -240,6 +240,7 @@ OPENAI_USAGE_REL = Path("logs") / "openai usage"
 _CUSTOM_IMPORT_LABEL = "customImportHTML"
 _CUSTOM_IMPORT_EMAIL = "customImportHTML@local.invalid"
 _EXCEL_STEP_WARN_SECONDS_DEFAULT = 120.0
+_DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV = "EMAIL_SORTER_DELETE_SAVED_EMAIL_DATA_THIS_RUN"
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -255,6 +256,27 @@ def _read_float_env(name: str, default: float) -> float:
 
 def _env_truthy(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _delete_saved_email_data_if_requested(base_dir: Path) -> None:
+    delete_requested = _env_truthy(
+        _DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV
+    ) or _env_truthy("DELETE_SAVED_EMAIL_DATA_NEXT_RUN")
+    if not delete_requested:
+        return
+
+    email_contents_dir = base_dir / "email_contents"
+    print(
+        "[Startup] Saved-email-data cleanup is ON - deleting previous email_contents data..."
+    )
+    try:
+        shutil.rmtree(email_contents_dir)
+    except FileNotFoundError:
+        print("  email_contents folder was already missing.")
+    except OSError as e:
+        _fatal(1, f"Could not delete saved email data folder {email_contents_dir}: {e}")
+    else:
+        print(f"  Deleted: {email_contents_dir}")
 
 
 def _custom_import_outlook_env() -> dict[str, str]:
@@ -872,6 +894,7 @@ def main() -> None:
 
     base_dir = ensure_base_dir_in_environ()
     clear_cancel_request(base_dir)
+    _delete_saved_email_data_if_requested(base_dir)
     _emit_run_launcher_progress(1, "Starting…")
 
     azure_client_id = (os.getenv("AZURE_CLIENT_ID") or "").strip()

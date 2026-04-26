@@ -20,6 +20,12 @@ configure_stdio_utf8()
 
 from shared.settings_store import apply_runtime_settings_from_json
 from shared.runLogger import is_debug
+from shared.excel_user_edits import (
+    apply_user_edits_to_json_files,
+    apply_user_edits_to_records,
+    company_display_value,
+    display_value_for_excel,
+)
 from giftcardInvoiceLink.link_store import (
     gift_order_link_label,
     load_edges,
@@ -117,6 +123,7 @@ TRACKING_STATUS_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingNumbersViewer" / "t
 # Launched from VBA (GIFTCARD_LINK= in ini) when the user follows an ``Invoice link`` cell.
 GIFT_INVOICE_LINK_SCRIPT = _PYTHON_FILES_DIR / "giftcardInvoiceLink" / "gift_invoice_link_workflow.py"
 POD_WORKFLOW_SCRIPT = _PYTHON_FILES_DIR / "proofOfDelivery" / "pod_workflow.py"
+USER_EDIT_SYNC_SCRIPT = _PYTHON_FILES_DIR / "createExcelDocument" / "excel_user_edit_sync.py"
 
 
 def _resolve_excel_output_path(using_template: bool) -> str:
@@ -223,6 +230,7 @@ SHIPPING_STATUS_HEADER_ALIASES = frozenset(
 
 HYPERLINK_FONT = Font(name="Calibri", color="0563C1", underline="single")
 HEADER_FILL    = PatternFill("solid", fgColor="2F5597")
+ACTION_ROW_EMPTY_FILL = PatternFill("solid", fgColor="1F3B73")
 HEADER_FONT    = Font(bold=True, color="FFFFFF", name="Calibri")
 CELL_FONT      = Font(name="Calibri")
 CENTER_ALIGN   = Alignment(horizontal="center", vertical="center")
@@ -361,11 +369,7 @@ def _html_file_uri_for_record(record: dict) -> str | None:
 
 
 def get_company_value(record: dict):
-    explicit_company = clean_value(record.get("company"))
-    if explicit_company:
-        return explicit_company
-
-    return infer_company_from_subject(record.get("subject"))
+    return company_display_value(record)
 
 
 def _build_column_order() -> tuple[list[str], list[str]]:
@@ -409,7 +413,7 @@ def _record_to_row(
     row: list = []
     for key in column_keys:
         if key == "company":
-            row.append(get_company_value(record))
+            row.append(display_value_for_excel(record, key, get_company_value(record)))
         elif key == "copy_file_path":
             row.append(clean_value(record.get("source_file_link")))
         elif key == "html_source_link":
@@ -426,7 +430,7 @@ def _record_to_row(
                 )
             )
         else:
-            row.append(clean_value(record.get(key)))
+            row.append(display_value_for_excel(record, key, clean_value(record.get(key))))
     return row
 
 
@@ -1268,6 +1272,20 @@ def _excel_launcher_17track_skip_requested() -> bool:
         return False
 
 
+def load_user_edit_aware_excel_records(
+    *,
+    include_automation_hub: bool = True,
+    sync_pod_json: bool = True,
+) -> list[dict]:
+    apply_user_edits_to_json_files(PROJECT_ROOT)
+    records = load_excel_records(
+        PROJECT_ROOT,
+        include_automation_hub=include_automation_hub,
+        sync_pod_json=sync_pod_json,
+    )
+    return apply_user_edits_to_records(PROJECT_ROOT, records)
+
+
 def set_clipboard_ini_cell(wb: Workbook, ini_path: Path) -> None:
     """Write absolute ini path for Workbook_SheetFollowHyperlink; hide column AA."""
     ws = wb["Orders"]
@@ -1372,6 +1390,7 @@ def _build_populated_orders_workbook(
             tracking_numbers_viewer_script=TRACKING_NUMBERS_VIEWER_SCRIPT,
             tracking_status_viewer_script=TRACKING_STATUS_VIEWER_SCRIPT,
             pod_workflow_script=POD_WORKFLOW_SCRIPT,
+            user_edit_sync_script=USER_EDIT_SYNC_SCRIPT,
         )
         set_clipboard_ini_cell(wb, ini_written)
         if verbose_clipboard_log:
@@ -1389,7 +1408,10 @@ def rebuild_orders_workbook(excel_output_path: str | Path) -> None:
     ``apply_runtime_settings_from_json()`` before loading this module if settings may have changed.
     """
     _emit_excel_launcher_progress(2, "Loading results.json")
-    records = load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=True)
+    records = load_user_edit_aware_excel_records(
+        include_automation_hub=True,
+        sync_pod_json=True,
+    )
 
     def _on_track(done: int, total: int) -> None:
         if total <= 0:
@@ -1442,7 +1464,10 @@ def refresh_orders_workbook_shipping_status(excel_path: str | Path) -> None:
     path = Path(excel_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(str(path))
-    records = load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=True)
+    records = load_user_edit_aware_excel_records(
+        include_automation_hub=True,
+        sync_pod_json=True,
+    )
     _hub_record, data_records = _split_automation_hub_record(records)
     try:
         _prefetch_17track_for_excel_build(records, quiet=True)
@@ -1619,7 +1644,10 @@ def append_to_workbook(path: str, records: list[dict]):
         ws, desired_keys, records, start_row=next_row, vba_friendly=vba_friendly,
     )
 
-    full_records = load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=False)
+    full_records = load_user_edit_aware_excel_records(
+        include_automation_hub=True,
+        sync_pod_json=False,
+    )
     hub_record, full_data_records = _split_automation_hub_record(full_records)
     apply_gift_invoice_link_columns(ws, desired_keys, full_data_records, DATA_START_ROW, PROJECT_ROOT)
     apply_debug_gated_tracking_tool_columns(ws, desired_keys)
@@ -1644,6 +1672,7 @@ def append_to_workbook(path: str, records: list[dict]):
                 tracking_numbers_viewer_script=TRACKING_NUMBERS_VIEWER_SCRIPT,
                 tracking_status_viewer_script=TRACKING_STATUS_VIEWER_SCRIPT,
                 pod_workflow_script=POD_WORKFLOW_SCRIPT,
+                user_edit_sync_script=USER_EDIT_SYNC_SCRIPT,
             )
             set_clipboard_ini_cell(wb, ini_written)
 
@@ -1684,7 +1713,10 @@ def _remove_orders_template_for_rebuild() -> None:
 def main():
     _remove_orders_template_for_rebuild()
 
-    records = load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=True)
+    records = load_user_edit_aware_excel_records(
+        include_automation_hub=True,
+        sync_pod_json=True,
+    )
     _prefetch_17track_for_excel_build(records, quiet=False)
 
     wb, using_template = _build_populated_orders_workbook(records, verbose_clipboard_log=True)

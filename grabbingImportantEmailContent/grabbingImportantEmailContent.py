@@ -1272,6 +1272,7 @@ def process_file(
             "sender_name": clean_text(sender_name),
             "email": clean_text(email),
             "company": clean_text(extracted.get("company")),
+            "llm_obtained_company": clean_text(extracted.get("company")),
             "order_number": clean_text(extracted.get("order_number")),
             "purchase_datetime": clean_text(extracted.get("purchase_datetime")),
             "total_amount_paid": extracted.get("total_amount_paid"),
@@ -1301,6 +1302,7 @@ def process_file(
             "email": clean_text(email),
             "error": clean_text(e),
             "company": None,
+            "llm_obtained_company": None,
             "order_number": None,
             "purchase_datetime": None,
             "total_amount_paid": None,
@@ -1505,7 +1507,7 @@ def _company_vote_key(company: str | None) -> str:
 
 
 def unify_company_names_by_order(results: list[dict]) -> None:
-    """For each order_number shared by 2+ rows, set ``company`` to the plurality winner.
+    """For each order_number shared by 2+ rows, set ``company`` and ``llm_obtained_company`` to the plurality winner.
 
     Voting uses a normalized key so variants like 'Bath & Body Works' and
     'bath and body works' count together; the displayed string is the most
@@ -1556,6 +1558,7 @@ def unify_company_names_by_order(results: list[dict]) -> None:
         before_vals = [clean_text(r.get("company")) for r in group]
         for r in group:
             r["company"] = winner_display
+            r["llm_obtained_company"] = winner_display
 
         if any(b != winner_display for b in before_vals):
             print(

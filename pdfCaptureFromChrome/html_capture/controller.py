@@ -4,6 +4,7 @@ Isolated Chrome + global Ctrl+Shift+P: snapshot the focused tab to an expected .
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
@@ -33,7 +34,10 @@ try:
         reserve_free_port,
         wait_for_debugger,
     )
-    from ..launch_mitm_chrome import launch_isolated_chrome_no_proxy
+    from ..launch_mitm_chrome import (
+        launch_isolated_chrome_no_proxy,
+        terminate_isolated_capture_chrome,
+    )
     from ..paths import PDF_CAPTURE_SESSION_LOG
 except ImportError:
     from chrome_devtools import (  # type: ignore[no-redef]  # noqa: E402
@@ -45,7 +49,10 @@ except ImportError:
         reserve_free_port,
         wait_for_debugger,
     )
-    from launch_mitm_chrome import launch_isolated_chrome_no_proxy  # type: ignore[no-redef]  # noqa: E402
+    from launch_mitm_chrome import (  # type: ignore[no-redef]  # noqa: E402
+        launch_isolated_chrome_no_proxy,
+        terminate_isolated_capture_chrome,
+    )
     from paths import PDF_CAPTURE_SESSION_LOG  # type: ignore[no-redef]  # noqa: E402
 
 try:
@@ -123,6 +130,18 @@ def _http_close_tab(debug_port: int, target_id: str) -> bool:
         return True
     except OSError as e:
         _log_line(f"json/close error: {e!r} target_id={target_id}")
+        return False
+
+
+def _http_activate_tab(debug_port: int, target_id: str) -> bool:
+    tid = urllib.parse.quote(str(target_id), safe="")
+    req_url = f"http://127.0.0.1:{debug_port}/json/activate/{tid}"
+    try:
+        with urllib.request.urlopen(req_url, timeout=4) as r:
+            r.read()
+        return True
+    except OSError as e:
+        _log_line(f"json/activate error: {e!r} target_id={target_id}")
         return False
 
 
@@ -260,6 +279,7 @@ class HtmlCaptureController:
         self._target_to_record: dict[str, dict] = {}
         self._order: list[str] = []
         self._hotkey: CaptureHotkey | None = None
+        atexit.register(self.stop)
 
     @staticmethod
     def _env_debug_port() -> int:
@@ -289,6 +309,10 @@ class HtmlCaptureController:
             if not hotkey_capture_available():
                 self._emit("error", f"HTML capture ({CAPTURE_HOTKEY_LABEL}) requires Windows.")
                 return False
+            try:
+                terminate_isolated_capture_chrome()
+            except Exception as exc:
+                _log_line(f"stale chrome cleanup failed on start: {exc!r}")
             self._debug_port = self._env_debug_port()
             self._target_to_path.clear()
             self._target_to_record.clear()
@@ -321,6 +345,39 @@ class HtmlCaptureController:
             h.stop()
         if c is not None:
             _terminate_chrome_process(c)
+        try:
+            terminate_isolated_capture_chrome()
+        except Exception as exc:
+            _log_line(f"stale chrome cleanup failed on stop: {exc!r}")
+
+    def _find_existing_target_id(self, debug_port: int, want_url: str, expected_pdf: Path) -> str | None:
+        try:
+            targets = list_page_targets(debug_port)
+        except OSError as exc:
+            _log_line(f"existing-target lookup failed: {exc!r}")
+            return None
+
+        want = _norm_href(want_url)
+        with self._lock:
+            known_paths = dict(self._target_to_path)
+
+        url_fallback: str | None = None
+        for target in targets:
+            tid = str(target.get("id") or "")
+            if not tid:
+                continue
+            if known_paths.get(tid) == expected_pdf:
+                return tid
+            current_url = str(target.get("url") or "")
+            current_norm = _norm_href(current_url)
+            if not want or not current_norm:
+                continue
+            if want in current_norm or current_norm in want or want in current_url.casefold():
+                if tid in known_paths:
+                    return tid
+                if url_fallback is None:
+                    url_fallback = tid
+        return url_fallback
 
     def enqueue_capture(
         self,
@@ -344,7 +401,14 @@ class HtmlCaptureController:
         with self._lock:
             ch = self._chrome
 
-        if ch is None or ch.poll() is not None:
+        existing_target_id: str | None = None
+        if ch is not None and ch.poll() is None:
+            existing_target_id = self._find_existing_target_id(dport, u, expected_pdf)
+
+        if existing_target_id:
+            target_id = existing_target_id
+            _http_activate_tab(dport, target_id)
+        elif ch is None or ch.poll() is not None:
             if ch is not None:
                 _terminate_chrome_process(ch)
             with self._lock:
@@ -389,7 +453,10 @@ class HtmlCaptureController:
                 self._order.append(str(target_id))
             if not self._first_enqueued:
                 self._first_enqueued = True
-        _log_line(f"enqueued target_id={target_id} -> {expected_pdf} url={u[:120]}")
+        if existing_target_id:
+            _log_line(f"reused target_id={target_id} -> {expected_pdf} url={u[:120]}")
+        else:
+            _log_line(f"enqueued target_id={target_id} -> {expected_pdf} url={u[:120]}")
         if self._verbose:
             _log_line("enqueue: ok")
         if auto_print_pdf:

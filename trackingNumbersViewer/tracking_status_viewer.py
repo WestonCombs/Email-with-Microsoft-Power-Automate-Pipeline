@@ -26,10 +26,11 @@ if str(_PYTHON_FILES_DIR) not in sys.path:
     sys.path.insert(0, str(_PYTHON_FILES_DIR))
 
 from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
-from shared.gui_treeview_copy import bind_treeview_copy_menu
+from shared.gui_treeview_copy import treeview_cell_text, treeview_row_text_tsv
 from htmlHandler.carrier_urls import normalize_carrier_for_public_url, public_tracking_url
 from proofOfDelivery.pod_data import (
     POD_HUB_MODE,
+    delete_processed_tracking_artifacts,
     expected_pod_pdf_path,
     first_existing_capture_pdf_path,
     pod_status_viewer_rows,
@@ -37,6 +38,7 @@ from proofOfDelivery.pod_data import (
 )
 from pdfCaptureFromChrome.html_capture import HtmlCaptureController
 from pdfCaptureFromChrome.html_capture.hotkey_win32 import CAPTURE_HOTKEY_LABEL
+from pdfCaptureFromChrome.launch_mitm_chrome import terminate_isolated_capture_chrome
 from tracking_pdf_audit import audit_path, load_tracking_pdf_audit_entries
 from tracking_pdf_capture import (
     read_hands_free_capture_enabled,
@@ -226,6 +228,14 @@ class TrackingStatusViewerApp:
             apply_runtime_settings_from_json()
         except Exception:
             pass
+        try:
+            write_hands_free_capture_enabled(False)
+        except OSError:
+            pass
+        try:
+            terminate_isolated_capture_chrome()
+        except Exception:
+            pass
 
         self._root = tk.Tk()
         self._root.title(
@@ -316,7 +326,7 @@ class TrackingStatusViewerApp:
 
         btn_row = tk.Frame(self._frm, bg=THEME["bg"])
         btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        self._hands_free_pdf_var = tk.IntVar(value=1 if read_hands_free_capture_enabled() else 0)
+        self._hands_free_pdf_var = tk.IntVar(value=0)
         self._hands_free_pdf_var.trace_add("write", self._on_hands_free_pdf_toggle)
         hf_row = tk.Frame(btn_row, bg=THEME["bg"])
         hf_row.pack(side=tk.LEFT, padx=(0, 8))
@@ -326,17 +336,6 @@ class TrackingStatusViewerApp:
             text="Assisted PDF Capture",
             **settings_label_opts(),
         ).pack(side=tk.LEFT, padx=(10, 0))
-        self._capture_play_button = make_flat_button(
-            hf_row,
-            text="Play",
-            command=self._toggle_batch_capture,
-            bg=THEME["run_accent"],
-            active_bg=THEME["run_accent_dim"],
-            padx=12,
-            pady=5,
-            width=7,
-        )
-        self._capture_play_button.pack(side=tk.LEFT, padx=(14, 0))
         self._capture_status_var = tk.StringVar(value="")
         tk.Label(
             btn_row,
@@ -437,11 +436,7 @@ class TrackingStatusViewerApp:
 
         self._tree.bind("<Double-1>", self._on_double)
         self._tree.bind("<Return>", lambda _e: self._activate_row_open_or_capture())
-        bind_treeview_copy_menu(
-            self._tree,
-            self._root,
-            extra_commands=[("Force Check Tracking Number", self._force_check_selected_tracking_number)],
-        )
+        self._bind_tree_context_menu()
 
         if not self._row_infos:
             tk.Label(
@@ -455,6 +450,10 @@ class TrackingStatusViewerApp:
         self._root.protocol("WM_DELETE_WINDOW", self._on_viewer_closing)
 
     def _on_viewer_closing(self) -> None:
+        try:
+            write_hands_free_capture_enabled(False)
+        except OSError:
+            pass
         self._set_batch_capture_active(False)
         self._stop_capture_controller()
         self._cancel_pod_poll()
@@ -525,6 +524,87 @@ class TrackingStatusViewerApp:
 
     def _info_for_index(self, idx: int) -> dict[str, object]:
         return self._row_infos[idx]
+
+    def _clipboard_set(self, text: str) -> None:
+        try:
+            self._root.clipboard_clear()
+            self._root.clipboard_append(text)
+            self._root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _copy_context_cell(self) -> None:
+        item = getattr(self, "_menu_item", None)
+        col = getattr(self, "_menu_col", None)
+        if not item or not col:
+            return
+        self._clipboard_set(treeview_cell_text(self._tree, item, col))
+
+    def _copy_context_row(self) -> None:
+        item = getattr(self, "_menu_item", None)
+        if not item:
+            return
+        self._clipboard_set(treeview_row_text_tsv(self._tree, item))
+
+    def _context_menu_index(self) -> int | None:
+        item = getattr(self, "_menu_item", None)
+        if not item:
+            return None
+        try:
+            idx = int(item)
+        except ValueError:
+            return None
+        if 0 <= idx < len(self._row_infos):
+            return idx
+        return None
+
+    def _context_menu_can_delete(self) -> bool:
+        idx = self._context_menu_index()
+        if idx is None:
+            return False
+        return self._is_processed(self._info_for_index(idx))
+
+    def _bind_tree_context_menu(self) -> None:
+        self._menu_item = None
+        self._menu_col = None
+        self._tree_menu = tk.Menu(self._root, tearoff=0)
+
+        def on_button(event: tk.Event) -> None:
+            region = self._tree.identify_region(event.x, event.y)
+            if region not in ("cell", "tree"):
+                return
+            item = self._tree.identify_row(event.y)
+            col = self._tree.identify_column(event.x)
+            if not item or not col:
+                return
+            try:
+                self._tree.selection_set(item)
+                self._tree.focus(item)
+            except tk.TclError:
+                pass
+            self._menu_item = item
+            self._menu_col = col
+
+            self._tree_menu.delete(0, tk.END)
+            self._tree_menu.add_command(label="Open", command=self._open_carrier_in_browser_only)
+            if self._context_menu_can_delete():
+                self._tree_menu.add_command(label="Delete", command=self._delete_selected_processed_row)
+            self._tree_menu.add_command(
+                label="Force Check Tracking Number",
+                command=self._force_check_selected_tracking_number,
+            )
+            self._tree_menu.add_separator()
+            self._tree_menu.add_command(label="Copy cell", command=self._copy_context_cell)
+            self._tree_menu.add_command(label="Copy row", command=self._copy_context_row)
+            try:
+                self._tree_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self._tree_menu.grab_release()
+
+        self._tree.bind("<Button-3>", on_button)
+        if sys.platform == "darwin":
+            self._tree.bind("<Button-2>", on_button)
+            self._tree.bind("<Control-Button-1>", on_button)
 
     def _carrier_url_for_index(self, idx: int) -> str | None:
         info = self._info_for_index(idx)
@@ -745,6 +825,40 @@ class TrackingStatusViewerApp:
             return
         webbrowser.open(url)
 
+    def _delete_selected_processed_row(self) -> None:
+        idx = self._selected_index()
+        if idx is None or idx < 0 or idx >= len(self._row_infos):
+            return
+        if self._project_root is None:
+            messagebox.showerror("Delete", "Project data directory is unavailable.")
+            return
+        info = self._info_for_index(idx)
+        if not self._is_processed(info):
+            return
+
+        processed_path = self._processed_pdf_path_for_info(info)
+        result = delete_processed_tracking_artifacts(
+            self._project_root,
+            tracking_number=info.get("tracking_number"),
+            company=info.get("company"),
+            purchase_datetime=info.get("purchase_datetime"),
+            carrier_display=info.get("carrier"),
+            order_number=info.get("order_number"),
+            category=info.get("category"),
+            processed_pdf_path=processed_path,
+        )
+        self._audit_entries_cache = []
+        self._audit_entries_mtime_ns = None
+        self._apply_pod_completion_layout()
+        deleted_pdfs = int(result.get("deleted_pdfs", 0))
+        removed_refs = int(result.get("removed_pod_records", 0)) + int(
+            result.get("removed_audit_entries", 0)
+        )
+        if deleted_pdfs > 0 or removed_refs > 0:
+            self._set_capture_status("Deleted. Row is now unprocessed.")
+        else:
+            self._set_capture_status("Nothing was deleted for this row.")
+
     def _record_for_hands_free_capture(self, info: dict[str, object]) -> dict:
         """Build the record shape expected by the convention filename builder."""
         record = dict(self._context)
@@ -785,6 +899,13 @@ class TrackingStatusViewerApp:
             self._set_batch_capture_active(False)
             self._stop_capture_controller()
             self._set_capture_status("")
+        else:
+            self._set_batch_capture_active(True)
+            self._set_capture_status("Opening the next eligible POD row...")
+            try:
+                self._root.after(0, self._start_or_continue_batch_capture)
+            except tk.TclError:
+                pass
         self._update_capture_controls()
 
     def _sync_hands_free_state_from_disk(self) -> None:
@@ -817,17 +938,7 @@ class TrackingStatusViewerApp:
         self._hands_free_sync_after_id = self._root.after(1200, tick)
 
     def _update_capture_controls(self) -> None:
-        btn = getattr(self, "_capture_play_button", None)
-        if btn is None:
-            return
-        enabled = bool(self._hands_free_pdf_var.get())
-        try:
-            btn.configure(
-                text="Pause" if self._batch_capture_active else "Play",
-                state=tk.NORMAL if enabled else tk.DISABLED,
-            )
-        except tk.TclError:
-            pass
+        return
 
     def _set_capture_status(self, message: str) -> None:
         var = getattr(self, "_capture_status_var", None)
@@ -840,11 +951,28 @@ class TrackingStatusViewerApp:
             pass
 
     def _capture_notify(self, level: str, message: str) -> None:
+        audit_pause = level == "error" and "AI audit did not approve this capture" in str(message or "")
+        chrome_closed = level == "info" and "The capture Chrome was closed." in str(message or "")
+
         def show() -> None:
             self._set_capture_status(message)
-            if level == "error":
+            if chrome_closed:
                 self._hands_free_capture_running = False
-                self._set_batch_capture_active(False)
+                if self._batch_capture_active and self._hands_free_pdf_var.get():
+                    self._cancel_batch_after()
+                    self._batch_capture_after_id = self._root.after(
+                        350, self._start_or_continue_batch_capture
+                    )
+                return
+            if level == "error":
+                if not audit_pause:
+                    self._hands_free_capture_running = False
+                    self._set_batch_capture_active(False)
+                else:
+                    self._set_capture_status(
+                        "AI audit wants another look. Fix the still-open tab, then press "
+                        f"{CAPTURE_HOTKEY_LABEL} again."
+                    )
                 messagebox.showerror("PDF capture", message)
 
         try:
@@ -883,16 +1011,6 @@ class TrackingStatusViewerApp:
             self._cancel_batch_after()
         self._update_capture_controls()
 
-    def _toggle_batch_capture(self) -> None:
-        if self._batch_capture_active:
-            self._set_batch_capture_active(False)
-            self._set_capture_status("Paused. Current tab can still be captured manually.")
-            return
-        if not self._hands_free_pdf_var.get():
-            self._hands_free_pdf_var.set(1)
-        self._set_batch_capture_active(True)
-        self._start_or_continue_batch_capture()
-
     def _capture_eligible(self, info: dict[str, object]) -> bool:
         return (not self._is_processed(info)) and (not self._is_grey_row(info))
 
@@ -908,6 +1026,9 @@ class TrackingStatusViewerApp:
 
     def _start_or_continue_batch_capture(self) -> None:
         if not self._batch_capture_active:
+            return
+        if not self._hands_free_pdf_var.get():
+            self._set_batch_capture_active(False)
             return
         if self._hands_free_capture_running:
             return
@@ -948,6 +1069,8 @@ class TrackingStatusViewerApp:
                 f"Could not start assisted capture. {CAPTURE_HOTKEY_LABEL} capture requires Windows and Chrome.",
             )
             return False
+        if self._hands_free_pdf_var.get():
+            self._set_batch_capture_active(True)
         self._tree.selection_set(str(idx))
         self._tree.see(str(idx))
         record = self._record_for_hands_free_capture(info)
