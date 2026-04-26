@@ -50,6 +50,7 @@ _DANGER_BG = THEME["stop_fg"]
 _DANGER_ACTIVE_BG = "#da3633"
 _UPDATE_BG = "#f59e0b"
 _UPDATE_ACTIVE_BG = "#d97706"
+_DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV = "EMAIL_SORTER_DELETE_SAVED_EMAIL_DATA_THIS_RUN"
 
 
 def _attach_tooltip(widget: tk.Misc, text: str) -> None:
@@ -879,6 +880,17 @@ def _settings_truthy(raw: str | None) -> bool:
     return (raw or "").strip().lower() in ("1", "true", "yes")
 
 
+def _clear_one_shot_setting(setting_key: str) -> None:
+    try:
+        merged = read_settings_for_write_merge()
+        merged[setting_key] = "0"
+        write_settings_json(merged)
+    except (OSError, ValueError):
+        os.environ[setting_key] = "0"
+    else:
+        apply_runtime_settings_from_json()
+
+
 class SettingsDialog:
     """Edit required app values; Save writes ``python_files/email_sorter_settings.json``."""
 
@@ -900,6 +912,9 @@ class SettingsDialog:
         t17 = (cfg.get("SEVENTEEN_TRACK_API_KEY") or os.getenv("SEVENTEEN_TRACK_API_KEY") or "").strip()
         dbg = _settings_truthy(cfg.get("DEBUG_MODE") or os.getenv("DEBUG_MODE"))
         login_next = _settings_truthy(cfg.get("LOGIN_NEW_ACCOUNT_NEXT_RUN"))
+        delete_saved_email_data = _settings_truthy(
+            cfg.get("DELETE_SAVED_EMAIL_DATA_NEXT_RUN")
+        )
 
         content = self._win
         outer = tk.Frame(content, padx=18, pady=18, bg=THEME["bg"])
@@ -943,6 +958,31 @@ class SettingsDialog:
             anchor=tk.W,
             **label_opts,
         ).pack(side=tk.LEFT, padx=(10, 0))
+        r += 1
+
+        self._delete_saved_email_data = tk.IntVar(value=1 if delete_saved_email_data else 0)
+        delete_row = tk.Frame(outer, bg=THEME["bg"])
+        delete_row.grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        _SettingsSwitch(delete_row, self._delete_saved_email_data).pack(side=tk.LEFT)
+        self._delete_saved_email_label_font = tkfont.Font(
+            self._win,
+            family="Segoe UI",
+            size=10,
+            weight="bold" if self._delete_saved_email_data.get() else "normal",
+        )
+        self._delete_saved_email_label = tk.Label(
+            delete_row,
+            text="Delete all saved email data on next run",
+            anchor=tk.W,
+            fg=THEME["stop_fg"],
+            bg=THEME["bg"],
+            font=self._delete_saved_email_label_font,
+        )
+        self._delete_saved_email_label.pack(side=tk.LEFT, padx=(10, 0))
+        self._delete_saved_email_data.trace_add(
+            "write", lambda *_: self._refresh_delete_saved_email_label()
+        )
+        self._refresh_delete_saved_email_label()
         r += 1
 
         tk.Label(
@@ -1044,6 +1084,11 @@ class SettingsDialog:
     def _cancel(self) -> None:
         self._win.destroy()
 
+    def _refresh_delete_saved_email_label(self) -> None:
+        self._delete_saved_email_label_font.configure(
+            weight="bold" if self._delete_saved_email_data.get() else "normal"
+        )
+
     def _save(self) -> None:
         mail = self._mail.get().strip()
         azure = self._azure.get().strip()
@@ -1059,6 +1104,9 @@ class SettingsDialog:
             "SEVENTEEN_TRACK_API_KEY": t17,
             "DEBUG_MODE": "1" if self._debug.get() else "0",
             "LOGIN_NEW_ACCOUNT_NEXT_RUN": "1" if self._login_next.get() else "0",
+            "DELETE_SAVED_EMAIL_DATA_NEXT_RUN": (
+                "1" if self._delete_saved_email_data.get() else "0"
+            ),
         }
         try:
             write_settings_json(updates)
@@ -1437,14 +1485,12 @@ def main() -> None:
                 (_PYTHON_FILES_DIR / ".graph_token_cache.bin").unlink(missing_ok=True)
             except OSError:
                 pass
-            try:
-                merged = read_settings_for_write_merge()
-                merged["LOGIN_NEW_ACCOUNT_NEXT_RUN"] = "0"
-                write_settings_json(merged)
-            except (OSError, ValueError):
-                os.environ["LOGIN_NEW_ACCOUNT_NEXT_RUN"] = "0"
-            else:
-                apply_runtime_settings_from_json()
+            _clear_one_shot_setting("LOGIN_NEW_ACCOUNT_NEXT_RUN")
+
+        delete_saved_email_data_next_run = (
+            not is_excel_rebuild_only
+            and _settings_truthy(os.getenv("DELETE_SAVED_EMAIL_DATA_NEXT_RUN"))
+        )
 
         run_in_progress = True
         set_pipeline_ui_busy(True)
@@ -1495,6 +1541,8 @@ def main() -> None:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["EMAIL_SORTER_17TRACK_QUOTA_SESSION"] = "1"
+        if delete_saved_email_data_next_run:
+            env[_DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV] = "1"
         if is_excel_rebuild_only:
             env["EXCEL_LAUNCHER_PROGRESS"] = "1"
             if skip17_flag_path_run:
@@ -1524,6 +1572,8 @@ def main() -> None:
                     kw["creationflags"] = cf
                 p = subprocess.Popen(**kw)
                 proc_holder[0] = p
+                if delete_saved_email_data_next_run:
+                    _clear_one_shot_setting("DELETE_SAVED_EMAIL_DATA_NEXT_RUN")
                 if p.stdout:
                     for line in p.stdout:
                         line_q.put(("line", line))

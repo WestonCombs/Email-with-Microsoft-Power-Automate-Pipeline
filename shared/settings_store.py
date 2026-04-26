@@ -27,6 +27,7 @@ STORED_SETTING_KEYS = frozenset(
         "SEVENTEEN_TRACK_API_KEY",
         "DEBUG_MODE",
         "LOGIN_NEW_ACCOUNT_NEXT_RUN",
+        "DELETE_SAVED_EMAIL_DATA_NEXT_RUN",
     }
 )
 
@@ -204,3 +205,11 @@ def apply_runtime_settings_from_json() -> None:
         os.environ["LOGIN_NEW_ACCOUNT_NEXT_RUN"] = login_next
     else:
         os.environ.pop("LOGIN_NEW_ACCOUNT_NEXT_RUN", None)
+
+    delete_saved_email_data = (
+        json_data.get("DELETE_SAVED_EMAIL_DATA_NEXT_RUN") or ""
+    ).strip()
+    if delete_saved_email_data:
+        os.environ["DELETE_SAVED_EMAIL_DATA_NEXT_RUN"] = delete_saved_email_data
+    else:
+        os.environ.pop("DELETE_SAVED_EMAIL_DATA_NEXT_RUN", None)

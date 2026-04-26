@@ -28,7 +28,53 @@ EMAIL_SORTER_HOTKEYS_VBA = r'''Option Explicit
 ' Application.OnKey must reference a Public Sub in a standard module (not ThisWorkbook).
 Private escPresses As Long
 Private escLastAt As Date
+Private editModeEnabled As Boolean
+Private editEventsBusy As Boolean
+Private editExpiresAt As Date
+Private editResetAt As Date
+Private editCycleAt As Date
+Private editOldStatusBar As Variant
+Private editSelectedAddress As String
+Private editSelectedValue As Variant
+Private editSelectedFormula As Variant
+Private editSelectedHadFormula As Boolean
+Private editRainbowFrame As Long
+Private editRainbowPalette As Variant
+
 Private Const TRIPLE_ESC_MAX_GAP_SEC As Long = 2
+Private Const EDIT_MODE_SECONDS As Long = 10
+Private Const EDIT_RAINBOW_FRAME_SECONDS As Double = 0.12
+Private Const TOP_ROW As Long = 1
+Private Const DEFAULT_HEADER_ROW As Long = 2
+Private Const COL_FILE_URI As Long = 29
+Private Const TOP_ORANGE_R As Long = 244
+Private Const TOP_ORANGE_G As Long = 177
+Private Const TOP_ORANGE_B As Long = 131
+Private Const TOP_GREEN_R As Long = 52
+Private Const TOP_GREEN_G As Long = 199
+Private Const TOP_GREEN_B As Long = 89
+Private Const USER_EDIT_ALLOWED_LABELS As String = "Company, Total Paid, Tax Paid"
+Private Const USER_EDIT_LOG_FILE As String = "email_sorter_user_edit.log"
+Private lastUserEditContextTsv As String
+
+Private Function EmailSorter_UserEditLogFullPath() As String
+    On Error Resume Next
+    EmailSorter_UserEditLogFullPath = CreateObject("Scripting.FileSystemObject").GetSpecialFolder(2) & "\" & USER_EDIT_LOG_FILE
+End Function
+
+' Append one UTF-16 line (Excel/VBA locale) for quick diagnosis; same file also gets UTF-8 lines from Python.
+Private Sub EmailSorter_LogUserEdit(ByVal detail As String)
+    Dim fso As Object
+    Dim ts As Object
+    Dim p As String
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    p = EmailSorter_UserEditLogFullPath()
+    If Len(p) = 0 Then Exit Sub
+    Set ts = fso.OpenTextFile(p, 8, True, -1)
+    ts.WriteLine Format(Now, "yyyy-mm-dd hh:nn:ss") & " [VBA] " & detail
+    ts.Close
+End Sub
 
 Public Sub EmailSorter_TripleEscapeHandler()
     On Error GoTo CleanFail
@@ -46,12 +92,639 @@ Public Sub EmailSorter_TripleEscapeHandler()
 
     If escPresses >= 3 Then
         escPresses = 0
-        MsgBox "hello world!", vbInformation, "Email Sorter"
+        EmailSorter_StartEditMode
     End If
     Exit Sub
 CleanFail:
     escPresses = 0
 End Sub
+
+Public Sub EmailSorter_StartEditMode()
+    On Error GoTo CleanFail
+    If TypeName(ActiveSheet) <> "Worksheet" Then Exit Sub
+
+    EmailSorter_CancelScheduledTimers
+    editModeEnabled = True
+    editEventsBusy = False
+    editOldStatusBar = Application.StatusBar
+    editExpiresAt = Now + TimeSerial(0, 0, EDIT_MODE_SECONDS)
+
+    editRainbowFrame = 0
+    editRainbowPalette = EmailSorter_RainbowPalette()
+    EmailSorter_ApplyTopRowRainbowCycle ActiveSheet
+    Application.StatusBar = "Edit mode armed for 10 seconds. Allowed: " & USER_EDIT_ALLOWED_LABELS
+    If TypeName(Selection) = "Range" Then
+        EmailSorter_HandleSelectionChange ActiveSheet, Selection
+    End If
+    EmailSorter_RunTopRowRainbowLoop ActiveSheet
+    Exit Sub
+CleanFail:
+    EmailSorter_EndEditMode False
+End Sub
+
+Public Sub EmailSorter_EditModeTimeout()
+    If editModeEnabled Then EmailSorter_EndEditMode False
+End Sub
+
+Public Sub EmailSorter_CancelEditMode()
+    If editModeEnabled Then
+        EmailSorter_EndEditMode False
+    Else
+        EmailSorter_CancelScheduledTimers
+    End If
+End Sub
+
+Public Sub EmailSorter_ResetTopRowAfterSuccess()
+    On Error Resume Next
+    If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_SetTopRowColor ActiveSheet, RGB(TOP_ORANGE_R, TOP_ORANGE_G, TOP_ORANGE_B)
+    Application.StatusBar = editOldStatusBar
+    editResetAt = 0
+End Sub
+
+Public Sub EmailSorter_HandleSelectionChange(ByVal Sh As Object, ByVal Target As Range)
+    On Error GoTo CleanFail
+    If Not editModeEnabled Then Exit Sub
+    If editEventsBusy Then Exit Sub
+    If Target Is Nothing Then Exit Sub
+    If Target.Cells.CountLarge <> 1 Then Exit Sub
+    If Not EmailSorter_IsOrdersSheet(Sh) Then Exit Sub
+
+    editSelectedAddress = Target.Address(False, False)
+    editSelectedValue = Target.Value
+    editSelectedFormula = Target.Formula
+    editSelectedHadFormula = Target.HasFormula
+
+    If Target.Row <= HeaderRow(Sh) Then
+        Application.StatusBar = "Edit mode armed. Choose a data cell in: " & USER_EDIT_ALLOWED_LABELS
+    ElseIf Len(EmailSorter_FieldKeyForColumn(Sh, Target.Column)) > 0 Then
+        EmailSorter_ApplyTopRowRainbowCycle Sh
+        Application.StatusBar = "Editing enabled for this cell. Allowed: " & USER_EDIT_ALLOWED_LABELS
+    Else
+        Application.StatusBar = "Edit mode armed. Allowed: " & USER_EDIT_ALLOWED_LABELS
+    End If
+    Exit Sub
+CleanFail:
+End Sub
+
+Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Range)
+    Dim fieldKey As String
+    Dim cleanValue As String
+    Dim orderNumber As String
+    Dim sourceUri As String
+    Dim rc As Long
+    Dim resultMode As String
+    Dim resultValue As String
+    Dim resultValueKind As String
+
+    On Error GoTo CleanFail
+    If Not editModeEnabled Then Exit Sub
+    If editEventsBusy Then Exit Sub
+    If Target Is Nothing Then Exit Sub
+    If Not EmailSorter_IsOrdersSheet(Sh) Then Exit Sub
+
+    If Target.Cells.CountLarge <> 1 Then
+        EmailSorter_DisallowEdit Target, "Only one cell can be edited while triple-Esc edit mode is active."
+        Exit Sub
+    End If
+    If Target.Row <= HeaderRow(Sh) Then
+        EmailSorter_DisallowEdit Target, "Choose a data row below the top row and headers."
+        Exit Sub
+    End If
+
+    fieldKey = EmailSorter_FieldKeyForColumn(Sh, Target.Column)
+    If Len(fieldKey) = 0 Then
+        EmailSorter_DisallowEdit Target, "That column cannot be modified here."
+        Exit Sub
+    End If
+
+    cleanValue = EmailSorter_CleanSubmittedValue(Target.Value)
+    orderNumber = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, HeaderColumn(Sh, "Order Number")).Value)
+    sourceUri = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_FILE_URI).Value)
+
+    rc = EmailSorter_RunUserEditSync(Sh, fieldKey, cleanValue, orderNumber, sourceUri, Target.Row)
+    If rc <> 0 Then
+        EmailSorter_RestoreEditedTarget Target
+        Dim failMsg As String
+        failMsg = "I could not record that edit in JSON, so the cell was restored." & vbCrLf & vbCrLf
+        failMsg = failMsg & "Diagnostics were appended to:" & vbCrLf & EmailSorter_UserEditLogFullPath() & vbCrLf & vbCrLf
+        If Len(lastUserEditContextTsv) > 0 Then
+            failMsg = failMsg & "If Python reported an error, see also:" & vbCrLf & lastUserEditContextTsv & ".err.txt" & vbCrLf & vbCrLf
+        End If
+        failMsg = failMsg & "Open the log in Notepad to see exit code, paths, and ini checks. Saving/reopening can help if the JSON overlay was locked."
+        MsgBox failMsg, vbExclamation, "Email Sorter"
+        EmailSorter_EndEditMode False
+        Exit Sub
+    End If
+
+    EmailSorter_ReadUserEditSyncResult lastUserEditContextTsv, resultMode, resultValue, resultValueKind
+    editEventsBusy = True
+    Application.EnableEvents = False
+    If LCase$(resultMode) = "cleared" Then
+        If fieldKey = "company" And Len(orderNumber) > 0 Then
+            EmailSorter_ApplyCompanyEditToOrder Sh, orderNumber, resultValue, False, resultValueKind
+        Else
+            EmailSorter_ApplyPlainCellValue Target, resultValue, resultValueKind
+        End If
+    ElseIf fieldKey = "company" Then
+        If Len(orderNumber) > 0 Then
+            EmailSorter_ApplyCompanyEditToOrder Sh, orderNumber, cleanValue
+        Else
+            Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
+        End If
+    Else
+        Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
+    End If
+    Application.EnableEvents = True
+    editEventsBusy = False
+    lastUserEditContextTsv = ""
+
+    EmailSorter_EndEditMode True
+    Exit Sub
+CleanFail:
+    On Error Resume Next
+    Application.EnableEvents = True
+    editEventsBusy = False
+    EmailSorter_EndEditMode False
+End Sub
+
+Private Sub EmailSorter_DisallowEdit(ByVal Target As Range, ByVal reason As String)
+    On Error Resume Next
+    EmailSorter_RestoreEditedTarget Target
+    MsgBox reason & vbCrLf & vbCrLf & "Allowed columns: " & USER_EDIT_ALLOWED_LABELS, vbExclamation, "Email Sorter"
+    EmailSorter_EndEditMode False
+End Sub
+
+Private Sub EmailSorter_RestoreEditedTarget(ByVal Target As Range)
+    On Error Resume Next
+    editEventsBusy = True
+    Application.EnableEvents = False
+    If Not Target Is Nothing Then
+        If editSelectedAddress = Target.Address(False, False) Then
+            If editSelectedHadFormula Then
+                Target.Formula = editSelectedFormula
+            Else
+                Target.Value = editSelectedValue
+            End If
+        Else
+            Application.Undo
+        End If
+    End If
+    Application.EnableEvents = True
+    editEventsBusy = False
+End Sub
+
+Private Sub EmailSorter_EndEditMode(ByVal success As Boolean)
+    On Error Resume Next
+    EmailSorter_CancelScheduledTimeout
+    EmailSorter_CancelScheduledCycle
+    editModeEnabled = False
+    editSelectedAddress = ""
+    If success Then
+        If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_SetTopRowColor ActiveSheet, RGB(TOP_GREEN_R, TOP_GREEN_G, TOP_GREEN_B)
+        Application.StatusBar = "Saved to JSON. Modified values are marked with *."
+        editResetAt = Now + TimeSerial(0, 0, 1)
+        Application.OnTime editResetAt, EmailSorter_ProcedureBinding("EmailSorter_ResetTopRowAfterSuccess")
+    Else
+        If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_SetTopRowColor ActiveSheet, RGB(TOP_ORANGE_R, TOP_ORANGE_G, TOP_ORANGE_B)
+        Application.StatusBar = editOldStatusBar
+    End If
+End Sub
+
+Private Sub EmailSorter_CancelScheduledTimers()
+    EmailSorter_CancelScheduledTimeout
+    On Error Resume Next
+    If editResetAt <> 0 Then
+        Application.OnTime editResetAt, EmailSorter_ProcedureBinding("EmailSorter_ResetTopRowAfterSuccess"), , False
+        editResetAt = 0
+    End If
+    EmailSorter_CancelScheduledCycle
+End Sub
+
+Private Sub EmailSorter_CancelScheduledTimeout()
+    On Error Resume Next
+    editExpiresAt = 0
+End Sub
+
+Private Sub EmailSorter_RunTopRowRainbowLoop(ByVal ws As Worksheet)
+    Dim startedAt As Double
+    Dim frameStartedAt As Double
+
+    On Error GoTo CleanFail
+    startedAt = Timer
+    Do While editModeEnabled And EmailSorter_ElapsedSeconds(startedAt) < EDIT_MODE_SECONDS
+        editRainbowFrame = editRainbowFrame + 1
+        If TypeName(ActiveSheet) = "Worksheet" Then
+            EmailSorter_ApplyTopRowRainbowCycle ActiveSheet
+        Else
+            EmailSorter_ApplyTopRowRainbowCycle ws
+        End If
+
+        frameStartedAt = Timer
+        Do While editModeEnabled _
+            And EmailSorter_ElapsedSeconds(frameStartedAt) < EDIT_RAINBOW_FRAME_SECONDS _
+            And EmailSorter_ElapsedSeconds(startedAt) < EDIT_MODE_SECONDS
+            DoEvents
+        Loop
+    Loop
+
+    If editModeEnabled Then EmailSorter_EndEditMode False
+    Exit Sub
+CleanFail:
+    If editModeEnabled Then EmailSorter_EndEditMode False
+End Sub
+
+Private Sub EmailSorter_CancelScheduledCycle()
+    On Error Resume Next
+    editCycleAt = 0
+End Sub
+
+Private Function EmailSorter_ProcedureBinding(ByVal procName As String) As String
+    EmailSorter_ProcedureBinding = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!" & procName
+End Function
+
+Private Function EmailSorter_IsOrdersSheet(ByVal Sh As Object) As Boolean
+    On Error GoTo CleanFail
+    EmailSorter_IsOrdersSheet = (StrComp(CStr(Sh.Name), "Orders", vbTextCompare) = 0)
+    Exit Function
+CleanFail:
+    EmailSorter_IsOrdersSheet = False
+End Function
+
+Private Function HeaderRow(ByVal Sh As Object) As Long
+    If Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 1).Value)) = "Category" Then
+        HeaderRow = DEFAULT_HEADER_ROW
+    Else
+        HeaderRow = 1
+    End If
+End Function
+
+Private Function HeaderColumn(ByVal Sh As Object, ByVal want As String) As Long
+    Dim c As Long
+    Dim lastCol As Long
+    Dim h As String
+    Dim rowNum As Long
+    rowNum = HeaderRow(Sh)
+    On Error Resume Next
+    lastCol = Sh.Cells(rowNum, Sh.Columns.Count).End(xlToLeft).Column
+    On Error GoTo 0
+    If lastCol < 1 Then lastCol = 1
+    For c = 1 To lastCol
+        h = Trim(CStr(Sh.Cells(rowNum, c).Value))
+        If StrComp(h, want, vbTextCompare) = 0 Then
+            HeaderColumn = c
+            Exit Function
+        End If
+    Next c
+    HeaderColumn = 0
+End Function
+
+Private Function EmailSorter_FieldKeyForColumn(ByVal Sh As Object, ByVal colNum As Long) As String
+    Dim h As String
+    h = Trim(CStr(Sh.Cells(HeaderRow(Sh), colNum).Value))
+    Select Case LCase(h)
+        Case "company"
+            EmailSorter_FieldKeyForColumn = "company"
+        Case "total paid"
+            EmailSorter_FieldKeyForColumn = "total_amount_paid"
+        Case "tax paid"
+            EmailSorter_FieldKeyForColumn = "tax_paid"
+        Case Else
+            EmailSorter_FieldKeyForColumn = ""
+    End Select
+End Function
+
+Private Function EmailSorter_CleanSubmittedValue(ByVal v As Variant) As String
+    Dim s As String
+    If IsError(v) Or IsEmpty(v) Then
+        EmailSorter_CleanSubmittedValue = ""
+        Exit Function
+    End If
+    s = Trim(CStr(v))
+    Do While Len(s) > 0 And Right(s, 1) = "*"
+        s = Trim(Left(s, Len(s) - 1))
+    Loop
+    EmailSorter_CleanSubmittedValue = s
+End Function
+
+Private Function EmailSorter_DisplayModifiedValue(ByVal cleanValue As String) As String
+    If Len(cleanValue) = 0 Then
+        EmailSorter_DisplayModifiedValue = "*"
+    Else
+        EmailSorter_DisplayModifiedValue = cleanValue & "*"
+    End If
+End Function
+
+Private Sub EmailSorter_ApplyPlainCellValue(ByVal Target As Range, ByVal valueText As String, ByVal valueKind As String)
+    Dim kindText As String
+    kindText = LCase$(Trim$(valueKind))
+    Select Case kindText
+        Case "blank"
+            Target.Value = Empty
+        Case "number"
+            If Len(Trim$(valueText)) = 0 Then
+                Target.Value = Empty
+            Else
+                Target.Value = Val(Replace(valueText, ",", ""))
+            End If
+        Case Else
+            Target.Value = valueText
+    End Select
+End Sub
+
+Private Sub EmailSorter_ApplyCompanyEditToOrder(ByVal Sh As Object, ByVal orderNumber As String, ByVal cleanValue As String, Optional ByVal markModified As Boolean = True, Optional ByVal valueKind As String = "text")
+    Dim orderCol As Long
+    Dim companyCol As Long
+    Dim lastData As Long
+    Dim r As Long
+
+    orderCol = HeaderColumn(Sh, "Order Number")
+    companyCol = HeaderColumn(Sh, "Company")
+    If orderCol = 0 Or companyCol = 0 Then Exit Sub
+    On Error Resume Next
+    lastData = Sh.Cells(Sh.Rows.Count, orderCol).End(xlUp).Row
+    On Error GoTo 0
+    If lastData < HeaderRow(Sh) + 1 Then Exit Sub
+    For r = HeaderRow(Sh) + 1 To lastData
+        If EmailSorter_CleanSubmittedValue(Sh.Cells(r, orderCol).Value) = orderNumber Then
+            If markModified Then
+                Sh.Cells(r, companyCol).Value = EmailSorter_DisplayModifiedValue(cleanValue)
+            Else
+                EmailSorter_ApplyPlainCellValue Sh.Cells(r, companyCol), cleanValue, valueKind
+            End If
+        End If
+    Next r
+End Sub
+
+Private Function EmailSorter_TsvValue(ByVal allText As String, ByVal key As String) As String
+    Dim lines As Variant
+    Dim i As Long
+    Dim line As String
+    Dim tabPos As Long
+    Dim lhs As String
+    Dim want As String
+
+    want = LCase$(Trim$(key))
+    lines = Split(Replace(allText, vbCrLf, vbLf), vbLf)
+    For i = LBound(lines) To UBound(lines)
+        line = CStr(lines(i))
+        tabPos = InStr(1, line, vbTab)
+        If tabPos <= 0 Then GoTo NextLine
+        lhs = LCase$(Trim$(Left$(line, tabPos - 1)))
+        If lhs = want Then
+            EmailSorter_TsvValue = Trim$(Mid$(line, tabPos + 1))
+            Exit Function
+        End If
+NextLine:
+    Next i
+    EmailSorter_TsvValue = ""
+End Function
+
+Private Sub EmailSorter_ReadUserEditSyncResult(ByVal ctxPath As String, ByRef mode As String, ByRef valueText As String, ByRef valueKind As String)
+    Dim fso As Object
+    Dim resultPath As String
+    Dim allText As String
+
+    mode = ""
+    valueText = ""
+    valueKind = ""
+    If Len(ctxPath) = 0 Then Exit Sub
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    resultPath = ctxPath & ".out.tsv"
+    If Not fso.FileExists(resultPath) Then Exit Sub
+
+    allText = ReadUtf8File(resultPath)
+    If Len(allText) = 0 Then Exit Sub
+
+    mode = LCase$(EmailSorter_TsvValue(allText, "mode"))
+    valueText = EmailSorter_TsvValue(allText, "display_value")
+    valueKind = LCase$(EmailSorter_TsvValue(allText, "display_value_kind"))
+End Sub
+
+Private Function EmailSorter_RunUserEditSync(ByVal Sh As Object, ByVal fieldKey As String, ByVal cleanValue As String, ByVal orderNumber As String, ByVal sourceUri As String, ByVal rowNum As Long) As Long
+    Dim fso As Object
+    Dim tempPath As String
+    Dim iniPath As String
+    Dim allText As String
+    Dim py As String
+    Dim syncScript As String
+    Dim cmd As String
+    Dim shell As Object
+    Dim exitCode As Long
+
+    On Error GoTo CleanFail
+    lastUserEditContextTsv = ""
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    tempPath = fso.GetSpecialFolder(2) & "\email_sorter_user_edit_r" & rowNum & "_t" & CLng(Timer * 10000) & ".tsv"
+    lastUserEditContextTsv = tempPath
+    Call WriteUtf8File(tempPath, _
+        CtxLine("field", fieldKey) & _
+        CtxLine("value", cleanValue) & _
+        CtxLine("order_number", orderNumber) & _
+        CtxLine("source_uri", sourceUri) & _
+        CtxLine("row_number", CStr(rowNum)) & _
+        CtxLine("workbook_path", ThisWorkbook.FullName) & _
+        CtxLine("sheet_name", Sh.Name))
+
+    EmailSorter_LogUserEdit "user_edit start row=" & rowNum & " field=" & fieldKey & " orderLen=" & Len(orderNumber) & " uriLen=" & Len(sourceUri) & " wb=" & ThisWorkbook.FullName
+
+    iniPath = EmailSorter_IniPath(Sh)
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        EmailSorter_LogUserEdit "FAIL ini missing or not found iniLen=" & Len(iniPath)
+        GoTo CleanFail
+    End If
+
+    allText = ReadUtf8File(iniPath)
+    py = IniValue(allText, "PY")
+    syncScript = IniValue(allText, "USER_EDIT_SYNC")
+    If Len(py) = 0 Or Len(syncScript) = 0 Then
+        EmailSorter_LogUserEdit "FAIL ini keys PY len=" & Len(py) & " USER_EDIT_SYNC len=" & Len(syncScript) & " ini=" & iniPath
+        GoTo CleanFail
+    End If
+    If Not fso.FileExists(py) Then
+        EmailSorter_LogUserEdit "FAIL python.exe missing: " & py
+        GoTo CleanFail
+    End If
+    If Not fso.FileExists(syncScript) Then
+        EmailSorter_LogUserEdit "FAIL USER_EDIT_SYNC script missing: " & syncScript
+        GoTo CleanFail
+    End If
+
+    cmd = Chr(34) & py & Chr(34) & " " & Chr(34) & syncScript & Chr(34) & " " & Chr(34) & tempPath & Chr(34)
+    Set shell = CreateObject("WScript.Shell")
+    exitCode = shell.Run(cmd, 0, True)
+    EmailSorter_LogUserEdit "user_edit shell exitCode=" & exitCode & " ctx=" & tempPath
+    EmailSorter_RunUserEditSync = exitCode
+    Exit Function
+CleanFail:
+    EmailSorter_LogUserEdit "user_edit CleanFail (VBA) Err=" & Err.Number & " " & Err.Description
+    EmailSorter_RunUserEditSync = 1
+End Function
+
+Private Function EmailSorter_IniPath(ByVal Sh As Object) As String
+    Dim fso As Object
+    Dim iniPath As String
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    On Error Resume Next
+    iniPath = Trim(CStr(Sh.Range("AA1").Value))
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        If Len(ThisWorkbook.Path) > 0 Then
+            iniPath = ThisWorkbook.Path & Application.PathSeparator & "excel_clipboard_launch.ini"
+        End If
+    End If
+    If Len(iniPath) > 0 And fso.FileExists(iniPath) Then EmailSorter_IniPath = iniPath
+End Function
+
+Private Function CtxLine(ByVal key As String, ByVal v As Variant) As String
+    Dim s As String
+    If IsError(v) Or IsEmpty(v) Then
+        CtxLine = ""
+        Exit Function
+    End If
+    s = CStr(v)
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, vbLf, " ")
+    s = Replace(s, Chr(9), " ")
+    CtxLine = key & Chr(9) & s & vbLf
+End Function
+
+Private Function ReadUtf8File(ByVal path As String) As String
+    Dim stm As Object
+    On Error GoTo CleanFail
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.LoadFromFile path
+    ReadUtf8File = stm.ReadText
+    stm.Close
+    Exit Function
+CleanFail:
+    ReadUtf8File = ""
+    On Error Resume Next
+    If Not stm Is Nothing Then stm.Close
+End Function
+
+Private Sub WriteUtf8File(ByVal path As String, ByVal content As String)
+    Dim stm As Object
+    On Error GoTo CleanFail
+    Set stm = CreateObject("ADODB.Stream")
+    stm.Type = 2
+    stm.Charset = "utf-8"
+    stm.Open
+    stm.WriteText content
+    stm.SaveToFile path, 2
+    stm.Close
+    Exit Sub
+CleanFail:
+    On Error Resume Next
+    If Not stm Is Nothing Then stm.Close
+End Sub
+
+Private Function IniValue(ByVal allText As String, ByVal key As String) As String
+    Dim lines As Variant
+    Dim i As Long
+    Dim line As String
+    Dim prefix As String
+    prefix = UCase(key) & "="
+    lines = Split(Replace(allText, vbCrLf, vbLf), vbLf)
+    For i = LBound(lines) To UBound(lines)
+        line = Trim(lines(i))
+        If UCase(Left(line, Len(prefix))) = prefix Then
+            IniValue = Trim(Mid(line, Len(prefix) + 1))
+            Exit Function
+        End If
+    Next i
+    IniValue = ""
+End Function
+
+Private Function EmailSorter_LastActionColumn(ByVal ws As Worksheet) As Long
+    Dim usedLastCol As Long
+    Dim c As Long
+    Dim v1 As Variant
+    Dim v2 As Variant
+    Dim s1 As String
+    Dim s2 As String
+
+    On Error GoTo Fallback
+    usedLastCol = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
+    If usedLastCol < 1 Then usedLastCol = 1
+
+    For c = 1 To usedLastCol
+        If Not ws.Columns(c).Hidden Then
+            v1 = ws.Cells(TOP_ROW, c).Value
+            v2 = ws.Cells(HeaderRow(ws), c).Value
+            If Not IsError(v1) Then s1 = Trim(CStr(v1)) Else s1 = ""
+            If Not IsError(v2) Then s2 = Trim(CStr(v2)) Else s2 = ""
+            If Len(s1) > 0 Or Len(s2) > 0 Then EmailSorter_LastActionColumn = c
+        End If
+    Next c
+    If EmailSorter_LastActionColumn < 1 Then EmailSorter_LastActionColumn = 1
+    Exit Function
+Fallback:
+    EmailSorter_LastActionColumn = 1
+End Function
+
+Private Function EmailSorter_RainbowPalette() As Variant
+    EmailSorter_RainbowPalette = Array( _
+        RGB(255, 59, 48), _
+        RGB(255, 149, 0), _
+        RGB(255, 214, 10), _
+        RGB(52, 199, 89), _
+        RGB(0, 122, 255), _
+        RGB(88, 86, 214), _
+        RGB(191, 90, 242))
+End Function
+
+Private Sub EmailSorter_ApplyTopRowRainbowCycle(ByVal ws As Worksheet)
+    Dim rng As Range
+    Dim cell As Range
+    Dim visibleIndex As Long
+    Dim colorCount As Long
+
+    On Error Resume Next
+    If IsEmpty(editRainbowPalette) Then editRainbowPalette = EmailSorter_RainbowPalette()
+    colorCount = UBound(editRainbowPalette) - LBound(editRainbowPalette) + 1
+    If colorCount <= 0 Then Exit Sub
+
+    Set rng = ws.Range(ws.Cells(TOP_ROW, 1), ws.Cells(TOP_ROW, EmailSorter_LastActionColumn(ws)))
+    visibleIndex = 0
+    For Each cell In rng.Cells
+        If Not cell.EntireColumn.Hidden Then
+            With cell.Interior
+                .Pattern = xlSolid
+                .Color = editRainbowPalette((visibleIndex + editRainbowFrame) Mod colorCount)
+                .TintAndShade = 0
+                .PatternTintAndShade = 0
+            End With
+            visibleIndex = visibleIndex + 1
+        End If
+    Next cell
+End Sub
+
+Private Sub EmailSorter_SetTopRowColor(ByVal ws As Worksheet, ByVal colorValue As Long)
+    Dim rng As Range
+    Dim cell As Range
+    On Error Resume Next
+    Set rng = ws.Range(ws.Cells(TOP_ROW, 1), ws.Cells(TOP_ROW, EmailSorter_LastActionColumn(ws)))
+    For Each cell In rng.Cells
+        If Not cell.EntireColumn.Hidden Then
+            With cell.Interior
+                .Pattern = xlSolid
+                .Color = colorValue
+                .TintAndShade = 0
+                .PatternTintAndShade = 0
+            End With
+        End If
+    Next cell
+End Sub
+
+Private Function EmailSorter_ElapsedSeconds(ByVal startedAt As Double) As Double
+    Dim t As Double
+    t = Timer
+    If t < startedAt Then t = t + 86400#
+    EmailSorter_ElapsedSeconds = t - startedAt
+End Function
 '''
 
 THISWORKBOOK_VBA = r'''Option Explicit
@@ -568,13 +1241,25 @@ Private Sub Workbook_Activate()
     Call EmailSorter_RegisterTripleEscapeHotkey
 End Sub
 
+Private Sub Workbook_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
+    On Error Resume Next
+    Call EmailSorter_HandleSelectionChange(Sh, Target)
+End Sub
+
+Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
+    On Error Resume Next
+    Call EmailSorter_HandleSheetChange(Sh, Target)
+End Sub
+
 Private Sub Workbook_Deactivate()
     On Error Resume Next
+    Call EmailSorter_CancelEditMode
     Call EmailSorter_UnregisterTripleEscapeHotkey
 End Sub
 
 Private Sub Workbook_BeforeClose(Cancel As Boolean)
     On Error Resume Next
+    Call EmailSorter_CancelEditMode
     Call EmailSorter_UnregisterTripleEscapeHotkey
 End Sub
 
@@ -832,6 +1517,7 @@ def write_clipboard_launch_ini(
     tracking_numbers_viewer_script: Path | None = None,
     tracking_status_viewer_script: Path | None = None,
     pod_workflow_script: Path | None = None,
+    user_edit_sync_script: Path | None = None,
 ) -> Path:
     """Write the Excel launcher INI consumed by VBA helpers (UTF-8)."""
     dest_file = dest_file.resolve()
@@ -847,6 +1533,8 @@ def write_clipboard_launch_ini(
         lines.append(f"TRACKING_STATUS_VIEWER={tracking_status_viewer_script.resolve()}\n")
     if pod_workflow_script is not None:
         lines.append(f"POD_WORKFLOW={pod_workflow_script.resolve()}\n")
+    if user_edit_sync_script is not None:
+        lines.append(f"USER_EDIT_SYNC={user_edit_sync_script.resolve()}\n")
     dest_file.write_text("".join(lines), encoding="utf-8")
     return dest_file
 

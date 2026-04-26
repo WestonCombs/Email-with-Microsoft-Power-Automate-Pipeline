@@ -2,7 +2,7 @@
 
 ## Primary workflow: proof-of-delivery (no MITM)
 
-The **Shipping status (17TRACK)** window uses **Toggle PDF capture** and **Ctrl+Enter** in the isolated capture Chrome. Implementation: **`html_capture/`** (Chrome DevTools `Page.printToPDF`).
+The **Shipping status (17TRACK)** window uses **Assisted PDF Capture**, **Play/Pause**, and **Ctrl+Shift+P** in the isolated capture Chrome. Implementation: **`html_capture/`** (Chrome DevTools `Page.printToPDF`).
 
 ## MITM (archival / optional)
 

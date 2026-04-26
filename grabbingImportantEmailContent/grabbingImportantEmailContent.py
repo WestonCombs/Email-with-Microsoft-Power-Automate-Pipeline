@@ -59,6 +59,9 @@ from emailFetching.emailFetcher import EmailMessage, prepend_outlook_style_heade
 
 from isGiftCard import UNKNOWN as IS_GIFT_CARD_UNKNOWN, is_gift_card, should_run_is_gift_card
 
+LLM_OBTAINED_COMPANY_FIELD = "llm_obtained_company"
+ORIGINAL_LLM_OBTAINED_COMPANY_FIELD = "original_llm_obtained_company"
+
 
 def _openai_fields_log_line(extracted: dict) -> str:
     """Short field summary for logs (not full JSON / body text)."""
@@ -1176,6 +1179,8 @@ def process_file(
             extracted = empty_extraction
         _coerce_llm_tracking_numbers(extracted)
 
+        original_llm_company = clean_text(extracted.get("company"))
+
         if not clean_text(extracted.get("company")):
             extracted["company"] = infer_company_from_subject(subject)
 
@@ -1272,6 +1277,8 @@ def process_file(
             "sender_name": clean_text(sender_name),
             "email": clean_text(email),
             "company": clean_text(extracted.get("company")),
+            LLM_OBTAINED_COMPANY_FIELD: clean_text(extracted.get("company")),
+            ORIGINAL_LLM_OBTAINED_COMPANY_FIELD: original_llm_company,
             "order_number": clean_text(extracted.get("order_number")),
             "purchase_datetime": clean_text(extracted.get("purchase_datetime")),
             "total_amount_paid": extracted.get("total_amount_paid"),
@@ -1301,6 +1308,8 @@ def process_file(
             "email": clean_text(email),
             "error": clean_text(e),
             "company": None,
+            LLM_OBTAINED_COMPANY_FIELD: None,
+            ORIGINAL_LLM_OBTAINED_COMPANY_FIELD: None,
             "order_number": None,
             "purchase_datetime": None,
             "total_amount_paid": None,
@@ -1504,12 +1513,60 @@ def _company_vote_key(company: str | None) -> str:
     return s
 
 
+def _record_company_vote_candidates(record: dict) -> list[str]:
+    """Company guesses this row can contribute to an order-level consensus vote.
+
+    A single email should not get extra weight just because the same guessed
+    label was copied through multiple fields, but genuinely different guesses
+    from different extraction attempts should all remain visible to the pool.
+    """
+    candidates: list[str] = []
+    seen_vote_keys: set[str] = set()
+
+    if not record.get("modified_company"):
+        field_order = (
+            ORIGINAL_LLM_OBTAINED_COMPANY_FIELD,
+            LLM_OBTAINED_COMPANY_FIELD,
+            "company",
+        )
+    else:
+        # User edits are authoritative for display, but should not become
+        # synthetic evidence about what the automated extraction discovered.
+        field_order = (
+            ORIGINAL_LLM_OBTAINED_COMPANY_FIELD,
+            LLM_OBTAINED_COMPANY_FIELD,
+        )
+
+    values: list[str | None] = [clean_text(record.get(k)) for k in field_order]
+    values.append(infer_company_from_subject(record.get("subject")))
+
+    for value in values:
+        cleaned = clean_text(value)
+        if not cleaned:
+            continue
+        vote_key = _company_vote_key(cleaned)
+        if not vote_key or vote_key in seen_vote_keys:
+            continue
+        seen_vote_keys.add(vote_key)
+        candidates.append(cleaned)
+
+    return candidates
+
+
+def _company_display_sort_key(item: tuple[str, int]) -> tuple[int, int, int, str, str]:
+    value, count = item
+    has_alpha = any(ch.isalpha() for ch in value)
+    all_caps_penalty = 1 if has_alpha and value.upper() == value else 0
+    return (-count, all_caps_penalty, -len(value), value.casefold(), value)
+
+
 def unify_company_names_by_order(results: list[dict]) -> None:
-    """For each order_number shared by 2+ rows, set ``company`` to the plurality winner.
+    """For each order_number shared by 2+ rows, apply a pooled company consensus.
 
     Voting uses a normalized key so variants like 'Bath & Body Works' and
-    'bath and body works' count together; the displayed string is the most
-    frequent *original* spelling among rows in the winning bucket.
+    'bath and body works' count together. Each row contributes every distinct
+    company candidate it has, then the group winner is written back to the
+    automated company field and to ``company`` unless the row was user-edited.
     """
     groups: dict[str, list[dict]] = defaultdict(list)
     for r in results:
@@ -1525,14 +1582,19 @@ def unify_company_names_by_order(results: list[dict]) -> None:
         originals_by_vote_key: dict[str, list[str]] = defaultdict(list)
 
         for r in group:
-            raw = clean_text(r.get("company"))
-            if not raw:
-                continue
-            vk = _company_vote_key(raw)
-            if not vk:
-                continue
-            key_votes[vk] += 1
-            originals_by_vote_key[vk].append(raw)
+            if (
+                ORIGINAL_LLM_OBTAINED_COMPANY_FIELD not in r
+                and clean_text(r.get(LLM_OBTAINED_COMPANY_FIELD))
+            ):
+                r[ORIGINAL_LLM_OBTAINED_COMPANY_FIELD] = clean_text(
+                    r.get(LLM_OBTAINED_COMPANY_FIELD)
+                )
+            for raw in _record_company_vote_candidates(r):
+                vk = _company_vote_key(raw)
+                if not vk:
+                    continue
+                key_votes[vk] += 1
+                originals_by_vote_key[vk].append(raw)
 
         if not key_votes:
             continue
@@ -1550,14 +1612,19 @@ def unify_company_names_by_order(results: list[dict]) -> None:
         oc = Counter(origs)
         winner_display = sorted(
             oc.items(),
-            key=lambda kv: (-kv[1], -len(kv[0]), kv[0]),
+            key=_company_display_sort_key,
         )[0][0]
 
         before_vals = [clean_text(r.get("company")) for r in group]
         for r in group:
-            r["company"] = winner_display
+            if not r.get("modified_company"):
+                r["company"] = winner_display
+            r[LLM_OBTAINED_COMPANY_FIELD] = winner_display
 
-        if any(b != winner_display for b in before_vals):
+        if any(
+            (not r.get("modified_company")) and b != winner_display
+            for r, b in zip(group, before_vals)
+        ):
             print(
                 console_safe_text(
                     f"  Company consensus (order {order_key}): {winner_display!r} "

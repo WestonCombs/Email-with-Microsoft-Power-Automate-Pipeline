@@ -12,6 +12,7 @@ Typical use is via ``BASE_DIR/mitm_pdf_capture/run_pdf_capture.py`` (starts mitm
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -51,6 +52,104 @@ def _append_capture_log(message: str) -> None:
         pass
 
 
+def _hidden_subprocess_kwargs() -> dict:
+    kwargs: dict = {
+        "capture_output": True,
+        "text": True,
+        "stdin": subprocess.DEVNULL,
+    }
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # type: ignore[assignment]
+    return kwargs
+
+
+def _capture_profile_marker() -> str:
+    return str(CHROME_USER_DATA_MITM.resolve()).replace("/", "\\").casefold()
+
+
+def _commandline_uses_capture_profile(command_line: str) -> bool:
+    marker = _capture_profile_marker()
+    haystack = str(command_line or "").replace("/", "\\").casefold()
+    return bool(marker) and marker in haystack and "--user-data-dir=" in haystack
+
+
+def list_isolated_capture_chrome_pids() -> list[int]:
+    """Return Chrome process IDs using this tool's dedicated capture profile."""
+    if sys.platform != "win32":
+        return []
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" "
+                    "| Select-Object ProcessId, CommandLine "
+                    "| ConvertTo-Json -Compress"
+                ),
+            ],
+            timeout=15,
+            **_hidden_subprocess_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    items = payload if isinstance(payload, list) else [payload]
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        command_line = str(item.get("CommandLine") or "")
+        if not _commandline_uses_capture_profile(command_line):
+            continue
+        try:
+            pid = int(item.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid > 0 and pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+    return out
+
+
+def terminate_isolated_capture_chrome(*, exclude_pids: set[int] | None = None) -> int:
+    """Force-close every Chrome instance using the dedicated assisted-capture profile."""
+    if sys.platform != "win32":
+        return 0
+    exclude = {int(pid) for pid in (exclude_pids or set()) if int(pid) > 0}
+    killed = 0
+    for pid in list_isolated_capture_chrome_pids():
+        if pid in exclude:
+            continue
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                timeout=15,
+                **_hidden_subprocess_kwargs(),
+            )
+            killed += 1
+        except (OSError, subprocess.SubprocessError):
+            continue
+    if killed:
+        _append_capture_log(f"Closed {killed} stale isolated Chrome process(es).")
+    return killed
+
+
 def _find_chrome_exe() -> Path | None:
     program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
     program_files_x86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
@@ -69,6 +168,11 @@ def _find_chrome_exe() -> Path | None:
 def find_chrome_executable() -> Path | None:
     """Path to ``chrome.exe`` for readiness checks and optional overrides."""
     return _find_chrome_exe()
+
+
+def _remote_allow_origins_arg(remote_debugging_port: int) -> str:
+    """Allow local DevTools WebSocket clients for the chosen debugging port."""
+    return f"--remote-allow-origins=http://127.0.0.1:{remote_debugging_port}"
 
 
 def launch_isolated_chrome(
@@ -102,6 +206,7 @@ def launch_isolated_chrome(
     ]
     if remote_debugging_port is not None:
         args.insert(4, f"--remote-debugging-port={remote_debugging_port}")
+        args.insert(5, _remote_allow_origins_arg(remote_debugging_port))
     if verbose:
         print("Starting isolated Chrome for mitmproxy:")
         print(" ", subprocess.list2cmdline(args))
@@ -127,7 +232,7 @@ def launch_isolated_chrome_no_proxy(
     verbose: bool = False,
 ) -> subprocess.Popen | None:
     """
-    Isolated profile Chrome **without** mitmproxy. Used by HtmlCaptureController (Ctrl+Enter PDF snapshot).
+    Isolated profile Chrome **without** mitmproxy. Used by HtmlCaptureController (Ctrl+Shift+P PDF snapshot).
     Reuses the same user-data dir as the MITM launcher for shared CA / cookies.
     """
     chrome = chrome_path or _find_chrome_exe()
@@ -144,6 +249,7 @@ def launch_isolated_chrome_no_proxy(
         str(chrome),
         f"--user-data-dir={CHROME_USER_DATA_MITM.resolve()}",
         f"--remote-debugging-port={remote_debugging_port}",
+        _remote_allow_origins_arg(remote_debugging_port),
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-sync",

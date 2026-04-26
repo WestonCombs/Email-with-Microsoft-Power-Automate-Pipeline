@@ -1,4 +1,4 @@
-"""Keybind (Ctrl+Enter) + CDP print-to-PDF for proof-of-delivery capture."""
+"""Keybind (Ctrl+Shift+P) + CDP print-to-PDF for proof-of-delivery capture."""
 
 from __future__ import annotations
 
