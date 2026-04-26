@@ -32,7 +32,7 @@ from proofOfDelivery.pod_data import (
     POD_HUB_MODE,
     delete_processed_tracking_artifacts,
     expected_pod_pdf_path,
-    first_existing_capture_pdf_path,
+    first_existing_pod_pdf_path,
     pod_status_viewer_rows,
     project_root_from_env,
 )
@@ -221,6 +221,10 @@ class TrackingStatusViewerApp:
         self._batch_capture_after_id: str | None = None
         self._audit_entries_cache: list[dict[str, object]] = []
         self._audit_entries_mtime_ns: int | None = None
+        self._capture_instruction_window: tk.Toplevel | None = None
+        self._capture_progress_window: tk.Toplevel | None = None
+        self._capture_progress_status_var: tk.StringVar | None = None
+        self._capture_progress_bar: ttk.Progressbar | None = None
 
         try:
             from shared.settings_store import apply_runtime_settings_from_json
@@ -683,14 +687,12 @@ class TrackingStatusViewerApp:
         if self._project_root is not None:
             num = str(info.get("tracking_number") or "").strip()
             if num:
-                existing_pdf = first_existing_capture_pdf_path(
+                existing_pdf = first_existing_pod_pdf_path(
                     self._project_root,
                     str(info.get("company") or "").strip() or "Unknown",
                     str(info.get("purchase_datetime") or "").strip(),
                     num,
                     str(info.get("carrier") or "").strip() or carrier_display_for_number(num),
-                    str(info.get("order_number") or "").strip(),
-                    str(info.get("category") or "").strip(),
                 )
                 if existing_pdf is not None:
                     return existing_pdf
@@ -950,13 +952,167 @@ class TrackingStatusViewerApp:
         except tk.TclError:
             pass
 
+    def _place_capture_popup(self, win: tk.Toplevel) -> None:
+        try:
+            win.update_idletasks()
+            self._root.update_idletasks()
+            x = self._root.winfo_rootx() + (self._root.winfo_width() // 2) - (win.winfo_width() // 2)
+            y = self._root.winfo_rooty() + 72
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+            win.lift()
+            win.attributes("-topmost", True)
+            def clear_topmost() -> None:
+                try:
+                    win.attributes("-topmost", False)
+                except tk.TclError:
+                    pass
+
+            win.after(900, clear_topmost)
+        except tk.TclError:
+            pass
+
+    def _destroy_capture_instruction_window(self) -> None:
+        win = self._capture_instruction_window
+        self._capture_instruction_window = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _destroy_capture_progress_window(self) -> None:
+        bar = self._capture_progress_bar
+        self._capture_progress_bar = None
+        if bar is not None:
+            try:
+                bar.stop()
+            except tk.TclError:
+                pass
+        win = self._capture_progress_window
+        self._capture_progress_window = None
+        self._capture_progress_status_var = None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+    def _destroy_capture_popups(self) -> None:
+        self._destroy_capture_instruction_window()
+        self._destroy_capture_progress_window()
+
+    def _show_capture_instruction_window(self, info: dict[str, object]) -> None:
+        self._destroy_capture_progress_window()
+        self._destroy_capture_instruction_window()
+        num = str(info.get("tracking_number") or "").strip()
+        carrier = str(info.get("carrier") or "").strip() or carrier_display_for_number(num)
+        title = "Starting assisted PDF capture"
+        try:
+            win = tk.Toplevel(self._root)
+            win.title("Assisted PDF Capture")
+            win.configure(bg=THEME["bg"])
+            win.resizable(False, False)
+            win.transient(self._root)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+            frame = tk.Frame(win, bg=THEME["bg"], padx=18, pady=16)
+            frame.pack(fill=tk.BOTH, expand=True)
+            tk.Label(
+                frame,
+                text=title,
+                fg=THEME["fg"],
+                bg=THEME["bg"],
+                font=theme_font("title"),
+                anchor=tk.W,
+            ).pack(fill=tk.X, anchor=tk.W)
+            detail = f"{carrier} {num}".strip()
+            if detail:
+                tk.Label(
+                    frame,
+                    text=detail,
+                    fg=THEME["muted"],
+                    bg=THEME["bg"],
+                    font=theme_font("body"),
+                    anchor=tk.W,
+                ).pack(fill=tk.X, anchor=tk.W, pady=(5, 0))
+            tk.Label(
+                frame,
+                text=(
+                    "Wait until the shipping information is displayed in Chrome, "
+                    f"then press {CAPTURE_HOTKEY_LABEL}."
+                ),
+                wraplength=430,
+                justify=tk.LEFT,
+                fg=THEME["fg"],
+                bg=THEME["bg"],
+                font=theme_font("body"),
+                anchor=tk.W,
+            ).pack(fill=tk.X, anchor=tk.W, pady=(12, 0))
+            self._capture_instruction_window = win
+            self._place_capture_popup(win)
+        except tk.TclError:
+            self._capture_instruction_window = None
+
+    def _show_capture_progress_window(self, message: str) -> None:
+        self._destroy_capture_instruction_window()
+        clean = " ".join(str(message or "").split()) or "Capture trigger received."
+        if self._capture_progress_window is not None and self._capture_progress_status_var is not None:
+            try:
+                self._capture_progress_status_var.set(clean)
+                self._capture_progress_window.lift()
+            except tk.TclError:
+                self._destroy_capture_progress_window()
+            return
+        try:
+            win = tk.Toplevel(self._root)
+            win.title("PDF Capture Progress")
+            win.configure(bg=THEME["bg"])
+            win.resizable(False, False)
+            win.transient(self._root)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+            frame = tk.Frame(win, bg=THEME["bg"], padx=18, pady=16)
+            frame.pack(fill=tk.BOTH, expand=True)
+            tk.Label(
+                frame,
+                text="Capture trigger received",
+                fg=THEME["fg"],
+                bg=THEME["bg"],
+                font=theme_font("title"),
+                anchor=tk.W,
+            ).pack(fill=tk.X, anchor=tk.W)
+            status_var = tk.StringVar(value=clean)
+            tk.Label(
+                frame,
+                textvariable=status_var,
+                wraplength=430,
+                justify=tk.LEFT,
+                fg=THEME["muted"],
+                bg=THEME["bg"],
+                font=theme_font("body"),
+                anchor=tk.W,
+            ).pack(fill=tk.X, anchor=tk.W, pady=(8, 12))
+            bar = ttk.Progressbar(frame, mode="indeterminate", length=420)
+            bar.pack(fill=tk.X)
+            bar.start(12)
+            self._capture_progress_window = win
+            self._capture_progress_status_var = status_var
+            self._capture_progress_bar = bar
+            self._place_capture_popup(win)
+        except tk.TclError:
+            self._capture_progress_window = None
+            self._capture_progress_status_var = None
+            self._capture_progress_bar = None
+
     def _capture_notify(self, level: str, message: str) -> None:
         audit_pause = level == "error" and "AI audit did not approve this capture" in str(message or "")
         chrome_closed = level == "info" and "The capture Chrome was closed." in str(message or "")
 
         def show() -> None:
             self._set_capture_status(message)
+            if level == "progress":
+                self._show_capture_progress_window(message)
+                return
             if chrome_closed:
+                self._destroy_capture_popups()
                 self._hands_free_capture_running = False
                 if self._batch_capture_active and self._hands_free_pdf_var.get():
                     self._cancel_batch_after()
@@ -965,7 +1121,9 @@ class TrackingStatusViewerApp:
                     )
                 return
             if level == "error":
+                self._destroy_capture_progress_window()
                 if not audit_pause:
+                    self._destroy_capture_instruction_window()
                     self._hands_free_capture_running = False
                     self._set_batch_capture_active(False)
                 else:
@@ -994,6 +1152,7 @@ class TrackingStatusViewerApp:
         controller = self._capture_controller
         self._capture_controller = None
         self._hands_free_capture_running = False
+        self._destroy_capture_popups()
         if controller is not None:
             controller.stop()
 
@@ -1064,6 +1223,7 @@ class TrackingStatusViewerApp:
             return False
         controller = self._ensure_capture_controller()
         if controller is None:
+            self._destroy_capture_instruction_window()
             messagebox.showerror(
                 "PDF capture",
                 f"Could not start assisted capture. {CAPTURE_HOTKEY_LABEL} capture requires Windows and Chrome.",
@@ -1073,17 +1233,22 @@ class TrackingStatusViewerApp:
             self._set_batch_capture_active(True)
         self._tree.selection_set(str(idx))
         self._tree.see(str(idx))
+        self._show_capture_instruction_window(info)
         record = self._record_for_hands_free_capture(info)
         if not controller.enqueue_capture(url, expected_pdf, record=record, auto_print_pdf=False):
+            self._destroy_capture_instruction_window()
             return False
         self._hands_free_capture_running = True
         num = str(info.get("tracking_number") or "").strip()
-        self._set_capture_status(f"Opened {num}. Press {CAPTURE_HOTKEY_LABEL} in Chrome when the page is ready.")
+        self._set_capture_status(
+            f"Starting {num}. Wait for shipping information, then press {CAPTURE_HOTKEY_LABEL}."
+        )
         return True
 
     def _on_assisted_capture_saved(self) -> None:
         """Refresh visible POD state and advance the batch after an approved capture."""
         self._hands_free_capture_running = False
+        self._destroy_capture_popups()
         self._apply_pod_completion_layout()
         if self._batch_capture_active:
             self._set_capture_status("Saved. Opening next active POD row...")

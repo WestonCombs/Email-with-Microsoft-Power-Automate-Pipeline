@@ -398,14 +398,12 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
                 tracking_number,
                 carrier_display,
             )
-            existing_pdf_path = first_existing_capture_pdf_path(
+            existing_pdf_path = first_existing_pod_pdf_path(
                 project_root,
                 company,
                 purchase_datetime,
                 tracking_number,
                 carrier_display,
-                order_number,
-                source_category,
             )
             if existing_pdf_path is None:
                 continue
@@ -566,14 +564,12 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
                 tracking_number,
                 carrier_display,
             )
-            if first_existing_capture_pdf_path(
+            if first_existing_pod_pdf_path(
                 project_root,
                 company,
                 purchase_datetime,
                 tracking_number,
                 carrier_display,
-                order_number,
-                source_category,
             ) is not None:
                 continue
             out.append(
@@ -664,20 +660,17 @@ def delete_processed_tracking_artifacts(
         add_candidate(_safe_path(processed_pdf_path))
 
     add_candidate(
-        first_existing_capture_pdf_path(
+        first_existing_pod_pdf_path(
             project_root,
             company,
             purchase_datetime,
             tracking_number,
             carrier_display,
-            order_number,
-            category,
         )
     )
     for basename in (
         pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display),
         legacy_pod_pdf_basename(company, purchase_datetime, tracking_number, carrier_display),
-        legacy_email_capture_pdf_basename(company, purchase_datetime, order_number, category),
     ):
         for path in _all_existing_pdf_named(project_root, basename):
             add_candidate(path)

@@ -43,6 +43,7 @@ Private editRainbowPalette As Variant
 
 Private Const TRIPLE_ESC_MAX_GAP_SEC As Long = 2
 Private Const EDIT_MODE_SECONDS As Long = 10
+Private Const EDIT_RAINBOW_FRAME_STEP As Long = 3
 Private Const TOP_ROW As Long = 1
 Private Const DEFAULT_HEADER_ROW As Long = 2
 Private Const COL_FILE_URI As Long = 29
@@ -319,7 +320,7 @@ Public Sub EmailSorter_TopRowRainbowCycleTick()
     On Error Resume Next
     If Not editModeEnabled Then Exit Sub
     If TypeName(ActiveSheet) = "Worksheet" Then
-        editRainbowFrame = editRainbowFrame + 1
+        editRainbowFrame = editRainbowFrame + EDIT_RAINBOW_FRAME_STEP
         EmailSorter_ApplyTopRowRainbowCycle ActiveSheet
     End If
     EmailSorter_ScheduleTopRowRainbowCycle

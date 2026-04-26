@@ -896,6 +896,14 @@ def main() -> None:
     clear_cancel_request(base_dir)
     _delete_saved_email_data_if_requested(base_dir)
     _emit_run_launcher_progress(1, "Starting…")
+    auto_custom_import_sources = (
+        _discover_custom_import_html_files(base_dir)
+        if not skip_email_fetch and not custom_import_html
+        else []
+    )
+    auto_custom_import = bool(auto_custom_import_sources)
+    if auto_custom_import:
+        custom_import_html = True
 
     azure_client_id = (os.getenv("AZURE_CLIENT_ID") or "").strip()
     azure_tenant_id = (os.getenv("AZURE_TENANT_ID") or "common").strip()
@@ -936,10 +944,16 @@ def main() -> None:
             "email_contents/html/ and email_contents/pdf/"
         )
     elif custom_import_html:
-        print(
-            "  Email fetch: SKIPPED (--custom-import-html) — using *.html under "
-            "BASE_DIR/custom_import_html_files/ (placeholder From/Subject for debug)"
-        )
+        if auto_custom_import:
+            print(
+                "  Email fetch: SKIPPED (auto-detected custom import HTML) — using *.html under "
+                "BASE_DIR/custom_import_html_files/ (placeholder From/Subject for debug)"
+            )
+        else:
+            print(
+                "  Email fetch: SKIPPED (--custom-import-html) — using *.html under "
+                "BASE_DIR/custom_import_html_files/ (placeholder From/Subject for debug)"
+            )
     print(f"{'=' * W}\n")
 
     # ── Prepare timing buffer (temp JSONL) ───────────────────────
@@ -1054,12 +1068,17 @@ def main() -> None:
         fetch_skipped = True
         html_archive = base_dir / "email_contents" / "html"
         custom_dir = base_dir / "custom_import_html_files"
+        sources = auto_custom_import_sources or _discover_custom_import_html_files(base_dir)
+        intro = (
+            "[Step 2] Skipping Microsoft Graph — auto-detected custom import HTML from:\n"
+            if auto_custom_import
+            else "[Step 2] Skipping Microsoft Graph — custom debug import from:\n"
+        )
         print(
-            "[Step 2] Skipping Microsoft Graph — custom debug import from:\n"
+            f"{intro}"
             f"         {custom_dir}\n"
             "         (each file is copied to email_contents/pdf/fileN.html; originals are unchanged.)\n"
         )
-        sources = _discover_custom_import_html_files(base_dir)
         fetch_s = time.perf_counter() - t_fetch
         if not sources:
             print(

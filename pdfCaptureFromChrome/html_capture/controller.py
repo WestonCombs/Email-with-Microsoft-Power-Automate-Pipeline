@@ -596,6 +596,7 @@ class HtmlCaptureController:
             self._emit("error", f"Automatic print to PDF failed: {e!s}")
 
     def _schedule_snapshot(self) -> None:
+        self._emit("progress", f"{CAPTURE_HOTKEY_LABEL} received. Starting PDF capture...")
         threading.Thread(target=self._do_snapshot, name="html-capture-cdp", daemon=True).start()
 
     def _resolve_capture_for_focused_tab(self) -> tuple[str, Path] | None:
@@ -674,6 +675,7 @@ class HtmlCaptureController:
                 )
                 return
             target_id, out_path = capture
+            self._emit("progress", "Matched the focused Chrome tab. Preparing to print the page...")
             if out_path.is_file() and not self._verbose:
                 self._emit("info", f"File already exists:\n{out_path.name}")
                 self._close_target_id(target_id)
@@ -708,11 +710,13 @@ class HtmlCaptureController:
                 self._emit("error", "Could not find the Chrome tab to print (is DevTools connected?).")
                 return
 
+            self._emit("progress", "Printing the displayed shipping page to PDF...")
             pdf_bytes = export_page_pdf(ws_url)
             staged_pdf = _unique_sibling_path(out_path, "_capture_pending")
             staged_pdf.write_bytes(pdf_bytes)
             with self._lock:
                 record = self._target_to_record.get(target_id)
+            self._emit("progress", "Checking the captured PDF before saving...")
             final_pdf, can_advance, audit_message = _finalize_pdf_with_audit(
                 staged_pdf,
                 out_path,
