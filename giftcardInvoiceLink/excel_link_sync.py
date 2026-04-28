@@ -19,6 +19,8 @@ _XL_EDGE_BOTTOM = 9
 _XL_EDGE_RIGHT = 10
 _XL_CONTINUOUS = 1  # xlContinuous
 _XL_HAIRLINE = 1  # xlHairline border weight (matches openpyxl hair side)
+_HEADER_SCAN_ROWS = (2, 1, 3, 4, 5)
+_HEADER_SCAN_COLS = 80
 
 from giftcardInvoiceLink.link_store import (
     gift_order_link_label,
@@ -30,22 +32,25 @@ from giftcardInvoiceLink.link_store import (
 from proofOfDelivery.pod_data import load_excel_records
 
 
-def _com_header_col(ws, want: str) -> int:
-    """1-based column index or 0."""
-    last = 1
-    for c in range(1, 40):
-        v = ws.Cells(1, c).Value
-        if v is None or (isinstance(v, str) and not v.strip()):
-            continue
-        last = c
-    want_l = want.strip().lower()
-    for c in range(1, last + 1):
-        h = ws.Cells(1, c).Value
-        if h is None:
-            continue
-        if str(h).strip().lower() == want_l:
-            return c
-    return 0
+def _norm_header(value: object) -> str:
+    text = str(value or "").replace("\xa0", " ").strip()
+    return " ".join(text.split()).casefold()
+
+
+def find_header_columns(ws, *wants: str) -> tuple[int, dict[str, int]]:
+    """Return ``(header_row, columns_by_want)`` for the row containing every wanted header."""
+    if not wants:
+        return 0, {}
+    want_by_norm = {_norm_header(want): want for want in wants}
+    for row in _HEADER_SCAN_ROWS:
+        found: dict[str, int] = {}
+        for col in range(1, _HEADER_SCAN_COLS + 1):
+            want = want_by_norm.get(_norm_header(ws.Cells(row, col).Value))
+            if want is not None and want not in found:
+                found[want] = col
+        if len(found) == len(wants):
+            return row, found
+    return 0, {}
 
 
 def _sheet_name_for_ref(name: str) -> str:
@@ -147,10 +152,10 @@ def sync_workbook_invoice_links(
     *,
     project_root: Path,
     sheet_name: str = "Orders",
-    data_start_row: int = 2,
+    data_start_row: int | None = None,
 ) -> bool:
     """Refresh Invoice link column from JSON + link file. Returns True if updated."""
-    records = load_excel_records(project_root, include_automation_hub=True, sync_pod_json=False)
+    records = load_excel_records(project_root, include_automation_hub=False, sync_pod_json=False)
     if not isinstance(records, list) or not records:
         return False
     edges = load_edges(links_path_for_project_root(project_root), records)
@@ -160,10 +165,13 @@ def sync_workbook_invoice_links(
     except Exception:
         return False
 
-    col_invoice = _com_header_col(ws, "Invoice link")
-    col_cat = _com_header_col(ws, "Category")
+    header_row, header_cols = find_header_columns(ws, "Category", "Invoice link")
+    col_invoice = header_cols.get("Invoice link", 0)
+    col_cat = header_cols.get("Category", 0)
     if col_invoice == 0 or col_cat == 0:
         return False
+    if data_start_row is None:
+        data_start_row = header_row + 1
 
     sn = _sheet_name_for_ref(str(ws.Name))
     n = len(records)

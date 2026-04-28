@@ -48,6 +48,7 @@ _MSG_REFRESH_FAILED = (
 from tkinter import Tk, messagebox
 
 from giftcardInvoiceLink.excel_link_sync import (
+    find_header_columns,
     find_workbook_and_application,
     find_workbook_by_path,
     sync_workbook_invoice_links,
@@ -88,7 +89,7 @@ def _refresh_invoice_links_with_retries(excel, wb_path: str) -> None:
 
 
 def _load_records() -> list[dict]:
-    return load_excel_records(PROJECT_ROOT, include_automation_hub=True, sync_pod_json=False)
+    return load_excel_records(PROJECT_ROOT, include_automation_hub=False, sync_pod_json=False)
 
 
 def _category(ws, row: int, col_cat: int) -> str:
@@ -98,24 +99,14 @@ def _category(ws, row: int, col_cat: int) -> str:
     return str(v).strip()
 
 
-def _com_header_col(ws, want: str) -> int:
-    last = 1
-    for c in range(1, 40):
-        v = ws.Cells(1, c).Value
-        if v is None or (isinstance(v, str) and not v.strip()):
-            continue
-        last = c
-    want_l = want.strip().lower()
-    for c in range(1, last + 1):
-        h = ws.Cells(1, c).Value
-        if h is None:
-            continue
-        if str(h).strip().lower() == want_l:
-            return c
-    return 0
+def _record_index_for_row(records: list[dict], row: int, data_start_row: int) -> int | None:
+    idx = row - data_start_row
+    if idx < 0 or idx >= len(records):
+        return None
+    return idx
 
 
-def _order_summary(records: list[dict], idx: int) -> str:
+def _order_summary(records: list[dict], idx: int, data_start_row: int | None = None) -> str:
     if idx < 0 or idx >= len(records):
         return "?"
     r = records[idx]
@@ -126,7 +117,8 @@ def _order_summary(records: list[dict], idx: int) -> str:
         parts.append(f"order {on}")
     if co:
         parts.append(str(co))
-    return ", ".join(parts) if parts else f"row {idx + 2}"
+    display_row = idx + data_start_row if data_start_row is not None else idx + 2
+    return ", ".join(parts) if parts else f"row {display_row}"
 
 
 def _wait_different_row(excel, initial_row: int) -> int | None:
@@ -147,13 +139,14 @@ def _wait_different_row(excel, initial_row: int) -> int | None:
 def _remove_flow(
     records: list[dict],
     origin_row: int,
+    data_start_row: int,
     ws,
     col_cat: int,
 ) -> None:
-    if origin_row < 2 or origin_row > len(records) + 1:
+    idx = _record_index_for_row(records, origin_row, data_start_row)
+    if idx is None:
         messagebox.showerror("Invoice link", "That row is outside the data range.")
         return
-    idx = origin_row - 2
     key = stable_record_key(records[idx], idx)
     cat = _category(ws, origin_row, col_cat)
     link_path = links_path_for_project_root(PROJECT_ROOT)
@@ -189,7 +182,7 @@ def _remove_flow(
     for e in rel:
         gi = index_for_key(records, e.gift_key)
         if gi is not None:
-            gift_lines.append(_order_summary(records, gi))
+            gift_lines.append(_order_summary(records, gi, data_start_row))
         else:
             gift_lines.append("(gift card row)")
 
@@ -207,25 +200,26 @@ def _remove_flow(
 def _add_flow(
     records: list[dict],
     origin_row: int,
+    data_start_row: int,
     excel,
     ws,
     col_cat: int,
 ) -> None:
-    if origin_row < 2 or origin_row > len(records) + 1:
+    oidx = _record_index_for_row(records, origin_row, data_start_row)
+    if oidx is None:
         messagebox.showerror("Invoice link", "That row is outside the data range.")
         return
-    oidx = origin_row - 2
     ocat = _category(ws, origin_row, col_cat)
 
     target_row = _wait_different_row(excel, origin_row)
     if target_row is None:
         messagebox.showwarning("Invoice link", "Timed out waiting for a new row selection.")
         return
-    if target_row < 2 or target_row > len(records) + 1:
+    tidx = _record_index_for_row(records, target_row, data_start_row)
+    if tidx is None:
         messagebox.showerror("Invoice link", "Selected row is outside the data range.")
         return
 
-    tidx = target_row - 2
     tcat = _category(ws, target_row, col_cat)
 
     if ocat == tcat:
@@ -256,7 +250,7 @@ def _add_flow(
 
     msg = (
         "Create this link?\n\n"
-        f"Gift card: {_order_summary(records, gidx)}\n"
+        f"Gift card: {_order_summary(records, gidx, data_start_row)}\n"
         f"Order number (all rows with this number will show as linked): {order_on}"
     )
     r = messagebox.askyesnocancel("Confirm gift / order link", msg)
@@ -337,14 +331,16 @@ def main() -> None:
         root.destroy()
         return
 
-    col_cat = _com_header_col(ws, "Category")
-    col_inv = _com_header_col(ws, "Invoice link")
+    header_row, header_cols = find_header_columns(ws, "Category", "Invoice link")
+    col_cat = header_cols.get("Category", 0)
+    col_inv = header_cols.get("Invoice link", 0)
     if col_cat == 0 or col_inv == 0:
         root = Tk()
         root.withdraw()
         messagebox.showerror("Invoice link", "Missing Category or Invoice link column headers.")
         root.destroy()
         return
+    data_start_row = header_row + 1
 
     root = Tk()
     root.withdraw()
@@ -355,9 +351,9 @@ def main() -> None:
         txt = str(cell_txt).strip() if cell_txt is not None else ""
 
         if txt == "Linked":
-            _remove_flow(records, origin_row, ws, col_cat)
+            _remove_flow(records, origin_row, data_start_row, ws, col_cat)
         elif txt in ("Link to order", "Link to Gift Card"):
-            _add_flow(records, origin_row, excel, ws, col_cat)
+            _add_flow(records, origin_row, data_start_row, excel, ws, col_cat)
         else:
             messagebox.showinfo(
                 "Invoice link",
