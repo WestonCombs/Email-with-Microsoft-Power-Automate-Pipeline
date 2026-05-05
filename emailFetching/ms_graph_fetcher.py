@@ -453,6 +453,7 @@ def fetch_emails(
                 ).strip()
 
             sent_iso = detail.get("sentDateTime") or detail.get("receivedDateTime")
+            received_iso = detail.get("receivedDateTime") or detail.get("sentDateTime")
             sent_line = format_graph_datetime_local(sent_iso)
 
             attachments: list[tuple[str, bytes]] = []
@@ -495,6 +496,8 @@ def fetch_emails(
                     to_line=to_line,
                     sent_line=sent_line,
                     header_title=header_title,
+                    sent_datetime_iso=str(sent_iso or "").strip(),
+                    received_datetime_iso=str(received_iso or "").strip(),
                 )
             )
         return messages

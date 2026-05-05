@@ -23,6 +23,8 @@ class EmailMessage:
     to_line: str = ""
     sent_line: str = ""
     header_title: str = ""
+    sent_datetime_iso: str = ""
+    received_datetime_iso: str = ""
 
     @property
     def sender_email(self) -> str:

@@ -542,6 +542,7 @@ def run_grabbing_important_content(
     subject: str,
     sender_email: str,
     sender_name: str,
+    email_datetime: str | None = None,
     *,
     base_dir: Path,
     usage_log_path: Path | None = None,
@@ -561,6 +562,8 @@ def run_grabbing_important_content(
         "--email", sender_email,
         "--sender-name", sender_name,
     ]
+    if (email_datetime or "").strip():
+        cmd.extend(["--email-datetime", str(email_datetime).strip()])
     env = os.environ.copy()
     if usage_log_path:
         env["OPENAI_USAGE_LOG_PATH"] = str(usage_log_path)
@@ -1053,6 +1056,7 @@ def main() -> None:
                 subject=subj,
                 sender_email=sender_email,
                 sender_name=sender_name,
+                email_datetime=None,
                 base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,
@@ -1122,6 +1126,7 @@ def main() -> None:
                 subject=subj,
                 sender_email=sender_email,
                 sender_name=sender_name,
+                email_datetime=None,
                 base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,
@@ -1202,6 +1207,7 @@ def main() -> None:
                 subject=msg.subject,
                 sender_email=msg.sender_email,
                 sender_name=msg.sender_name,
+                email_datetime=(msg.received_datetime_iso or msg.sent_datetime_iso or None),
                 base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,

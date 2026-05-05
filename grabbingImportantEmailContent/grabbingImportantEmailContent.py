@@ -11,7 +11,7 @@ import time
 import traceback
 import urllib.parse
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # python_files/ — .env must load before htmlHandler (BASE_DIR is set when shared.runLogger loads)
@@ -1185,6 +1185,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Sender email address. Embedded in the output JSON as-is.",
     )
+    parser.add_argument(
+        "--email-datetime",
+        default=None,
+        dest="email_datetime",
+        help=(
+            "Original email timestamp (ISO-8601 preferred, e.g. 2026-05-05T13:14:15Z). "
+            "Used for order-level purchase date consolidation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1196,6 +1205,7 @@ def process_file(
     subject: str | None,
     sender_name: str | None,
     email: str | None,
+    email_datetime: str | None = None,
 ) -> dict:
     """Run the full extraction pipeline for one HTML email file.
 
@@ -1472,6 +1482,7 @@ def process_file(
             "subject": clean_text(subject),
             "sender_name": clean_text(sender_name),
             "email": clean_text(email),
+            "email_datetime": clean_text(email_datetime),
             "company": clean_text(extracted.get("company")),
             LLM_OBTAINED_COMPANY_FIELD: clean_text(extracted.get("company")),
             ORIGINAL_LLM_OBTAINED_COMPANY_FIELD: original_llm_company,
@@ -1502,6 +1513,7 @@ def process_file(
             "subject": clean_text(subject),
             "sender_name": clean_text(sender_name),
             "email": clean_text(email),
+            "email_datetime": clean_text(email_datetime),
             "error": clean_text(e),
             "company": None,
             LLM_OBTAINED_COMPANY_FIELD: None,
@@ -1860,6 +1872,103 @@ def unify_company_names_by_order(results: list[dict]) -> None:
             )
 
 
+def _parse_email_datetime_for_sort(value: str | None) -> datetime | None:
+    """Parse record-level email datetime into a UTC-naive datetime for sorting."""
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    raw = cleaned.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        date_only = _extract_date_str(cleaned)
+        if not date_only:
+            return None
+        try:
+            dt = datetime.fromisoformat(date_only)
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def unify_purchase_dates_by_order(results: list[dict]) -> None:
+    """Set one order-level purchase date, biased toward the earliest email in the order."""
+    groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for idx, record in enumerate(results):
+        order_key = _normalized_order_key(record)
+        if order_key:
+            groups[order_key].append((idx, record))
+
+    for order_key, indexed_group in groups.items():
+        if not indexed_group:
+            continue
+
+        decorated_group: list[tuple[int, dict, datetime | None]] = [
+            (row_idx, rec, _parse_email_datetime_for_sort(rec.get("email_datetime")))
+            for row_idx, rec in indexed_group
+        ]
+        sorted_group = sorted(
+            decorated_group,
+            key=lambda item: (
+                item[2] is None,
+                item[2] or datetime.max,
+                item[0],
+            ),
+        )
+
+        earliest_idx, earliest_record, earliest_dt = sorted_group[0]
+        earliest_extracted_date = _extract_date_str(earliest_record.get("purchase_datetime"))
+
+        chosen_date: str | None = None
+        chosen_source = ""
+
+        if earliest_extracted_date:
+            chosen_date = earliest_extracted_date
+            chosen_source = f"earliest_row_extracted:index={earliest_idx}"
+        else:
+            for row_idx, rec, _dt in sorted_group:
+                ds = _extract_date_str(rec.get("purchase_datetime"))
+                if ds:
+                    chosen_date = ds
+                    chosen_source = f"first_extracted_in_order:index={row_idx}"
+                    break
+            if chosen_date is None and earliest_dt is not None:
+                chosen_date = earliest_dt.strftime("%Y-%m-%d")
+                chosen_source = f"earliest_email_datetime:index={earliest_idx}"
+            elif chosen_date is None:
+                chosen_source = "no_valid_date_found"
+
+        if not chosen_date:
+            _log_warning(
+                "grabbingImportantEmailContent",
+                f"Order {order_key}: could not resolve consolidated purchase date "
+                f"({chosen_source}); leaving per-row values unchanged",
+            )
+            continue
+
+        updated_rows = 0
+        for _, rec in indexed_group:
+            before = _extract_date_str(rec.get("purchase_datetime"))
+            if before != chosen_date:
+                rec["purchase_datetime"] = chosen_date
+                updated_rows += 1
+
+        if updated_rows > 0:
+            print(
+                console_safe_text(
+                    f"  Purchase-date consensus (order {order_key}): {chosen_date} "
+                    f"({chosen_source}, {updated_rows} row(s) updated)"
+                )
+            )
+            RL.log(
+                "grabbingImportantEmailContent",
+                f"{RL.ts()}  order={order_key} purchase_date_consensus={chosen_date} "
+                f"source={chosen_source} updated_rows={updated_rows}",
+            )
+
+
 def rename_assets_to_match_record(
     record: dict, pdf_folder: Path, html_folder: Path
 ) -> None:
@@ -1906,10 +2015,11 @@ def rename_assets_to_match_record(
 def apply_order_company_consensus_and_sync(
     results: list[dict], base_dir: Path
 ) -> None:
-    """Update ``company`` by order-number plurality and rename PDF/HTML to match."""
+    """Update order-level company/date consensus and rename PDF/HTML to match."""
     pdf_folder = base_dir / "email_contents" / "pdf"
     html_folder = base_dir / "email_contents" / "html"
     unify_company_names_by_order(results)
+    unify_purchase_dates_by_order(results)
     for r in results:
         try:
             rename_assets_to_match_record(r, pdf_folder, html_folder)
@@ -2069,7 +2179,13 @@ def main(flow_started_at: datetime | None = None):
 
         file_path = rename_single_file(file_path, pdf_folder)
 
-        entry = process_file(file_path, args.subject, args.sender_name, args.email)
+        entry = process_file(
+            file_path,
+            args.subject,
+            args.sender_name,
+            args.email,
+            args.email_datetime,
+        )
         timings = entry.pop("_timings", {})
         if _timing_buffer_path:
             RL.write_timing_entry(_timing_buffer_path, {
@@ -2126,7 +2242,13 @@ def main(flow_started_at: datetime | None = None):
                     r["duplicate_on_last_run"] = 1
                     break
             continue
-        entry = process_file(fp, args.subject, args.sender_name, args.email)
+        entry = process_file(
+            fp,
+            args.subject,
+            args.sender_name,
+            args.email,
+            args.email_datetime,
+        )
         timings = entry.pop("_timings", {})
         if _timing_buffer_path:
             RL.write_timing_entry(_timing_buffer_path, {
@@ -2177,7 +2299,7 @@ if __name__ == "__main__":
         if e.code == EXIT_BAD_ARGS:
             print("\nERROR: Invalid or missing arguments.")
             print("Check command-line arguments. Set OPENAI_API_KEY via Email Sorter Settings if needed.")
-            print("Optional args: --file, --subject, --sender-name, --email")
+            print("Optional args: --file, --subject, --sender-name, --email, --email-datetime")
         _exit_code = e.code if isinstance(e.code, int) else (0 if e.code in (None, False) else 1)
         if _exit_code != 0:
             _record_fatal_exit(
