@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import base64
 import re
 import sys
 from dataclasses import dataclass, field
@@ -122,6 +123,62 @@ def prepend_outlook_style_header(body_html: str, msg: EmailMessage) -> str:
         + body_html
         + "\n</body></html>\n"
     )
+
+
+_CID_SRC_RE = re.compile(
+    r"(?P<prefix>\bsrc\s*=\s*[\"'])\s*cid:(?P<cid>[^\"'>\s]+)(?P<suffix>[\"'])",
+    re.IGNORECASE,
+)
+
+
+def _normalize_cid_token(token: str | None) -> str:
+    raw = (token or "").strip().strip("<>").strip()
+    if raw.lower().startswith("cid:"):
+        raw = raw[4:]
+    return raw.casefold()
+
+
+def inline_cid_images(
+    body_html: str,
+    inline_images: dict[str, tuple[str, bytes]],
+) -> tuple[str, int, int]:
+    """Replace ``src="cid:..."`` references with ``data:`` URIs.
+
+    Returns ``(updated_html, replaced_count, unresolved_count)``.
+    """
+    if not body_html or not inline_images:
+        return body_html, 0, 0
+
+    resolved_data_uris: dict[str, str] = {}
+    for raw_cid, payload in inline_images.items():
+        norm = _normalize_cid_token(raw_cid)
+        if not norm:
+            continue
+        content_type, data = payload
+        if not data:
+            continue
+        ctype = (content_type or "application/octet-stream").strip()
+        encoded = base64.b64encode(data).decode("ascii")
+        resolved_data_uris[norm] = f"data:{ctype};base64,{encoded}"
+
+    if not resolved_data_uris:
+        return body_html, 0, 0
+
+    replaced = 0
+    unresolved = 0
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal replaced, unresolved
+        token = _normalize_cid_token(match.group("cid"))
+        data_uri = resolved_data_uris.get(token)
+        if not data_uri:
+            unresolved += 1
+            return match.group(0)
+        replaced += 1
+        return f"{match.group('prefix')}{data_uri}{match.group('suffix')}"
+
+    updated = _CID_SRC_RE.sub(_replace, body_html)
+    return updated, replaced, unresolved
 
 
 def extract_email(text: str) -> str:

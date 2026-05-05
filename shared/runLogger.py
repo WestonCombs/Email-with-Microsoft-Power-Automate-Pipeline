@@ -74,6 +74,22 @@ def _logs_dir() -> Path:
     return d
 
 
+def _email_contents_log_dir() -> Path:
+    base = (os.getenv("BASE_DIR") or "").strip()
+    if not base:
+        raise ValueError(
+            "BASE_DIR is unset — project root could not be inferred "
+            '(expected scripts under a folder named "python_files").'
+        )
+    root = Path(base).expanduser().resolve()
+    d = root / "email_contents" / "log"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
 def is_debug() -> bool:
     """Return True when DEBUG_MODE=1 is set in the environment (read at call time).
 
@@ -86,12 +102,38 @@ def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _append(path: Path, text: str) -> None:
+def _mirror_log_path(path: Path) -> Path | None:
     try:
+        logs_root = _logs_dir().resolve()
+        rel = path.resolve().relative_to(logs_root)
+    except Exception:
+        return None
+    try:
+        return _email_contents_log_dir() / rel
+    except ValueError:
+        return None
+
+
+def _append_single(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(text)
     except OSError:
         pass
+
+
+def _append(path: Path, text: str) -> None:
+    _append_single(path, text)
+    mirror_path = _mirror_log_path(path)
+    if mirror_path is None:
+        return
+    try:
+        if mirror_path.resolve() == path.resolve():
+            return
+    except Exception:
+        pass
+    _append_single(mirror_path, text)
 
 
 def _append_master(segment: str, text: str, *, debug_line: bool = False, nl: bool = True) -> None:
@@ -104,9 +146,8 @@ def _append_master(segment: str, text: str, *, debug_line: bool = False, nl: boo
     prefix = f"[DEBUG][{segment}] " if debug_line else f"[{segment}] "
     path = _logs_dir() / _MASTER_FILE
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            for line in payload.splitlines(True):
-                f.write(prefix + line)
+        merged = "".join(prefix + line for line in payload.splitlines(True))
+        _append(path, merged)
     except OSError:
         pass
 

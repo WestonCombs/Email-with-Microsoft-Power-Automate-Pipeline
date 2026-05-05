@@ -85,6 +85,8 @@ def _infer_company_from_source_file(source_file: Any) -> str | None:
         return None
     stem = re.sub(r" \(\d+\)$", "", stem).strip()
     patterns = (
+        r"^DOC (.+?) \d{4} (?:SHIPPED|DELIVERED|INVOICE)$",
+        r"^DOC (.+?) \d{4}$",
         r"^DOC (.+?) \d{4}-\d{2}-\d{2} (?:INVOICE|SHIPPED|DELIVERED)_\d{4}$",
         r"^DOC (.+?) \d{4}-\d{2}-\d{2} TRACKING_INV_\d{4}$",
         r"^DOC (.+?) \d{4}-\d{2}-\d{2} .+_FROM_.+$",

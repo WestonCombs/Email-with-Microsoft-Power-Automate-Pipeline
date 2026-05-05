@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -141,6 +142,48 @@ VALID_CATEGORIES = [
 # Categories the LLM returns directly (Gift Card is set only after the invoice refine call).
 LLM_EMAIL_CATEGORIES = frozenset({"Invoice", "Shipped", "Delivered", "Unknown"})
 CATEGORY_CONFIDENCE_THRESHOLD = 60
+
+_MISSING_COMPANY_VALUES = frozenset(
+    {
+        "",
+        "unknown",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unavailable",
+        "not available",
+    }
+)
+
+_DOMAIN_COMPANY_HINTS: dict[str, str] = {
+    "zara.com": "Zara",
+    "inditex.com": "Zara",
+    "fragrancenet.com": "FragranceNet",
+    "marshalls.com": "Marshalls",
+    "tjx.com": "Marshalls",
+}
+
+_SUBJECT_COMPANY_HINTS: tuple[tuple[str, str], ...] = (
+    (r"\bzara\b", "Zara"),
+    (r"\bfragrance\s*net\b|\bfragrancenet\b", "FragranceNet"),
+    (r"\bmarshalls\b", "Marshalls"),
+)
+
+_ORDER_DATE_PARAM_HINTS = frozenset(
+    {
+        "order_date",
+        "orderdate",
+        "purchase_date",
+        "purchasedate",
+        "placed_date",
+        "placeddate",
+    }
+)
+
+_ISO_DATE_TOKEN_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_US_DATE_TOKEN_RE = re.compile(r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:20)?\d{2})\b")
+_MONTH_NAME_DATE_RE = re.compile(r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b")
 
 RATE_LIMIT_RETRY_WAIT = 3
 RATE_LIMIT_MAX_RETRIES = 20
@@ -358,6 +401,116 @@ def clean_text(text) -> str | None:
     return str(text).replace("\ufeff", "").strip() or None
 
 
+def _looks_missing_company(value: str | None) -> bool:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return True
+    return cleaned.casefold() in _MISSING_COMPANY_VALUES
+
+
+def _extract_email_domain(value: str | None) -> str:
+    cleaned = clean_text(value) or ""
+    if not cleaned:
+        return ""
+    if "@" not in cleaned:
+        return ""
+    domain = cleaned.rsplit("@", 1)[-1].strip().strip(">").strip()
+    return domain.casefold()
+
+
+def _company_hint_from_subject_text(subject: str | None) -> str | None:
+    cleaned = clean_text(subject)
+    if not cleaned:
+        return None
+    for pattern, display in _SUBJECT_COMPANY_HINTS:
+        if re.search(pattern, cleaned, flags=re.IGNORECASE):
+            return display
+    return None
+
+
+def infer_company_from_sender(sender_name: str | None, sender_email: str | None) -> str | None:
+    """Best-effort company from sender identity (name/address domain)."""
+    name_hint = _company_hint_from_subject_text(sender_name)
+    if name_hint:
+        return name_hint
+
+    domain = _extract_email_domain(sender_email)
+    if not domain:
+        return None
+
+    for suffix, display in _DOMAIN_COMPANY_HINTS.items():
+        if domain == suffix or domain.endswith(f".{suffix}"):
+            return display
+    return None
+
+
+def infer_company_fallback(
+    subject: str | None,
+    sender_name: str | None,
+    sender_email: str | None,
+) -> str | None:
+    """Layered fallback for missing/unknown company values."""
+    for candidate in (
+        _company_hint_from_subject_text(subject),
+        infer_company_from_subject(subject),
+        infer_company_from_sender(sender_name, sender_email),
+    ):
+        if not _looks_missing_company(candidate):
+            return clean_text(candidate)
+    return None
+
+
+def _extract_iso_date_token(value: str | None) -> str | None:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    match = _ISO_DATE_TOKEN_RE.search(cleaned)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _order_date_from_url(url: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+
+    query_map = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+    for raw_key, values in query_map.items():
+        if raw_key.casefold() not in _ORDER_DATE_PARAM_HINTS:
+            continue
+        for v in values:
+            date_token = _extract_iso_date_token(v)
+            if date_token:
+                return date_token
+
+    decoded = urllib.parse.unquote(url or "")
+    for key in _ORDER_DATE_PARAM_HINTS:
+        match = re.search(
+            rf"(?:^|[?&#/]){re.escape(key)}=([^&#/]+)",
+            decoded,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        date_token = _extract_iso_date_token(match.group(1))
+        if date_token:
+            return date_token
+
+    if re.search(r"(order|purchase|placed)[_\- ]?date", decoded, flags=re.IGNORECASE):
+        return _extract_iso_date_token(decoded)
+    return None
+
+
+def infer_order_date_from_tracking_links(tracking_links: list[str]) -> str | None:
+    for link in tracking_links:
+        token = _order_date_from_url(link)
+        if token:
+            return token
+    return None
+
+
 def _coerce_llm_tracking_numbers(extracted: dict) -> None:
     """Normalize OpenAI output: ``tracking_numbers`` list; fold legacy ``tracking_number``."""
     nums = normalize_openai_tracking_numbers(extracted.get("tracking_numbers"))
@@ -506,17 +659,20 @@ def convert_html_to_pdf(
     browser = _find_browser()
     if browser:
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [
                     str(browser),
                     "--headless",
                     "--disable-gpu",
+                    "--allow-file-access-from-files",
+                    "--virtual-time-budget=15000",
                     "--no-pdf-header-footer",
                     f"--print-to-pdf={pdf_path}",
                     file_uri,
                 ],
                 capture_output=True,
-                timeout=30,
+                timeout=45,
+                text=True,
             )
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
                 _cleanup_print_tmp()
@@ -527,6 +683,12 @@ def convert_html_to_pdf(
                     f"{RL.ts()}  converted_to_pdf browser={browser.name} source={html_path.name} output={pdf_path.name}",
                 )
                 return pdf_path
+            stderr = clean_text(proc.stderr)
+            if stderr:
+                _log_warning(
+                    "htmlHandler",
+                    f"Browser PDF conversion produced stderr for {html_path.name}: {stderr[:500]}",
+                )
         except Exception as e:
             print(f"  Browser PDF conversion failed: {console_safe_text(e)}")
             _log_warning(
@@ -584,6 +746,10 @@ def infer_company_from_subject(subject: str | None) -> str | None:
     if not subject:
         return None
 
+    hinted = _company_hint_from_subject_text(subject)
+    if hinted:
+        return hinted
+
     normalized = subject
     while True:
         updated = re.sub(r"^\s*(?:fw|fwd|re)\s*:\s*", "", normalized, flags=re.IGNORECASE)
@@ -594,6 +760,8 @@ def infer_company_from_subject(subject: str | None) -> str | None:
     patterns = [
         r"your\s+(.+?)\s+order(?:\b|:)",
         r"order\s+from\s+(.+?)(?:\b|:)",
+        r"(.+?)\s+order\s+(?:has\s+)?(?:shipped|delivered|confirmed)(?:\b|:)",
+        r"(.+?)\s+(?:shipping|delivery)\s+update(?:\b|:)",
         r"thanks\s+.+?\s+for\s+your\s+purchase\s+with\s+(.+?)(?:\b|!|\.|:)",
     ]
 
@@ -601,7 +769,10 @@ def infer_company_from_subject(subject: str | None) -> str | None:
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
         if match:
             company = clean_text(match.group(1))
-            if company:
+            if company and not _looks_missing_company(company):
+                maybe_hinted = _company_hint_from_subject_text(company)
+                if maybe_hinted:
+                    return maybe_hinted
                 return company.strip(" -,:;.!?")
 
     return None
@@ -1181,8 +1352,19 @@ def process_file(
 
         original_llm_company = clean_text(extracted.get("company"))
 
-        if not clean_text(extracted.get("company")):
-            extracted["company"] = infer_company_from_subject(subject)
+        if _looks_missing_company(extracted.get("company")):
+            fallback_company = infer_company_fallback(subject, sender_name, email)
+            if fallback_company:
+                extracted["company"] = fallback_company
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: company fallback -> {fallback_company!r}",
+                )
+            else:
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: company missing after extraction and fallback",
+                )
 
         file_uri = "file:///" + str(file_path.resolve()).replace("\\", "/")
         final_category, raw_confidence = resolve_base_email_category(extracted)
@@ -1228,6 +1410,20 @@ def process_file(
 
         if final_category not in VALID_CATEGORIES:
             final_category = "Unknown"
+
+        if not _extract_date_str(extracted.get("purchase_datetime")):
+            inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
+            if inferred_order_date:
+                extracted["purchase_datetime"] = inferred_order_date
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
+                )
+            else:
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: purchase_datetime missing or non-ISO; filename will use no-date fallback",
+                )
 
         timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
         timings["category"] = final_category
@@ -1401,13 +1597,37 @@ def _sanitize_for_filename(name: str) -> str:
     return sanitized or "Unknown"
 
 
-def _extract_date_str(purchase_datetime: str | None) -> str:
-    """Pull a YYYY-MM-DD date from the extracted purchase_datetime, or today's date."""
-    if purchase_datetime:
-        m = re.match(r"(\d{4}-\d{2}-\d{2})", purchase_datetime.strip())
-        if m:
-            return m.group(1)
-    return datetime.now().strftime("%Y-%m-%d")
+def _extract_date_str(purchase_datetime: str | None) -> str | None:
+    """Pull a ``YYYY-MM-DD`` token from ``purchase_datetime`` when present."""
+    cleaned = clean_text(purchase_datetime)
+    if not cleaned:
+        return None
+    m = _ISO_DATE_TOKEN_RE.search(cleaned)
+    if m:
+        return m.group(1)
+    m_us = _US_DATE_TOKEN_RE.search(cleaned)
+    if m_us:
+        month = int(m_us.group(1))
+        day = int(m_us.group(2))
+        year_raw = m_us.group(3)
+        year = int(year_raw)
+        if year < 100:
+            year += 2000
+        try:
+            normalized = datetime(year, month, day)
+            return normalized.strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    m_named = _MONTH_NAME_DATE_RE.search(cleaned)
+    if m_named:
+        token = m_named.group(1)
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                normalized = datetime.strptime(token, fmt)
+                return normalized.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return None
 
 
 def _extract_order_last4(order_number: str | None) -> str:
@@ -1425,12 +1645,12 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     """Build a filename following the mom's naming convention.
 
     Invoice    → DOC <store> <YYYY-MM-DD> INVOICE
-    Shipped    → DOC <store> <YYYY-MM-DD> SHIPPED
-    Delivered  → DOC <store> <YYYY-MM-DD> DELIVERED
+    Shipped    → DOC <store> <last4> SHIPPED
+    Delivered  → DOC <store> <last4> DELIVERED
     Gift Card  → <store> <YYYY-MM-DD>
-    Unknown    → DOC <store> <YYYY-MM-DD>
+    Unknown    → DOC <store> <YYYY-MM-DD> (or no-date fallback)
     """
-    category = record.get("email_category", "Unknown")
+    category = clean_text(record.get("email_category")) or "Unknown"
     store = _sanitize_for_filename(record.get("company") or "Unknown")
     date_str = _extract_date_str(record.get("purchase_datetime"))
     order_last4 = _extract_order_last4(record.get("order_number"))
@@ -1438,11 +1658,16 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     suffix = _CATEGORY_SUFFIX_MAP.get(category)
 
     if category == "Gift Card":
-        name = f"{store} {date_str}_{order_last4}"
+        name = f"{store} {date_str}_{order_last4}" if date_str else f"{store}_{order_last4}"
+    elif category in {"Shipped", "Delivered"} and suffix:
+        name = f"DOC {store} {order_last4} {suffix}"
     elif suffix:
-        name = f"DOC {store} {date_str} {suffix}_{order_last4}"
+        if date_str:
+            name = f"DOC {store} {date_str} {suffix}_{order_last4}"
+        else:
+            name = f"DOC {store} {order_last4} {suffix}"
     else:
-        name = f"DOC {store} {date_str}_{order_last4}"
+        name = f"DOC {store} {date_str}_{order_last4}" if date_str else f"DOC {store} {order_last4}"
 
     return name + extension
 
@@ -1539,10 +1764,11 @@ def _record_company_vote_candidates(record: dict) -> list[str]:
 
     values: list[str | None] = [clean_text(record.get(k)) for k in field_order]
     values.append(infer_company_from_subject(record.get("subject")))
+    values.append(infer_company_from_sender(record.get("sender_name"), record.get("email")))
 
     for value in values:
         cleaned = clean_text(value)
-        if not cleaned:
+        if not cleaned or _looks_missing_company(cleaned):
             continue
         vote_key = _company_vote_key(cleaned)
         if not vote_key or vote_key in seen_vote_keys:

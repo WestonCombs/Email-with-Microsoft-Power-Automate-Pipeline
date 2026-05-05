@@ -14,7 +14,14 @@ from pathlib import Path
 
 import msal
 
-from .emailFetcher import EmailMessage, format_graph_datetime_local, save_attachments
+from shared import runLogger as RL
+
+from .emailFetcher import (
+    EmailMessage,
+    format_graph_datetime_local,
+    inline_cid_images,
+    save_attachments,
+)
 from .graph_browser_signin_hint import run_blocking_task_with_browser_signin_hint
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
@@ -335,10 +342,11 @@ def _download_attachment_bytes(
 
 def _collect_attachments(
     access_token: str, message_id: str
-) -> list[tuple[str, bytes]]:
+) -> tuple[list[tuple[str, bytes]], dict[str, tuple[str, bytes]]]:
     safe_mid = urllib.parse.quote(message_id, safe="")
     base = f"{GRAPH_ROOT}/me/messages/{safe_mid}/attachments?$top=100"
     out: list[tuple[str, bytes]] = []
+    inline_by_cid: dict[str, tuple[str, bytes]] = {}
     for att in _graph_get_all_pages(base, access_token):
         otype = att.get("@odata.type", "")
         name = att.get("name") or "unnamed_attachment"
@@ -355,8 +363,14 @@ def _collect_attachments(
                 )
             if data:
                 out.append((name, data))
+                cid = str(att.get("contentId") or "").strip()
+                if cid:
+                    inline_by_cid[cid] = (
+                        str(att.get("contentType") or "application/octet-stream"),
+                        data,
+                    )
         # itemAttachment / referenceAttachment: skip (no simple bytes)
-    return out
+    return out, inline_by_cid
 
 
 def fetch_emails(
@@ -442,8 +456,30 @@ def fetch_emails(
             sent_line = format_graph_datetime_local(sent_iso)
 
             attachments: list[tuple[str, bytes]] = []
+            inline_cid_payloads: dict[str, tuple[str, bytes]] = {}
             if detail.get("hasAttachments"):
-                attachments = _collect_attachments(token, mid)
+                attachments, inline_cid_payloads = _collect_attachments(token, mid)
+
+            if inline_cid_payloads:
+                body_html, cid_replaced, cid_unresolved = inline_cid_images(
+                    body_html,
+                    inline_cid_payloads,
+                )
+                if cid_replaced:
+                    print(f"    Inlined {cid_replaced} CID image(s) for HTML/PDF rendering")
+                    RL.log(
+                        "emailFetching",
+                        f"{RL.ts()}  message={mid}  inlined_cid_images={cid_replaced}",
+                    )
+                if cid_unresolved:
+                    print(
+                        "    WARNING: "
+                        f"{cid_unresolved} CID image reference(s) could not be inlined"
+                    )
+                    RL.log(
+                        "emailFetching",
+                        f"{RL.ts()}  WARNING: message={mid} unresolved_cid_images={cid_unresolved}",
+                    )
 
             if attachments_dir and attachments:
                 saved = save_attachments(attachments, attachments_dir)
