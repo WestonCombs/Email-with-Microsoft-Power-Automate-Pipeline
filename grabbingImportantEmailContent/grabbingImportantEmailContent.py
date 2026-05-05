@@ -1657,8 +1657,8 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     """Build a filename following the mom's naming convention.
 
     Invoice    → DOC <store> <YYYY-MM-DD> INVOICE
-    Shipped    → DOC <store> <last4> SHIPPED
-    Delivered  → DOC <store> <last4> DELIVERED
+    Shipped    → DOC <store> <YYYY-MM-DD> SHIPPED
+    Delivered  → DOC <store> <YYYY-MM-DD> DELIVERED
     Gift Card  → <store> <YYYY-MM-DD>
     Unknown    → DOC <store> <YYYY-MM-DD> (or no-date fallback)
     """
@@ -1672,7 +1672,10 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     if category == "Gift Card":
         name = f"{store} {date_str}_{order_last4}" if date_str else f"{store}_{order_last4}"
     elif category in {"Shipped", "Delivered"} and suffix:
-        name = f"DOC {store} {order_last4} {suffix}"
+        if date_str:
+            name = f"DOC {store} {date_str} {suffix}_{order_last4}"
+        else:
+            name = f"DOC {store} {order_last4} {suffix}"
     elif suffix:
         if date_str:
             name = f"DOC {store} {date_str} {suffix}_{order_last4}"
