@@ -6,6 +6,7 @@ import base64
 import concurrent.futures
 import contextlib
 import json
+import re
 import socket
 import sys
 import threading
@@ -35,6 +36,79 @@ SILENT_AUTH_TIMEOUT_S = 30.0
 GRAPH_JSON_TIMEOUT_S = 30.0
 # MSAL uses requests for authority/instance discovery; default timeout=None can hang forever.
 MSAL_HTTP_TIMEOUT_S = 30.0
+
+_HTML_DEBUG_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=", re.IGNORECASE)
+_IMG_HTTP_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]https?://", re.IGNORECASE)
+_IMG_CID_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]cid:", re.IGNORECASE)
+_IMG_DATA_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]data:", re.IGNORECASE)
+_IMG_SRCSET_RE = re.compile(r"<img\b[^>]*\bsrcset\s*=", re.IGNORECASE)
+_IMG_LAZY_ATTR_RE = re.compile(
+    r"<img\b[^>]*\b(?:data-src|data-original|data-original-src|data-lazy-src|data-url|originalsrc)\s*=",
+    re.IGNORECASE,
+)
+
+
+def _safe_debug_token(value: str, *, max_len: int = 80) -> str:
+    token = _HTML_DEBUG_INVALID_CHARS_RE.sub("_", value or "")
+    token = re.sub(r"\s+", "_", token).strip("._ ")
+    if len(token) > max_len:
+        token = token[:max_len].rstrip("._ ")
+    return token or "html"
+
+
+def _html_image_stats(html: str) -> str:
+    img_tags = len(_IMG_TAG_RE.findall(html or ""))
+    img_src = len(_IMG_SRC_RE.findall(html or ""))
+    blocked_marker = "Some pictures have been blocked" in (html or "")
+    return (
+        f"img_tags={img_tags} "
+        f"img_src={img_src} "
+        f"missing_src={max(img_tags - img_src, 0)} "
+        f"http_src={len(_IMG_HTTP_SRC_RE.findall(html or ''))} "
+        f"cid_src={len(_IMG_CID_SRC_RE.findall(html or ''))} "
+        f"data_src={len(_IMG_DATA_SRC_RE.findall(html or ''))} "
+        f"srcset={len(_IMG_SRCSET_RE.findall(html or ''))} "
+        f"lazy_attr={len(_IMG_LAZY_ATTR_RE.findall(html or ''))} "
+        f"outlook_blocked_marker={1 if blocked_marker else 0}"
+    )
+
+
+def _debug_write_graph_html_state(
+    base_dir: Path | None,
+    message_id: str,
+    subject: str,
+    state: str,
+    html: str,
+) -> None:
+    if not RL.is_debug():
+        return
+    if base_dir is None:
+        try:
+            from shared.project_paths import ensure_base_dir_in_environ
+
+            base_dir = ensure_base_dir_in_environ()
+        except Exception:
+            return
+    out_dir = Path(base_dir) / "email_contents" / "html_debug"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    mid = _safe_debug_token(message_id, max_len=24)
+    subj = _safe_debug_token(subject, max_len=60)
+    state_token = _safe_debug_token(state, max_len=60)
+    out_path = out_dir / f"graph_{mid}__{state_token}__{subj}.html"
+    try:
+        out_path.write_text(html or "", encoding="utf-8")
+        RL.log(
+            "emailFetching",
+            f"{RL.ts()}  html_debug_state state={state_token} file={out_path.name} "
+            f"{_html_image_stats(html or '')}",
+        )
+    except OSError as e:
+        RL.log("emailFetching", f"{RL.ts()}  WARNING: could not write HTML debug state {out_path}: {e}")
 # Guard MSAL setup/lookup steps that occasionally stall on some Windows installs.
 MSAL_APP_INIT_TIMEOUT_S = 15.0
 MSAL_GET_ACCOUNTS_TIMEOUT_S = 10.0
@@ -743,6 +817,13 @@ def fetch_emails(
                 from_raw = _recipient_to_from_raw(detail.get("from"))
                 subject = detail.get("subject") or ""
                 body_html = _message_body_html(detail.get("body"))
+                _debug_write_graph_html_state(
+                    base_dir,
+                    mid,
+                    subject,
+                    "00_graph_body_before_cid_inline",
+                    body_html,
+                )
 
                 to_recs = detail.get("toRecipients") or []
                 to_line = ", ".join(
@@ -768,6 +849,13 @@ def fetch_emails(
                     body_html, cid_replaced, cid_unresolved = inline_cid_images(
                         body_html,
                         inline_cid_payloads,
+                    )
+                    _debug_write_graph_html_state(
+                        base_dir,
+                        mid,
+                        subject,
+                        "00b_graph_body_after_cid_inline",
+                        body_html,
                     )
                     if cid_replaced:
                         print(f"    Inlined {cid_replaced} CID image(s) for HTML/PDF rendering")

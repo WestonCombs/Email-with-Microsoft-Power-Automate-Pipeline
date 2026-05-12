@@ -590,6 +590,112 @@ def read_email_html_file(file_path: Path) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
+_HTML_DEBUG_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=", re.IGNORECASE)
+_IMG_HTTP_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]https?://", re.IGNORECASE)
+_IMG_CID_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]cid:", re.IGNORECASE)
+_IMG_DATA_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]data:", re.IGNORECASE)
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE | re.DOTALL)
+
+
+def _debug_html_dir() -> Path | None:
+    if not RL.is_debug():
+        return None
+    try:
+        from shared.project_paths import ensure_base_dir_in_environ
+
+        base = ensure_base_dir_in_environ()
+    except Exception:
+        return None
+    out_dir = base / "email_contents" / "html_debug"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return out_dir
+
+
+def _safe_debug_token(value: str, *, max_len: int = 80) -> str:
+    token = _HTML_DEBUG_INVALID_CHARS_RE.sub("_", value or "")
+    token = re.sub(r"\s+", "_", token).strip("._ ")
+    if len(token) > max_len:
+        token = token[:max_len].rstrip("._ ")
+    return token or "html"
+
+
+def _html_image_stats(html: str) -> str:
+    blocked_marker = "Some pictures have been blocked" in (html or "")
+    return (
+        f"img_tags={len(_IMG_TAG_RE.findall(html or ''))} "
+        f"img_src={len(_IMG_SRC_RE.findall(html or ''))} "
+        f"http_src={len(_IMG_HTTP_SRC_RE.findall(html or ''))} "
+        f"cid_src={len(_IMG_CID_SRC_RE.findall(html or ''))} "
+        f"data_src={len(_IMG_DATA_SRC_RE.findall(html or ''))} "
+        f"outlook_blocked_marker={1 if blocked_marker else 0}"
+    )
+
+
+def _debug_write_html_state(source_path: Path, state: str, html: str) -> None:
+    out_dir = _debug_html_dir()
+    if out_dir is None:
+        return
+    source_token = _safe_debug_token(source_path.stem, max_len=90)
+    state_token = _safe_debug_token(state, max_len=70)
+    out_path = out_dir / f"{source_token}__{state_token}.html"
+    try:
+        out_path.write_text(html or "", encoding="utf-8")
+        RL.log(
+            "htmlHandler",
+            f"{RL.ts()}  html_debug_state state={state_token} file={out_path.name} "
+            f"{_html_image_stats(html or '')}",
+        )
+    except OSError as e:
+        _log_warning("htmlHandler", f"Could not write HTML debug state {out_path}: {e}")
+
+
+def _prepare_html_for_browser_pdf(html: str) -> str:
+    """Small print-prep pass that makes email images easier for headless Chrome to load."""
+    prepared = html or ""
+    prepared = re.sub(
+        r"\sloading\s*=\s*(['\"])lazy\1",
+        ' loading="eager"',
+        prepared,
+        flags=re.IGNORECASE,
+    )
+    prep_block = """
+<style>
+img { max-width: 100%; }
+@media print {
+  img, * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('img').forEach(function (img) {
+    img.loading = 'eager';
+    if (!img.getAttribute('src')) {
+      ['data-src', 'data-original', 'data-lazy-src', 'data-url'].some(function (name) {
+        var value = img.getAttribute(name);
+        if (value) {
+          img.setAttribute('src', value);
+          return true;
+        }
+        return false;
+      });
+    }
+  });
+});
+</script>
+""".strip()
+    head_match = re.search(r"</head\s*>", prepared, flags=re.IGNORECASE)
+    if head_match:
+        return prepared[: head_match.start()] + "\n" + prep_block + "\n" + prepared[head_match.start() :]
+    body_match = re.search(r"<body\b[^>]*>", prepared, flags=re.IGNORECASE)
+    if body_match:
+        return prepared[: body_match.end()] + "\n" + prep_block + "\n" + prepared[body_match.end() :]
+    return prep_block + "\n" + prepared
+
+
 def _find_browser() -> Path | None:
     """Find Edge or Chrome for headless PDF conversion (Edge ships with Win 10+)."""
     candidates = []
@@ -635,13 +741,24 @@ def convert_html_to_pdf(
     """
     pdf_path = html_path.with_suffix(".pdf")
 
-    html_for_pdf: str | None = None
+    raw_html_for_pdf, pdf_html_encoding = read_email_html_file(html_path)
+    _debug_write_html_state(html_path, "04_pdf_input_original", raw_html_for_pdf)
+
+    html_for_pdf: str = raw_html_for_pdf
     tmp_print: Path | None = None
     if outlook_msg is not None:
-        raw_html, _ = read_email_html_file(html_path)
-        html_for_pdf = prepend_outlook_style_header(raw_html, outlook_msg)
-        tmp_print = html_path.with_name(f"__print_{html_path.stem}.html")
-        tmp_print.write_text(html_for_pdf, encoding="utf-8")
+        html_for_pdf = prepend_outlook_style_header(raw_html_for_pdf, outlook_msg)
+        _debug_write_html_state(html_path, "05_pdf_input_with_outlook_header", html_for_pdf)
+
+    html_for_browser_pdf = _prepare_html_for_browser_pdf(html_for_pdf)
+    _debug_write_html_state(html_path, "06_browser_print_input", html_for_browser_pdf)
+    RL.log(
+        "htmlHandler",
+        f"{RL.ts()}  {html_path.name}: pdf_input encoding={pdf_html_encoding} "
+        f"{_html_image_stats(html_for_browser_pdf)}",
+    )
+    tmp_print = html_path.with_name(f"__print_{html_path.stem}.html")
+    tmp_print.write_text(html_for_browser_pdf, encoding="utf-8")
 
     def _cleanup_print_tmp() -> None:
         if tmp_print is not None:
@@ -651,9 +768,7 @@ def convert_html_to_pdf(
             except OSError:
                 pass
 
-    file_uri = (
-        tmp_print.resolve().as_uri() if tmp_print is not None else html_path.resolve().as_uri()
-    )
+    file_uri = tmp_print.resolve().as_uri()
 
     # --- Strategy 1: Edge / Chrome headless (handles any email HTML) ---
     browser = _find_browser()
@@ -665,13 +780,16 @@ def convert_html_to_pdf(
                     "--headless",
                     "--disable-gpu",
                     "--allow-file-access-from-files",
-                    "--virtual-time-budget=15000",
+                    "--blink-settings=imagesEnabled=true",
+                    "--disable-features=PaintHolding",
+                    "--run-all-compositor-stages-before-draw",
+                    "--virtual-time-budget=30000",
                     "--no-pdf-header-footer",
                     f"--print-to-pdf={pdf_path}",
                     file_uri,
                 ],
                 capture_output=True,
-                timeout=45,
+                timeout=90,
                 text=True,
             )
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
@@ -706,8 +824,7 @@ def convert_html_to_pdf(
     # --- Strategy 2: xhtml2pdf (pure Python fallback) ---
     if _HAS_XHTML2PDF:
         try:
-            if html_for_pdf is None:
-                html_for_pdf, _ = read_email_html_file(html_path)
+            _debug_write_html_state(html_path, "07_xhtml2pdf_fallback_input", html_for_pdf)
             with open(pdf_path, "wb") as pdf_file:
                 pisa.CreatePDF(
                     io.StringIO(html_for_pdf),
@@ -1233,6 +1350,7 @@ def process_file(
         t = _time.perf_counter()
         print("  » Reading email HTML...", end=" ", flush=True)
         raw_html, html_encoding = read_email_html_file(file_path)
+        _debug_write_html_state(file_path, "01_extraction_input_raw", raw_html)
         href_count_raw = raw_html.lower().count('href=')
         timings["step1_s"] = round(_time.perf_counter() - t, 3)
         timings["html_chars"] = len(raw_html)
@@ -1723,6 +1841,11 @@ def archive_html_before_pdf(source_html: Path, record: dict, html_folder: Path) 
         new_path = html_folder / f"{base_name} ({counter}){ext}"
         counter += 1
     shutil.copy2(source_html, new_path)
+    try:
+        archived_html, _ = read_email_html_file(new_path)
+        _debug_write_html_state(new_path, "03_archived_convention_html", archived_html)
+    except OSError as e:
+        _log_warning("htmlHandler", f"Could not snapshot archived HTML {new_path.name}: {e}")
     print(f"  Archived HTML: {new_path.name}")
     return new_path
 
