@@ -9,8 +9,9 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # python_files/ — .env must load before htmlHandler (BASE_DIR is set when shared.runLogger loads)
@@ -141,6 +142,48 @@ VALID_CATEGORIES = [
 # Categories the LLM returns directly (Gift Card is set only after the invoice refine call).
 LLM_EMAIL_CATEGORIES = frozenset({"Invoice", "Shipped", "Delivered", "Unknown"})
 CATEGORY_CONFIDENCE_THRESHOLD = 60
+
+_MISSING_COMPANY_VALUES = frozenset(
+    {
+        "",
+        "unknown",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "unavailable",
+        "not available",
+    }
+)
+
+_DOMAIN_COMPANY_HINTS: dict[str, str] = {
+    "zara.com": "Zara",
+    "inditex.com": "Zara",
+    "fragrancenet.com": "FragranceNet",
+    "marshalls.com": "Marshalls",
+    "tjx.com": "Marshalls",
+}
+
+_SUBJECT_COMPANY_HINTS: tuple[tuple[str, str], ...] = (
+    (r"\bzara\b", "Zara"),
+    (r"\bfragrance\s*net\b|\bfragrancenet\b", "FragranceNet"),
+    (r"\bmarshalls\b", "Marshalls"),
+)
+
+_ORDER_DATE_PARAM_HINTS = frozenset(
+    {
+        "order_date",
+        "orderdate",
+        "purchase_date",
+        "purchasedate",
+        "placed_date",
+        "placeddate",
+    }
+)
+
+_ISO_DATE_TOKEN_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_US_DATE_TOKEN_RE = re.compile(r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:20)?\d{2})\b")
+_MONTH_NAME_DATE_RE = re.compile(r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b")
 
 RATE_LIMIT_RETRY_WAIT = 3
 RATE_LIMIT_MAX_RETRIES = 20
@@ -358,6 +401,116 @@ def clean_text(text) -> str | None:
     return str(text).replace("\ufeff", "").strip() or None
 
 
+def _looks_missing_company(value: str | None) -> bool:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return True
+    return cleaned.casefold() in _MISSING_COMPANY_VALUES
+
+
+def _extract_email_domain(value: str | None) -> str:
+    cleaned = clean_text(value) or ""
+    if not cleaned:
+        return ""
+    if "@" not in cleaned:
+        return ""
+    domain = cleaned.rsplit("@", 1)[-1].strip().strip(">").strip()
+    return domain.casefold()
+
+
+def _company_hint_from_subject_text(subject: str | None) -> str | None:
+    cleaned = clean_text(subject)
+    if not cleaned:
+        return None
+    for pattern, display in _SUBJECT_COMPANY_HINTS:
+        if re.search(pattern, cleaned, flags=re.IGNORECASE):
+            return display
+    return None
+
+
+def infer_company_from_sender(sender_name: str | None, sender_email: str | None) -> str | None:
+    """Best-effort company from sender identity (name/address domain)."""
+    name_hint = _company_hint_from_subject_text(sender_name)
+    if name_hint:
+        return name_hint
+
+    domain = _extract_email_domain(sender_email)
+    if not domain:
+        return None
+
+    for suffix, display in _DOMAIN_COMPANY_HINTS.items():
+        if domain == suffix or domain.endswith(f".{suffix}"):
+            return display
+    return None
+
+
+def infer_company_fallback(
+    subject: str | None,
+    sender_name: str | None,
+    sender_email: str | None,
+) -> str | None:
+    """Layered fallback for missing/unknown company values."""
+    for candidate in (
+        _company_hint_from_subject_text(subject),
+        infer_company_from_subject(subject),
+        infer_company_from_sender(sender_name, sender_email),
+    ):
+        if not _looks_missing_company(candidate):
+            return clean_text(candidate)
+    return None
+
+
+def _extract_iso_date_token(value: str | None) -> str | None:
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    match = _ISO_DATE_TOKEN_RE.search(cleaned)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _order_date_from_url(url: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+
+    query_map = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+    for raw_key, values in query_map.items():
+        if raw_key.casefold() not in _ORDER_DATE_PARAM_HINTS:
+            continue
+        for v in values:
+            date_token = _extract_iso_date_token(v)
+            if date_token:
+                return date_token
+
+    decoded = urllib.parse.unquote(url or "")
+    for key in _ORDER_DATE_PARAM_HINTS:
+        match = re.search(
+            rf"(?:^|[?&#/]){re.escape(key)}=([^&#/]+)",
+            decoded,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        date_token = _extract_iso_date_token(match.group(1))
+        if date_token:
+            return date_token
+
+    if re.search(r"(order|purchase|placed)[_\- ]?date", decoded, flags=re.IGNORECASE):
+        return _extract_iso_date_token(decoded)
+    return None
+
+
+def infer_order_date_from_tracking_links(tracking_links: list[str]) -> str | None:
+    for link in tracking_links:
+        token = _order_date_from_url(link)
+        if token:
+            return token
+    return None
+
+
 def _coerce_llm_tracking_numbers(extracted: dict) -> None:
     """Normalize OpenAI output: ``tracking_numbers`` list; fold legacy ``tracking_number``."""
     nums = normalize_openai_tracking_numbers(extracted.get("tracking_numbers"))
@@ -437,6 +590,112 @@ def read_email_html_file(file_path: Path) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8-replace"
 
 
+_HTML_DEBUG_INVALID_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_IMG_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=", re.IGNORECASE)
+_IMG_HTTP_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]https?://", re.IGNORECASE)
+_IMG_CID_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]cid:", re.IGNORECASE)
+_IMG_DATA_SRC_RE = re.compile(r"<img\b[^>]*\bsrc\s*=\s*['\"]data:", re.IGNORECASE)
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE | re.DOTALL)
+
+
+def _debug_html_dir() -> Path | None:
+    if not RL.is_debug():
+        return None
+    try:
+        from shared.project_paths import ensure_base_dir_in_environ
+
+        base = ensure_base_dir_in_environ()
+    except Exception:
+        return None
+    out_dir = base / "email_contents" / "html_debug"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return out_dir
+
+
+def _safe_debug_token(value: str, *, max_len: int = 80) -> str:
+    token = _HTML_DEBUG_INVALID_CHARS_RE.sub("_", value or "")
+    token = re.sub(r"\s+", "_", token).strip("._ ")
+    if len(token) > max_len:
+        token = token[:max_len].rstrip("._ ")
+    return token or "html"
+
+
+def _html_image_stats(html: str) -> str:
+    blocked_marker = "Some pictures have been blocked" in (html or "")
+    return (
+        f"img_tags={len(_IMG_TAG_RE.findall(html or ''))} "
+        f"img_src={len(_IMG_SRC_RE.findall(html or ''))} "
+        f"http_src={len(_IMG_HTTP_SRC_RE.findall(html or ''))} "
+        f"cid_src={len(_IMG_CID_SRC_RE.findall(html or ''))} "
+        f"data_src={len(_IMG_DATA_SRC_RE.findall(html or ''))} "
+        f"outlook_blocked_marker={1 if blocked_marker else 0}"
+    )
+
+
+def _debug_write_html_state(source_path: Path, state: str, html: str) -> None:
+    out_dir = _debug_html_dir()
+    if out_dir is None:
+        return
+    source_token = _safe_debug_token(source_path.stem, max_len=90)
+    state_token = _safe_debug_token(state, max_len=70)
+    out_path = out_dir / f"{source_token}__{state_token}.html"
+    try:
+        out_path.write_text(html or "", encoding="utf-8")
+        RL.log(
+            "htmlHandler",
+            f"{RL.ts()}  html_debug_state state={state_token} file={out_path.name} "
+            f"{_html_image_stats(html or '')}",
+        )
+    except OSError as e:
+        _log_warning("htmlHandler", f"Could not write HTML debug state {out_path}: {e}")
+
+
+def _prepare_html_for_browser_pdf(html: str) -> str:
+    """Small print-prep pass that makes email images easier for headless Chrome to load."""
+    prepared = html or ""
+    prepared = re.sub(
+        r"\sloading\s*=\s*(['\"])lazy\1",
+        ' loading="eager"',
+        prepared,
+        flags=re.IGNORECASE,
+    )
+    prep_block = """
+<style>
+img { max-width: 100%; }
+@media print {
+  img, * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+}
+</style>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('img').forEach(function (img) {
+    img.loading = 'eager';
+    if (!img.getAttribute('src')) {
+      ['data-src', 'data-original', 'data-lazy-src', 'data-url'].some(function (name) {
+        var value = img.getAttribute(name);
+        if (value) {
+          img.setAttribute('src', value);
+          return true;
+        }
+        return false;
+      });
+    }
+  });
+});
+</script>
+""".strip()
+    head_match = re.search(r"</head\s*>", prepared, flags=re.IGNORECASE)
+    if head_match:
+        return prepared[: head_match.start()] + "\n" + prep_block + "\n" + prepared[head_match.start() :]
+    body_match = re.search(r"<body\b[^>]*>", prepared, flags=re.IGNORECASE)
+    if body_match:
+        return prepared[: body_match.end()] + "\n" + prep_block + "\n" + prepared[body_match.end() :]
+    return prep_block + "\n" + prepared
+
+
 def _find_browser() -> Path | None:
     """Find Edge or Chrome for headless PDF conversion (Edge ships with Win 10+)."""
     candidates = []
@@ -482,13 +741,24 @@ def convert_html_to_pdf(
     """
     pdf_path = html_path.with_suffix(".pdf")
 
-    html_for_pdf: str | None = None
+    raw_html_for_pdf, pdf_html_encoding = read_email_html_file(html_path)
+    _debug_write_html_state(html_path, "04_pdf_input_original", raw_html_for_pdf)
+
+    html_for_pdf: str = raw_html_for_pdf
     tmp_print: Path | None = None
     if outlook_msg is not None:
-        raw_html, _ = read_email_html_file(html_path)
-        html_for_pdf = prepend_outlook_style_header(raw_html, outlook_msg)
-        tmp_print = html_path.with_name(f"__print_{html_path.stem}.html")
-        tmp_print.write_text(html_for_pdf, encoding="utf-8")
+        html_for_pdf = prepend_outlook_style_header(raw_html_for_pdf, outlook_msg)
+        _debug_write_html_state(html_path, "05_pdf_input_with_outlook_header", html_for_pdf)
+
+    html_for_browser_pdf = _prepare_html_for_browser_pdf(html_for_pdf)
+    _debug_write_html_state(html_path, "06_browser_print_input", html_for_browser_pdf)
+    RL.log(
+        "htmlHandler",
+        f"{RL.ts()}  {html_path.name}: pdf_input encoding={pdf_html_encoding} "
+        f"{_html_image_stats(html_for_browser_pdf)}",
+    )
+    tmp_print = html_path.with_name(f"__print_{html_path.stem}.html")
+    tmp_print.write_text(html_for_browser_pdf, encoding="utf-8")
 
     def _cleanup_print_tmp() -> None:
         if tmp_print is not None:
@@ -498,25 +768,29 @@ def convert_html_to_pdf(
             except OSError:
                 pass
 
-    file_uri = (
-        tmp_print.resolve().as_uri() if tmp_print is not None else html_path.resolve().as_uri()
-    )
+    file_uri = tmp_print.resolve().as_uri()
 
     # --- Strategy 1: Edge / Chrome headless (handles any email HTML) ---
     browser = _find_browser()
     if browser:
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [
                     str(browser),
                     "--headless",
                     "--disable-gpu",
+                    "--allow-file-access-from-files",
+                    "--blink-settings=imagesEnabled=true",
+                    "--disable-features=PaintHolding",
+                    "--run-all-compositor-stages-before-draw",
+                    "--virtual-time-budget=30000",
                     "--no-pdf-header-footer",
                     f"--print-to-pdf={pdf_path}",
                     file_uri,
                 ],
                 capture_output=True,
-                timeout=30,
+                timeout=90,
+                text=True,
             )
             if pdf_path.exists() and pdf_path.stat().st_size > 0:
                 _cleanup_print_tmp()
@@ -527,6 +801,12 @@ def convert_html_to_pdf(
                     f"{RL.ts()}  converted_to_pdf browser={browser.name} source={html_path.name} output={pdf_path.name}",
                 )
                 return pdf_path
+            stderr = clean_text(proc.stderr)
+            if stderr:
+                _log_warning(
+                    "htmlHandler",
+                    f"Browser PDF conversion produced stderr for {html_path.name}: {stderr[:500]}",
+                )
         except Exception as e:
             print(f"  Browser PDF conversion failed: {console_safe_text(e)}")
             _log_warning(
@@ -544,8 +824,7 @@ def convert_html_to_pdf(
     # --- Strategy 2: xhtml2pdf (pure Python fallback) ---
     if _HAS_XHTML2PDF:
         try:
-            if html_for_pdf is None:
-                html_for_pdf, _ = read_email_html_file(html_path)
+            _debug_write_html_state(html_path, "07_xhtml2pdf_fallback_input", html_for_pdf)
             with open(pdf_path, "wb") as pdf_file:
                 pisa.CreatePDF(
                     io.StringIO(html_for_pdf),
@@ -584,6 +863,10 @@ def infer_company_from_subject(subject: str | None) -> str | None:
     if not subject:
         return None
 
+    hinted = _company_hint_from_subject_text(subject)
+    if hinted:
+        return hinted
+
     normalized = subject
     while True:
         updated = re.sub(r"^\s*(?:fw|fwd|re)\s*:\s*", "", normalized, flags=re.IGNORECASE)
@@ -594,6 +877,8 @@ def infer_company_from_subject(subject: str | None) -> str | None:
     patterns = [
         r"your\s+(.+?)\s+order(?:\b|:)",
         r"order\s+from\s+(.+?)(?:\b|:)",
+        r"(.+?)\s+order\s+(?:has\s+)?(?:shipped|delivered|confirmed)(?:\b|:)",
+        r"(.+?)\s+(?:shipping|delivery)\s+update(?:\b|:)",
         r"thanks\s+.+?\s+for\s+your\s+purchase\s+with\s+(.+?)(?:\b|!|\.|:)",
     ]
 
@@ -601,7 +886,10 @@ def infer_company_from_subject(subject: str | None) -> str | None:
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
         if match:
             company = clean_text(match.group(1))
-            if company:
+            if company and not _looks_missing_company(company):
+                maybe_hinted = _company_hint_from_subject_text(company)
+                if maybe_hinted:
+                    return maybe_hinted
                 return company.strip(" -,:;.!?")
 
     return None
@@ -1014,6 +1302,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Sender email address. Embedded in the output JSON as-is.",
     )
+    parser.add_argument(
+        "--email-datetime",
+        default=None,
+        dest="email_datetime",
+        help=(
+            "Original email timestamp (ISO-8601 preferred, e.g. 2026-05-05T13:14:15Z). "
+            "Used for order-level purchase date consolidation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1025,6 +1322,7 @@ def process_file(
     subject: str | None,
     sender_name: str | None,
     email: str | None,
+    email_datetime: str | None = None,
 ) -> dict:
     """Run the full extraction pipeline for one HTML email file.
 
@@ -1052,6 +1350,7 @@ def process_file(
         t = _time.perf_counter()
         print("  » Reading email HTML...", end=" ", flush=True)
         raw_html, html_encoding = read_email_html_file(file_path)
+        _debug_write_html_state(file_path, "01_extraction_input_raw", raw_html)
         href_count_raw = raw_html.lower().count('href=')
         timings["step1_s"] = round(_time.perf_counter() - t, 3)
         timings["html_chars"] = len(raw_html)
@@ -1181,8 +1480,19 @@ def process_file(
 
         original_llm_company = clean_text(extracted.get("company"))
 
-        if not clean_text(extracted.get("company")):
-            extracted["company"] = infer_company_from_subject(subject)
+        if _looks_missing_company(extracted.get("company")):
+            fallback_company = infer_company_fallback(subject, sender_name, email)
+            if fallback_company:
+                extracted["company"] = fallback_company
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: company fallback -> {fallback_company!r}",
+                )
+            else:
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: company missing after extraction and fallback",
+                )
 
         file_uri = "file:///" + str(file_path.resolve()).replace("\\", "/")
         final_category, raw_confidence = resolve_base_email_category(extracted)
@@ -1228,6 +1538,20 @@ def process_file(
 
         if final_category not in VALID_CATEGORIES:
             final_category = "Unknown"
+
+        if not _extract_date_str(extracted.get("purchase_datetime")):
+            inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
+            if inferred_order_date:
+                extracted["purchase_datetime"] = inferred_order_date
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
+                )
+            else:
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: purchase_datetime missing or non-ISO; filename will use no-date fallback",
+                )
 
         timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
         timings["category"] = final_category
@@ -1276,6 +1600,7 @@ def process_file(
             "subject": clean_text(subject),
             "sender_name": clean_text(sender_name),
             "email": clean_text(email),
+            "email_datetime": clean_text(email_datetime),
             "company": clean_text(extracted.get("company")),
             LLM_OBTAINED_COMPANY_FIELD: clean_text(extracted.get("company")),
             ORIGINAL_LLM_OBTAINED_COMPANY_FIELD: original_llm_company,
@@ -1306,6 +1631,7 @@ def process_file(
             "subject": clean_text(subject),
             "sender_name": clean_text(sender_name),
             "email": clean_text(email),
+            "email_datetime": clean_text(email_datetime),
             "error": clean_text(e),
             "company": None,
             LLM_OBTAINED_COMPANY_FIELD: None,
@@ -1401,13 +1727,37 @@ def _sanitize_for_filename(name: str) -> str:
     return sanitized or "Unknown"
 
 
-def _extract_date_str(purchase_datetime: str | None) -> str:
-    """Pull a YYYY-MM-DD date from the extracted purchase_datetime, or today's date."""
-    if purchase_datetime:
-        m = re.match(r"(\d{4}-\d{2}-\d{2})", purchase_datetime.strip())
-        if m:
-            return m.group(1)
-    return datetime.now().strftime("%Y-%m-%d")
+def _extract_date_str(purchase_datetime: str | None) -> str | None:
+    """Pull a ``YYYY-MM-DD`` token from ``purchase_datetime`` when present."""
+    cleaned = clean_text(purchase_datetime)
+    if not cleaned:
+        return None
+    m = _ISO_DATE_TOKEN_RE.search(cleaned)
+    if m:
+        return m.group(1)
+    m_us = _US_DATE_TOKEN_RE.search(cleaned)
+    if m_us:
+        month = int(m_us.group(1))
+        day = int(m_us.group(2))
+        year_raw = m_us.group(3)
+        year = int(year_raw)
+        if year < 100:
+            year += 2000
+        try:
+            normalized = datetime(year, month, day)
+            return normalized.strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    m_named = _MONTH_NAME_DATE_RE.search(cleaned)
+    if m_named:
+        token = m_named.group(1)
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                normalized = datetime.strptime(token, fmt)
+                return normalized.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return None
 
 
 def _extract_order_last4(order_number: str | None) -> str:
@@ -1428,9 +1778,9 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     Shipped    → DOC <store> <YYYY-MM-DD> SHIPPED
     Delivered  → DOC <store> <YYYY-MM-DD> DELIVERED
     Gift Card  → <store> <YYYY-MM-DD>
-    Unknown    → DOC <store> <YYYY-MM-DD>
+    Unknown    → DOC <store> <YYYY-MM-DD> (or no-date fallback)
     """
-    category = record.get("email_category", "Unknown")
+    category = clean_text(record.get("email_category")) or "Unknown"
     store = _sanitize_for_filename(record.get("company") or "Unknown")
     date_str = _extract_date_str(record.get("purchase_datetime"))
     order_last4 = _extract_order_last4(record.get("order_number"))
@@ -1438,11 +1788,19 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     suffix = _CATEGORY_SUFFIX_MAP.get(category)
 
     if category == "Gift Card":
-        name = f"{store} {date_str}_{order_last4}"
+        name = f"{store} {date_str}_{order_last4}" if date_str else f"{store}_{order_last4}"
+    elif category in {"Shipped", "Delivered"} and suffix:
+        if date_str:
+            name = f"DOC {store} {date_str} {suffix}_{order_last4}"
+        else:
+            name = f"DOC {store} {order_last4} {suffix}"
     elif suffix:
-        name = f"DOC {store} {date_str} {suffix}_{order_last4}"
+        if date_str:
+            name = f"DOC {store} {date_str} {suffix}_{order_last4}"
+        else:
+            name = f"DOC {store} {order_last4} {suffix}"
     else:
-        name = f"DOC {store} {date_str}_{order_last4}"
+        name = f"DOC {store} {date_str}_{order_last4}" if date_str else f"DOC {store} {order_last4}"
 
     return name + extension
 
@@ -1483,6 +1841,11 @@ def archive_html_before_pdf(source_html: Path, record: dict, html_folder: Path) 
         new_path = html_folder / f"{base_name} ({counter}){ext}"
         counter += 1
     shutil.copy2(source_html, new_path)
+    try:
+        archived_html, _ = read_email_html_file(new_path)
+        _debug_write_html_state(new_path, "03_archived_convention_html", archived_html)
+    except OSError as e:
+        _log_warning("htmlHandler", f"Could not snapshot archived HTML {new_path.name}: {e}")
     print(f"  Archived HTML: {new_path.name}")
     return new_path
 
@@ -1539,10 +1902,11 @@ def _record_company_vote_candidates(record: dict) -> list[str]:
 
     values: list[str | None] = [clean_text(record.get(k)) for k in field_order]
     values.append(infer_company_from_subject(record.get("subject")))
+    values.append(infer_company_from_sender(record.get("sender_name"), record.get("email")))
 
     for value in values:
         cleaned = clean_text(value)
-        if not cleaned:
+        if not cleaned or _looks_missing_company(cleaned):
             continue
         vote_key = _company_vote_key(cleaned)
         if not vote_key or vote_key in seen_vote_keys:
@@ -1634,6 +1998,103 @@ def unify_company_names_by_order(results: list[dict]) -> None:
             )
 
 
+def _parse_email_datetime_for_sort(value: str | None) -> datetime | None:
+    """Parse record-level email datetime into a UTC-naive datetime for sorting."""
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    raw = cleaned.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        date_only = _extract_date_str(cleaned)
+        if not date_only:
+            return None
+        try:
+            dt = datetime.fromisoformat(date_only)
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def unify_purchase_dates_by_order(results: list[dict]) -> None:
+    """Set one order-level purchase date, biased toward the earliest email in the order."""
+    groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+    for idx, record in enumerate(results):
+        order_key = _normalized_order_key(record)
+        if order_key:
+            groups[order_key].append((idx, record))
+
+    for order_key, indexed_group in groups.items():
+        if not indexed_group:
+            continue
+
+        decorated_group: list[tuple[int, dict, datetime | None]] = [
+            (row_idx, rec, _parse_email_datetime_for_sort(rec.get("email_datetime")))
+            for row_idx, rec in indexed_group
+        ]
+        sorted_group = sorted(
+            decorated_group,
+            key=lambda item: (
+                item[2] is None,
+                item[2] or datetime.max,
+                item[0],
+            ),
+        )
+
+        earliest_idx, earliest_record, earliest_dt = sorted_group[0]
+        earliest_extracted_date = _extract_date_str(earliest_record.get("purchase_datetime"))
+
+        chosen_date: str | None = None
+        chosen_source = ""
+
+        if earliest_extracted_date:
+            chosen_date = earliest_extracted_date
+            chosen_source = f"earliest_row_extracted:index={earliest_idx}"
+        else:
+            for row_idx, rec, _dt in sorted_group:
+                ds = _extract_date_str(rec.get("purchase_datetime"))
+                if ds:
+                    chosen_date = ds
+                    chosen_source = f"first_extracted_in_order:index={row_idx}"
+                    break
+            if chosen_date is None and earliest_dt is not None:
+                chosen_date = earliest_dt.strftime("%Y-%m-%d")
+                chosen_source = f"earliest_email_datetime:index={earliest_idx}"
+            elif chosen_date is None:
+                chosen_source = "no_valid_date_found"
+
+        if not chosen_date:
+            _log_warning(
+                "grabbingImportantEmailContent",
+                f"Order {order_key}: could not resolve consolidated purchase date "
+                f"({chosen_source}); leaving per-row values unchanged",
+            )
+            continue
+
+        updated_rows = 0
+        for _, rec in indexed_group:
+            before = _extract_date_str(rec.get("purchase_datetime"))
+            if before != chosen_date:
+                rec["purchase_datetime"] = chosen_date
+                updated_rows += 1
+
+        if updated_rows > 0:
+            print(
+                console_safe_text(
+                    f"  Purchase-date consensus (order {order_key}): {chosen_date} "
+                    f"({chosen_source}, {updated_rows} row(s) updated)"
+                )
+            )
+            RL.log(
+                "grabbingImportantEmailContent",
+                f"{RL.ts()}  order={order_key} purchase_date_consensus={chosen_date} "
+                f"source={chosen_source} updated_rows={updated_rows}",
+            )
+
+
 def rename_assets_to_match_record(
     record: dict, pdf_folder: Path, html_folder: Path
 ) -> None:
@@ -1680,10 +2141,11 @@ def rename_assets_to_match_record(
 def apply_order_company_consensus_and_sync(
     results: list[dict], base_dir: Path
 ) -> None:
-    """Update ``company`` by order-number plurality and rename PDF/HTML to match."""
+    """Update order-level company/date consensus and rename PDF/HTML to match."""
     pdf_folder = base_dir / "email_contents" / "pdf"
     html_folder = base_dir / "email_contents" / "html"
     unify_company_names_by_order(results)
+    unify_purchase_dates_by_order(results)
     for r in results:
         try:
             rename_assets_to_match_record(r, pdf_folder, html_folder)
@@ -1843,7 +2305,13 @@ def main(flow_started_at: datetime | None = None):
 
         file_path = rename_single_file(file_path, pdf_folder)
 
-        entry = process_file(file_path, args.subject, args.sender_name, args.email)
+        entry = process_file(
+            file_path,
+            args.subject,
+            args.sender_name,
+            args.email,
+            args.email_datetime,
+        )
         timings = entry.pop("_timings", {})
         if _timing_buffer_path:
             RL.write_timing_entry(_timing_buffer_path, {
@@ -1900,7 +2368,13 @@ def main(flow_started_at: datetime | None = None):
                     r["duplicate_on_last_run"] = 1
                     break
             continue
-        entry = process_file(fp, args.subject, args.sender_name, args.email)
+        entry = process_file(
+            fp,
+            args.subject,
+            args.sender_name,
+            args.email,
+            args.email_datetime,
+        )
         timings = entry.pop("_timings", {})
         if _timing_buffer_path:
             RL.write_timing_entry(_timing_buffer_path, {
@@ -1951,7 +2425,7 @@ if __name__ == "__main__":
         if e.code == EXIT_BAD_ARGS:
             print("\nERROR: Invalid or missing arguments.")
             print("Check command-line arguments. Set OPENAI_API_KEY via Email Sorter Settings if needed.")
-            print("Optional args: --file, --subject, --sender-name, --email")
+            print("Optional args: --file, --subject, --sender-name, --email, --email-datetime")
         _exit_code = e.code if isinstance(e.code, int) else (0 if e.code in (None, False) else 1)
         if _exit_code != 0:
             _record_fatal_exit(

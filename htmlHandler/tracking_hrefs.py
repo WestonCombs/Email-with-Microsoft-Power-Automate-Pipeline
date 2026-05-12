@@ -68,6 +68,15 @@ _TRACKING_DOMAINS = [
     "lasership.com",
 ]
 
+_CARRIER_TRACKING_DOMAINS = frozenset({
+    "ups.com",
+    "fedex.com",
+    "usps.com",
+    "dhl.com",
+    "ontrac.com",
+    "lasership.com",
+})
+
 _TRACKING_PATH_KEYWORDS = [
     "track",
     "tracking",
@@ -113,6 +122,28 @@ _LINK_PRIORITY_SUBSTRINGS = (
     "order&",
     "order=",
 )
+
+
+def _host_matches_domain(host: str, domain: str) -> bool:
+    host = (host or "").strip(".").lower()
+    domain = (domain or "").strip(".").lower()
+    return host == domain or host.endswith("." + domain)
+
+
+def _is_known_carrier_tracking_url(url: str) -> bool:
+    """True for carrier tracking pages that are already useful browser targets."""
+    s = clean_link(url)
+    if s.startswith("//"):
+        s = "https:" + s
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return False
+    host = parsed.hostname or ""
+    if not any(_host_matches_domain(host, d) for d in _CARRIER_TRACKING_DOMAINS):
+        return False
+    low = s.lower()
+    return any(kw in low for kw in _TRACKING_PATH_KEYWORDS)
 
 
 def clean_link(link: str) -> str:
@@ -354,6 +385,9 @@ def resolve_final_url(
     if not ok:
         _dbg(f"skip (non-http)  {raw[:120]}")
         return raw
+    if _is_known_carrier_tracking_url(current):
+        _dbg(f"resolve stop (already carrier tracking)  {current[:120]}")
+        return current
 
     _dbg(f"resolve start    {current[:120]}")
     opener = _redirect_opener()
@@ -364,6 +398,9 @@ def resolve_final_url(
             nxt = urljoin(current, loc.strip())
             _dbg(f"  hop {hop}  -> redirect {code} to {nxt[:120]}")
             current = nxt
+            if _is_known_carrier_tracking_url(current):
+                _dbg(f"  hop {hop}  carrier tracking target reached -> done: {current[:120]}")
+                return current
             continue
         if code == 200:
             _dbg(f"  hop {hop}  HEAD 200 -> done: {current[:120]}")
@@ -376,6 +413,9 @@ def resolve_final_url(
             nxt = urljoin(current, loc.strip())
             _dbg(f"  hop {hop}  -> redirect {code} to {nxt[:120]}")
             current = nxt
+            if _is_known_carrier_tracking_url(current):
+                _dbg(f"  hop {hop}  carrier tracking target reached -> done: {current[:120]}")
+                return current
             continue
         if code == 200:
             _dbg(f"  hop {hop}  GET  200 -> done: {current[:120]}")
