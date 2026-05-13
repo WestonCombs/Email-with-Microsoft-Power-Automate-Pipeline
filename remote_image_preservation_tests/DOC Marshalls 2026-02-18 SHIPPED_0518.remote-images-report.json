@@ -1,0 +1,104 @@
+{
+  "source_html": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\email_contents\\html\\DOC Marshalls 2026-02-18 SHIPPED_0518.html",
+  "preserved_html": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\python_files\\remote_image_preservation_tests\\DOC Marshalls 2026-02-18 SHIPPED_0518.remote-images-preserved.html",
+  "summary": {
+    "img_tags": 19,
+    "remote_src": 18,
+    "replaced_src": 1,
+    "failed_src": 17,
+    "skipped_src": 1
+  },
+  "attempts": [
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_header_em640700_logo_rev.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package1.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package3.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package4.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package5.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package6.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package7.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/package8.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy24_mar_transact/SyncSalesOrder_28Shipment_29_images_feb19_marshalls_transactional_spacer.gif",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://images.tr.tjx.com/images/073658fa996df23c26c8e1da39f1e883/FY26_E-Invoice/Receipt-MSH-20x20.png",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 557,
+      "error": ""
+    },
+    {
+      "url": "https://img.marshalls.com/marshalls?set=DisplayName%5be3%5d,prd%5b4000462639_NS10474336%5d,ag%5bno%5d&call=url%5bfile:tjxrPRD2.chain%5d",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://img.marshalls.com/marshalls?set=DisplayName%5be3%5d,prd%5b4000456693_NS4155652%5d,ag%5bno%5d&call=url%5bfile:tjxrPRD2.chain%5d",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    }
+  ]
+}

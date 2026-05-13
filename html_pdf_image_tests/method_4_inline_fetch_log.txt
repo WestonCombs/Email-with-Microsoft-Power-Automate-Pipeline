@@ -1,0 +1,23 @@
+OK	42	image/gif	https://cta.narvar.com/q/ypaUqTGTR6C1-6B5d5JszA~~/AAG0DBA~/TwRF-nbVZN89RsaYlgm8USDD9yVnoOnnCF_Rv3XuESugOaAMxLqA4kKfDyZ7ZPplz9YsS5V1REVIxnxyi-tTXA~~
+OK	3497	image/png	https://cdn.domain-freighter.prod20.narvar.com/marshalls/0a36cc03-a5e0-4a83-b7d5-eb9dc144fa16
+FAIL	0	HTTP Error 403: Forbidden	https://img.marshalls.com/tjx?set=DisplayName%5be8%5d,prd%5b4000462639_NS10474336%5d,ag%5bno%5d&call=url%5bfile:tjxrPRD2.chain%5d
+OK	69654	image/jpeg	https://cdn.domain-freighter.st20.narvar.com/marshalls/5e826918-639b-45c7-894f-606c042bbcaa
+OK	45331	image/jpeg	https://cdn.domain-freighter.st20.narvar.com/marshalls/905c0d26-cd5c-4c3f-9f22-90f769620ec7
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav1_update2.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav2_update2.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav3_update2.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav4_update2.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav5_update2.jpg
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav6_update2.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav7_update2.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav8_update2.png
+OK	17775	image/jpeg	https://cdn.domain-freighter.st20.narvar.com/marshalls/69fbe4fb-86c6-48a3-b96c-0fe05cc5143c
+OK	21963	image/jpeg	https://cdn.domain-freighter.st20.narvar.com/marshalls/e1c3853a-9171-4578-bed4-defe41b40961
+OK	10444	image/jpeg	https://cdn.domain-freighter.st20.narvar.com/marshalls/f1e29210-5ffa-4636-8b1e-deed5fe82462
+OK	21908	image/jpeg	https://cdn.domain-freighter.st20.narvar.com/marshalls/6d651ee7-146a-48dd-9842-5a06a5a5a06a
+OK	15582	image/png	https://storage.googleapis.com/narvar-st20-freighter-assets/marshalls/137ec15c-661f-491b-ab0c-d982535ba756
+OK	261115	image/png	https://storage.googleapis.com/narvar-st20-freighter-assets/tjmaxx/ed66c6bb-4922-45da-ac98-5ffea731bfb7
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_shopMar.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_shopMaxx.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_shopSierra.png
+FAIL	0	HTTP Error 403: Forbidden	https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_findHG.png

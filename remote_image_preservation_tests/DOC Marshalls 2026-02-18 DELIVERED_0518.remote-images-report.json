@@ -1,0 +1,202 @@
+{
+  "source_html": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\email_contents\\html\\DOC Marshalls 2026-02-18 DELIVERED_0518.html",
+  "preserved_html": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\python_files\\remote_image_preservation_tests\\DOC Marshalls 2026-02-18 DELIVERED_0518.remote-images-preserved.html",
+  "summary": {
+    "img_tags": 28,
+    "remote_src": 28,
+    "replaced_src": 13,
+    "failed_src": 15,
+    "skipped_src": 0
+  },
+  "attempts": [
+    {
+      "url": "https://cta.narvar.com/q/djgYNnOl3vC2wdRV8PyTXA~~/AAG0DBA~/7Fx-LDItZef0Eg0oQTwWtzdv_DGR3qlBosdVKgZpSpy3xFDuSmdLjGLbBPUDXDhmQiLTyV5zFhQfK_TYilJV0w~~",
+      "status": "ok",
+      "content_type": "image/gif",
+      "byte_count": 42,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.prod20.narvar.com/marshalls/0a36cc03-a5e0-4a83-b7d5-eb9dc144fa16",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 3497,
+      "error": ""
+    },
+    {
+      "url": "https://img.marshalls.com/tjx?set=DisplayName%5be8%5d,prd%5b4000462639_NS10474336%5d,ag%5bno%5d&call=url%5bfile:tjxrPRD2.chain%5d",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/5e826918-639b-45c7-894f-606c042bbcaa",
+      "status": "ok",
+      "content_type": "image/jpeg",
+      "byte_count": 69654,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/905c0d26-cd5c-4c3f-9f22-90f769620ec7",
+      "status": "ok",
+      "content_type": "image/jpeg",
+      "byte_count": 45331,
+      "error": ""
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav1_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav2_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav3_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav4_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav5_update2.jpg",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav6_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav7_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common/images/fy22_mar_footer_em640571_nav8_update2.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/69fbe4fb-86c6-48a3-b96c-0fe05cc5143c",
+      "status": "ok",
+      "content_type": "image/jpeg",
+      "byte_count": 17775,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/e1c3853a-9171-4578-bed4-defe41b40961",
+      "status": "ok",
+      "content_type": "image/jpeg",
+      "byte_count": 21963,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/f1e29210-5ffa-4636-8b1e-deed5fe82462",
+      "status": "ok",
+      "content_type": "image/jpeg",
+      "byte_count": 10444,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/6d651ee7-146a-48dd-9842-5a06a5a5a06a",
+      "status": "ok",
+      "content_type": "image/jpeg",
+      "byte_count": 21908,
+      "error": ""
+    },
+    {
+      "url": "https://storage.googleapis.com/narvar-st20-freighter-assets/marshalls/137ec15c-661f-491b-ab0c-d982535ba756",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 15582,
+      "error": ""
+    },
+    {
+      "url": "https://storage.googleapis.com/narvar-st20-freighter-assets/tjmaxx/ed66c6bb-4922-45da-ac98-5ffea731bfb7",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 261115,
+      "error": ""
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_shopMar.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_shopMaxx.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_shopSierra.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_findHG.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://static.marshalls.com/us/content/email_common_images/fy25_mar_footer_brands_1702938_findHS.png",
+      "status": "failed",
+      "content_type": "",
+      "byte_count": 0,
+      "error": "HTTP 403: Forbidden"
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/6c9e319f-620c-4a5e-b7f9-fef1ce28902a",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 3474,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/cc319b06-e53a-4492-b492-69123cd15af0",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 3590,
+      "error": ""
+    },
+    {
+      "url": "https://cdn.domain-freighter.st20.narvar.com/marshalls/1c61a59b-4fad-4770-843f-ae9829571f51",
+      "status": "ok",
+      "content_type": "image/png",
+      "byte_count": 3677,
+      "error": ""
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "source_html": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\email_contents\\html\\DOC Marshalls 2026-02-18 DELIVERED_0518 (3).html",
+  "pdf": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\python_files\\visible_email_pdf_tests\\DOC Marshalls 2026-02-18 DELIVERED_0518 (3).cdp-capture.pdf",
+  "preview": "C:\\Users\\Weston\\Documents\\Projects\\Microsoft Power Automate\\Mom\\Email Sorter 1.2\\python_files\\visible_email_pdf_tests\\DOC Marshalls 2026-02-18 DELIVERED_0518 (3).cdp-capture.preview-page2.png",
+  "ready_state": "complete",
+  "image_count": 29,
+  "images_complete": 29,
+  "images_loaded": 29,
+  "images_failed": 0,
+  "elapsed_seconds": 3.729
+}

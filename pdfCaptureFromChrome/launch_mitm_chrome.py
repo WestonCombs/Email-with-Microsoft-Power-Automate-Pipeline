@@ -175,6 +175,41 @@ def _remote_allow_origins_arg(remote_debugging_port: int) -> str:
     return f"--remote-allow-origins=http://127.0.0.1:{remote_debugging_port}"
 
 
+def _mark_capture_profile_exited_cleanly() -> None:
+    """Prevent Chrome's session-restore prompt for the dedicated capture profile."""
+    for path in (
+        CHROME_USER_DATA_MITM / "Default" / "Preferences",
+        CHROME_USER_DATA_MITM / "Local State",
+    ):
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        profile = data.setdefault("profile", {})
+        if not isinstance(profile, dict):
+            continue
+        changed = False
+        if profile.get("exit_type") != "Normal":
+            profile["exit_type"] = "Normal"
+            changed = True
+        if profile.get("exited_cleanly") is not True:
+            profile["exited_cleanly"] = True
+            changed = True
+        if not changed:
+            continue
+        try:
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+        except OSError:
+            continue
+
+
 def launch_isolated_chrome(
     port: int,
     chrome_path: Path | None = None,
@@ -192,6 +227,7 @@ def launch_isolated_chrome(
         return None
 
     CHROME_USER_DATA_MITM.mkdir(parents=True, exist_ok=True)
+    _mark_capture_profile_exited_cleanly()
 
     args = [
         str(chrome),
@@ -229,6 +265,7 @@ def launch_isolated_chrome_no_proxy(
     *,
     start_url: str = "about:blank",
     remote_debugging_port: int,
+    extra_args: list[str] | tuple[str, ...] | None = None,
     verbose: bool = False,
 ) -> subprocess.Popen | None:
     """
@@ -244,6 +281,7 @@ def launch_isolated_chrome_no_proxy(
         return None
 
     CHROME_USER_DATA_MITM.mkdir(parents=True, exist_ok=True)
+    _mark_capture_profile_exited_cleanly()
 
     args: list[object] = [
         str(chrome),
@@ -255,8 +293,10 @@ def launch_isolated_chrome_no_proxy(
         "--disable-sync",
         "--disable-background-networking",
         "--disable-background-mode",
-        start_url,
     ]
+    if extra_args:
+        args.extend(str(x) for x in extra_args if str(x).strip())
+    args.append(start_url)
     if verbose:
         _append_capture_log(
             f"no_proxy: remote-debugging-port={remote_debugging_port} start_url={start_url!r}"
