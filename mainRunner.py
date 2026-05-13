@@ -353,7 +353,25 @@ def _preserve_remote_images_for_email(
         f"{RL.ts()}  email_index={index} remote_image_preservation "
         f"{result.to_log_line()}{report_note}",
     )
+    if result.failed_src and _email_appears_delivery_proof_related(subject, body_html):
+        warning = (
+            f"Delivery/proof-related email {index} still has "
+            f"{result.failed_src} remote image(s) that could not be preserved"
+        )
+        print(f"  WARNING: {warning}")
+        _warn(warning + report_note, segment="emailFetching")
     return result.html if result.replaced_src else body_html
+
+
+def _email_appears_delivery_proof_related(subject: str | None, body_html: str | None) -> bool:
+    text = f"{subject or ''}\n{body_html or ''}"
+    return bool(
+        re.search(
+            r"\b(delivered|delivery|proof of delivery|image of delivery)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _delete_saved_email_data_if_requested(base_dir: Path) -> None:
@@ -641,6 +659,7 @@ def run_grabbing_important_content(
     sender_email: str,
     sender_name: str,
     email_datetime: str | None = None,
+    email_datetime_source: str | None = None,
     *,
     base_dir: Path,
     usage_log_path: Path | None = None,
@@ -662,6 +681,8 @@ def run_grabbing_important_content(
     ]
     if (email_datetime or "").strip():
         cmd.extend(["--email-datetime", str(email_datetime).strip()])
+    if (email_datetime_source or "").strip():
+        cmd.extend(["--email-datetime-source", str(email_datetime_source).strip()])
     env = os.environ.copy()
     if usage_log_path:
         env["OPENAI_USAGE_LOG_PATH"] = str(usage_log_path)
@@ -1305,13 +1326,24 @@ def main() -> None:
             )
             email_html.write_text(body_html, encoding="utf-8")
 
+            if (msg.sent_datetime_iso or "").strip():
+                email_datetime = msg.sent_datetime_iso
+                email_datetime_source = "original_email_sent_date"
+            elif (msg.received_datetime_iso or "").strip():
+                email_datetime = msg.received_datetime_iso
+                email_datetime_source = "forwarded_received_date"
+            else:
+                email_datetime = None
+                email_datetime_source = None
+
             t_email = time.perf_counter()
             run_grabbing_important_content(
                 html_file=f"file{i}.html",
                 subject=msg.subject,
                 sender_email=msg.sender_email,
                 sender_name=msg.sender_name,
-                email_datetime=(msg.received_datetime_iso or msg.sent_datetime_iso or None),
+                email_datetime=email_datetime,
+                email_datetime_source=email_datetime_source,
                 base_dir=base_dir,
                 usage_log_path=usage_log_path,
                 timing_buffer_path=timing_buffer_path,

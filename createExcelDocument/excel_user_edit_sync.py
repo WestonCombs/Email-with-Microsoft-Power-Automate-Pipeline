@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import traceback
@@ -68,6 +69,24 @@ def _write_result_tsv(path: Path, summary: dict) -> None:
     path.write_text("".join(lines), encoding="utf-8")
 
 
+def _sync_email_asset_names_after_edit(project_root: Path) -> None:
+    results_path = project_root / "email_contents" / "json" / "results.json"
+    if not results_path.is_file():
+        return
+    from grabbingImportantEmailContent.grabbingImportantEmailContent import (
+        apply_order_company_consensus_and_sync,
+    )
+
+    records = json.loads(results_path.read_text(encoding="utf-8"))
+    if not isinstance(records, list):
+        return
+    apply_order_company_consensus_and_sync(records, project_root)
+    results_path.write_text(
+        json.dumps(records, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Apply a user edit from Orders.xlsm to Email Sorter JSON."
@@ -95,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
             order_number=order_no,
             source_uri=src_uri,
         )
+        try:
+            _sync_email_asset_names_after_edit(project_root)
+        except Exception as sync_exc:
+            _append_user_edit_log(
+                f"WARN filename sync skipped after edit: {type(sync_exc).__name__}: {sync_exc}"
+            )
         _write_result_tsv(_user_edit_result_path(args.context_tsv), summary)
         _append_user_edit_log(
             "OK mode=%s matched_records=%s changed=%s"
