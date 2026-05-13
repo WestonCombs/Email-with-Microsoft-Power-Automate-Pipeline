@@ -73,8 +73,9 @@ class PurchaseDateAccuracyTests(unittest.TestCase):
         self.assertEqual(rows[1]["purchase_datetime"], "2026-04-28")
         self.assertEqual(
             rows[0]["purchase_datetime_source"],
-            "order_consensus:first_extracted_in_order:index=1",
+            "order_consensus:source=explicit_order_date;first_allowed_in_order:index=1",
         )
+        self.assertEqual(rows[0]["purchase_datetime_confidence"], "medium")
         self.assertIn("2026-04-28", build_convention_filename(rows[0]))
 
 
