@@ -731,9 +731,9 @@ def convert_html_to_pdf(
     html_path: Path,
     outlook_msg: EmailMessage | None = None,
 ) -> Path:
-    """Convert an HTML file to PDF. Tries Edge/Chrome headless first (perfect
-    rendering), then xhtml2pdf as fallback. Returns the original path if all
-    methods fail.
+    """Convert an HTML file to PDF. Tries capture-profile Chrome/CDP first,
+    then Edge/Chrome headless, then xhtml2pdf as fallback. Returns the original
+    path if all methods fail.
 
     If *outlook_msg* is set, the Outlook-style metadata block is prepended only
     for this print step; the file at *html_path* is still the raw body until it
@@ -770,7 +770,34 @@ def convert_html_to_pdf(
 
     file_uri = tmp_print.resolve().as_uri()
 
-    # --- Strategy 1: Edge / Chrome headless (handles any email HTML) ---
+    # --- Strategy 1: capture-profile Chrome via CDP (retail hosts may block headless) ---
+    try:
+        from pdfCaptureFromChrome.email_html_pdf import convert_email_html_to_pdf
+
+        cdp_result = convert_email_html_to_pdf(tmp_print, pdf_path)
+        _cleanup_print_tmp()
+        html_path.unlink()
+        print(f"  Converted to PDF: {pdf_path.name}")
+        RL.log(
+            "htmlHandler",
+            f"{RL.ts()}  converted_to_pdf cdp_chrome source={html_path.name} "
+            f"output={pdf_path.name} readyState={cdp_result.ready_state} "
+            f"{cdp_result.image_summary} elapsed_s={cdp_result.elapsed_seconds}",
+        )
+        return pdf_path
+    except Exception as e:
+        print(f"  Chrome CDP PDF conversion failed: {console_safe_text(e)}")
+        _log_warning(
+            "htmlHandler",
+            f"Chrome CDP PDF conversion failed for {html_path.name}: {e}",
+        )
+        if pdf_path.exists():
+            try:
+                pdf_path.unlink()
+            except OSError:
+                pass
+
+    # --- Strategy 2: Edge / Chrome headless (handles many email HTML files) ---
     browser = _find_browser()
     if browser:
         try:
@@ -821,7 +848,7 @@ def convert_html_to_pdf(
 
     _cleanup_print_tmp()
 
-    # --- Strategy 2: xhtml2pdf (pure Python fallback) ---
+    # --- Strategy 3: xhtml2pdf (pure Python fallback) ---
     if _HAS_XHTML2PDF:
         try:
             _debug_write_html_state(html_path, "07_xhtml2pdf_fallback_input", html_for_pdf)
@@ -1539,10 +1566,13 @@ def process_file(
         if final_category not in VALID_CATEGORIES:
             final_category = "Unknown"
 
+        purchase_datetime_source = "email_content" if _extract_date_str(extracted.get("purchase_datetime")) else None
+
         if not _extract_date_str(extracted.get("purchase_datetime")):
             inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
             if inferred_order_date:
                 extracted["purchase_datetime"] = inferred_order_date
+                purchase_datetime_source = "tracking_or_order_link"
                 RL.log(
                     "grabbingImportantEmailContent",
                     f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
@@ -1550,7 +1580,7 @@ def process_file(
             else:
                 _log_warning(
                     "grabbingImportantEmailContent",
-                    f"{file_path.name}: purchase_datetime missing or non-ISO; filename will use no-date fallback",
+                    f"{file_path.name}: purchase_datetime missing or non-ISO; leaving blank unless another email for this order supplies a verified date",
                 )
 
         timings["total_s"] = round(_time.perf_counter() - t_overall, 3)
@@ -1606,6 +1636,7 @@ def process_file(
             ORIGINAL_LLM_OBTAINED_COMPANY_FIELD: original_llm_company,
             "order_number": clean_text(extracted.get("order_number")),
             "purchase_datetime": clean_text(extracted.get("purchase_datetime")),
+            "purchase_datetime_source": clean_text(purchase_datetime_source),
             "total_amount_paid": extracted.get("total_amount_paid"),
             "tax_paid": extracted.get("tax_paid"),
             "tracking_numbers": tracking_numbers_out,
@@ -1638,6 +1669,7 @@ def process_file(
             ORIGINAL_LLM_OBTAINED_COMPANY_FIELD: None,
             "order_number": None,
             "purchase_datetime": None,
+            "purchase_datetime_source": None,
             "total_amount_paid": None,
             "tax_paid": None,
             "tracking_numbers": [],
@@ -2020,7 +2052,13 @@ def _parse_email_datetime_for_sort(value: str | None) -> datetime | None:
 
 
 def unify_purchase_dates_by_order(results: list[dict]) -> None:
-    """Set one order-level purchase date, biased toward the earliest email in the order."""
+    """Set one order-level purchase date only from verified order-date evidence.
+
+    Email sent/received timestamps are useful for ordering related messages, but
+    they are not purchase dates. If no email in the order has an extracted
+    purchase date, leave the field blank instead of manufacturing one from
+    mailbox metadata.
+    """
     groups: dict[str, list[tuple[int, dict]]] = defaultdict(list)
     for idx, record in enumerate(results):
         order_key = _normalized_order_key(record)
@@ -2060,10 +2098,7 @@ def unify_purchase_dates_by_order(results: list[dict]) -> None:
                     chosen_date = ds
                     chosen_source = f"first_extracted_in_order:index={row_idx}"
                     break
-            if chosen_date is None and earliest_dt is not None:
-                chosen_date = earliest_dt.strftime("%Y-%m-%d")
-                chosen_source = f"earliest_email_datetime:index={earliest_idx}"
-            elif chosen_date is None:
+            if chosen_date is None:
                 chosen_source = "no_valid_date_found"
 
         if not chosen_date:
@@ -2079,6 +2114,7 @@ def unify_purchase_dates_by_order(results: list[dict]) -> None:
             before = _extract_date_str(rec.get("purchase_datetime"))
             if before != chosen_date:
                 rec["purchase_datetime"] = chosen_date
+                rec["purchase_datetime_source"] = f"order_consensus:{chosen_source}"
                 updated_rows += 1
 
         if updated_rows > 0:

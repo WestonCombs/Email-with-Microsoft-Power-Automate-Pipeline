@@ -20,6 +20,7 @@ Reads Settings values first, with ``python_files/.env`` used only as an optional
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import html
 import json
 import os
@@ -214,6 +215,10 @@ from emailFetching.emailFetcher import (
     extract_sender_name,
     fetch_emails,
 )
+from emailFetching.remote_image_preserver import (
+    RemoteImagePreserveResult,
+    preserve_remote_images,
+)
 
 
 def _fatal(code: int, summary: str) -> None:
@@ -241,6 +246,7 @@ _CUSTOM_IMPORT_LABEL = "customImportHTML"
 _CUSTOM_IMPORT_EMAIL = "customImportHTML@local.invalid"
 _EXCEL_STEP_WARN_SECONDS_DEFAULT = 120.0
 _DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV = "EMAIL_SORTER_DELETE_SAVED_EMAIL_DATA_THIS_RUN"
+_REMOTE_IMAGE_PRESERVE_CACHE: dict[str, str | None] = {}
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -256,6 +262,98 @@ def _read_float_env(name: str, default: float) -> float:
 
 def _env_truthy(name: str) -> bool:
     return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _remote_image_preservation_enabled() -> bool:
+    raw = (os.getenv("EMAIL_SORTER_PRESERVE_REMOTE_IMAGES") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _safe_report_token(value: str, *, max_len: int = 80) -> str:
+    token = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value or "")
+    token = re.sub(r"\s+", "_", token).strip("._ ")
+    if len(token) > max_len:
+        token = token[:max_len].rstrip("._ ")
+    return token or "email"
+
+
+def _write_remote_image_preservation_report(
+    base_dir: Path,
+    *,
+    index: int,
+    subject: str,
+    result: RemoteImagePreserveResult,
+) -> Path | None:
+    report_dir = base_dir / "email_contents" / "html_debug" / "remote_image_reports"
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = (
+            report_dir
+            / f"email_{index:03d}_{_safe_report_token(subject, max_len=70)}.json"
+        )
+        report_path.write_text(
+            json.dumps(
+                {
+                    "email_index": index,
+                    "subject": subject,
+                    "summary": {
+                        "img_tags": result.img_tags,
+                        "remote_src": result.remote_src,
+                        "replaced_src": result.replaced_src,
+                        "failed_src": result.failed_src,
+                        "skipped_src": result.skipped_src,
+                    },
+                    "attempts": [asdict(attempt) for attempt in result.attempts],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return report_path
+    except OSError as e:
+        _warn(
+            f"Could not write remote image preservation report: {e}",
+            segment="emailFetching",
+        )
+        return None
+
+
+def _preserve_remote_images_for_email(
+    body_html: str,
+    *,
+    base_dir: Path,
+    index: int,
+    subject: str,
+) -> str:
+    if not _remote_image_preservation_enabled():
+        return body_html
+    try:
+        result = preserve_remote_images(
+            body_html,
+            image_cache=_REMOTE_IMAGE_PRESERVE_CACHE,
+        )
+    except Exception as e:
+        _warn(f"Remote image preservation failed for email {index}: {e}", segment="emailFetching")
+        return body_html
+
+    report_path = _write_remote_image_preservation_report(
+        base_dir,
+        index=index,
+        subject=subject,
+        result=result,
+    )
+    report_note = f" report={report_path.name}" if report_path is not None else ""
+    print(
+        "  Remote images: "
+        f"{result.replaced_src}/{result.remote_src} preserved, "
+        f"{result.failed_src} failed{report_note}"
+    )
+    RL.log(
+        "emailFetching",
+        f"{RL.ts()}  email_index={index} remote_image_preservation "
+        f"{result.to_log_line()}{report_note}",
+    )
+    return result.html if result.replaced_src else body_html
 
 
 def _delete_saved_email_data_if_requested(base_dir: Path) -> None:
@@ -1199,7 +1297,13 @@ def main() -> None:
             )
 
             email_html = pdf_dir / f"file{i}.html"
-            email_html.write_text(msg.body_html, encoding="utf-8")
+            body_html = _preserve_remote_images_for_email(
+                msg.body_html,
+                base_dir=base_dir,
+                index=i,
+                subject=msg.subject or "",
+            )
+            email_html.write_text(body_html, encoding="utf-8")
 
             t_email = time.perf_counter()
             run_grabbing_important_content(
