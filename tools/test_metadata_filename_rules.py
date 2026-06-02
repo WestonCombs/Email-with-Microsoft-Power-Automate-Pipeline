@@ -45,6 +45,10 @@ class MetadataFilenameRuleTests(unittest.TestCase):
             "FragranceNet.com",
         )
 
+    def test_typology_aliases_normalize(self) -> None:
+        for raw in ("Typology Paris", "Typology US", "Typology.com"):
+            self.assertEqual(extractor.normalize_company_display_name(raw), "Typology")
+
     def test_zara_domain_fallback(self) -> None:
         self.assertEqual(
             extractor.choose_company_display(None, "", "", "orders@zara.com"),
@@ -91,7 +95,39 @@ class MetadataFilenameRuleTests(unittest.TestCase):
         self.assertTrue(extractor.is_filename_date_allowed(record))
         self.assertEqual(
             extractor.build_convention_filename(record),
-            "DOC Iris & Romeo 2026-04-14 INVOICE_1658.pdf",
+            "DOC Iris & Romeo 1658 2026-04-14 INVOICE.pdf",
+        )
+
+    def test_invoice_filename_tax_marker(self) -> None:
+        record = {
+            "company": "Walgreens",
+            "email_category": "Invoice",
+            "order_number": "1234561234",
+            "purchase_datetime": "2026-05-22",
+            "purchase_datetime_source": "explicit_order_date",
+            "purchase_datetime_confidence": "high",
+            "tax_paid": "$1.25",
+        }
+        self.assertEqual(
+            extractor.build_convention_filename(record),
+            "DOC Walgreens 1234 2026-05-22 INVOICE t.pdf",
+        )
+
+    def test_labeled_text_order_date_fallback(self) -> None:
+        self.assertEqual(
+            extractor.infer_order_date_from_labeled_text("Order date: May 22, 2026"),
+            "2026-05-22",
+        )
+
+    def test_record_date_fallback_from_invoice_filename(self) -> None:
+        self.assertEqual(
+            extractor.infer_order_date_from_record(
+                {
+                    "email_category": "Invoice",
+                    "source_file": r"C:\tmp\DOC Typology 3605 2026-05-22 INVOICE.pdf",
+                }
+            ),
+            ("2026-05-22", "filename_date", "medium"),
         )
 
     def test_image_diagnostics_detect_delivery_remote_image(self) -> None:

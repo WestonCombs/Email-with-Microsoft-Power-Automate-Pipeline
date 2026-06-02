@@ -53,7 +53,7 @@ Private Const TOP_ORANGE_B As Long = 131
 Private Const TOP_GREEN_R As Long = 52
 Private Const TOP_GREEN_G As Long = 199
 Private Const TOP_GREEN_B As Long = 89
-Private Const USER_EDIT_ALLOWED_LABELS As String = "Company, Total Paid, Tax Paid"
+Private Const USER_EDIT_ALLOWED_LABELS As String = "Company, Purchase Date, Total Paid, Tax Paid, Accounting"
 Private Const USER_EDIT_LOG_FILE As String = "email_sorter_user_edit.log"
 Private lastUserEditContextTsv As String
 
@@ -198,6 +198,17 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
     End If
 
     cleanValue = EmailSorter_CleanSubmittedValue(Target.Value)
+    If fieldKey = "accounting" Then
+        editEventsBusy = True
+        Application.EnableEvents = False
+        Target.Value = cleanValue
+        Application.EnableEvents = True
+        editEventsBusy = False
+        EmailSorter_EndEditMode True
+        Application.StatusBar = "Accounting saved in workbook."
+        Exit Sub
+    End If
+
     orderNumber = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, HeaderColumn(Sh, "Order Number")).Value)
     sourceUri = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_FILE_URI).Value)
 
@@ -231,6 +242,8 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
         Else
             Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
         End If
+    ElseIf fieldKey = "purchase_datetime" Then
+        Target.Value = EmailSorter_DisplayModifiedValue(resultValue)
     Else
         Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
     End If
@@ -384,10 +397,14 @@ Private Function EmailSorter_FieldKeyForColumn(ByVal Sh As Object, ByVal colNum 
     Select Case LCase(h)
         Case "company"
             EmailSorter_FieldKeyForColumn = "company"
+        Case "purchase date"
+            EmailSorter_FieldKeyForColumn = "purchase_datetime"
         Case "total paid"
             EmailSorter_FieldKeyForColumn = "total_amount_paid"
         Case "tax paid"
             EmailSorter_FieldKeyForColumn = "tax_paid"
+        Case "accounting"
+            EmailSorter_FieldKeyForColumn = "accounting"
         Case Else
             EmailSorter_FieldKeyForColumn = ""
     End Select

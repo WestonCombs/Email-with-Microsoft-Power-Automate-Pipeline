@@ -34,6 +34,7 @@ from htmlHandler.convertHTMLToPlaintext import convert as html_to_plaintext
 import time as _time
 
 from shared import runLogger as RL
+from shared.supplier_normalization import normalize_supplier_display_name
 from htmlHandler.carrier_tracking_ids import (
     _norm_key,
     extract_carrier_ids_from_href_pairs,
@@ -203,7 +204,17 @@ _GENERIC_SENDER_NAME_RE = re.compile(
 )
 
 _ALLOWED_FILENAME_DATE_SOURCES = frozenset(
-    {"explicit_order_date", "original_email_sent_date", "event_date"}
+    {
+        "explicit_order_date",
+        "original_email_sent_date",
+        "event_date",
+        "subject",
+        "metadata",
+        "filename_date",
+        "html_text",
+        "pdf_text",
+        "user_excel_edit",
+    }
 )
 _DISALLOWED_FILENAME_DATE_SOURCES = frozenset(
     {"forwarded_received_date", "processing_date", "current_date", "unknown"}
@@ -225,6 +236,14 @@ _ORDER_DATE_PARAM_HINTS = frozenset(
 _ISO_DATE_TOKEN_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _US_DATE_TOKEN_RE = re.compile(r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:20)?\d{2})\b")
 _MONTH_NAME_DATE_RE = re.compile(r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b")
+_ORDER_DATE_LABEL_RE = re.compile(
+    r"\b("
+    r"order\s+date|ordered(?:\s+on)?|order\s+placed|purchase\s+date|"
+    r"purchased(?:\s+on)?|placed(?:\s+on)?|invoice\s+date|receipt\s+date|"
+    r"confirmation\s+date"
+    r")\b",
+    re.IGNORECASE,
+)
 
 RATE_LIMIT_RETRY_WAIT = 3
 RATE_LIMIT_MAX_RETRIES = 20
@@ -463,6 +482,9 @@ def _domain_company_hint(domain_or_email: str | None) -> str | None:
     cleaned = clean_text(domain_or_email)
     if not cleaned:
         return None
+    shared_hint = normalize_supplier_display_name(cleaned)
+    if shared_hint:
+        return shared_hint
     domain = _extract_email_domain(cleaned) or cleaned.casefold()
     domain = re.sub(r"^https?://", "", domain, flags=re.IGNORECASE)
     domain = domain.split("/", 1)[0].split("?", 1)[0].strip().strip(">")
@@ -514,6 +536,10 @@ def normalize_company_display_name(
         return None
     if "all rights reserved" in cleaned.casefold() or cleaned.casefold() == "the boots company plc":
         return None
+
+    shared_normalized = normalize_supplier_display_name(cleaned, sender_email)
+    if shared_normalized:
+        return shared_normalized
 
     sender_hint = _domain_company_hint(sender_email)
     if sender_hint and "@" in cleaned and _extract_email_domain(cleaned) == _extract_email_domain(sender_email):
@@ -1837,40 +1863,53 @@ def process_file(
                     extracted["purchase_datetime"] = None
 
         if not _extract_date_str(extracted.get("purchase_datetime")):
-            inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
-            if inferred_order_date:
-                extracted["purchase_datetime"] = inferred_order_date
+            labeled_order_date = infer_order_date_from_labeled_text(
+                "\n".join([subject or "", text_only or ""])
+            )
+            if labeled_order_date:
+                extracted["purchase_datetime"] = labeled_order_date
                 purchase_datetime_source = "explicit_order_date"
-                purchase_datetime_confidence = "medium"
+                purchase_datetime_confidence = "high"
                 RL.log(
                     "grabbingImportantEmailContent",
-                    f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
+                    f"{RL.ts()}  {file_path.name}: purchase_datetime fallback "
+                    f"from labeled invoice/email text -> {labeled_order_date}",
                 )
             else:
-                fallback_date, fallback_source, fallback_confidence = _email_datetime_fallback_date(
-                    email_datetime,
-                    email_datetime_source,
-                )
-                if fallback_date:
-                    extracted["purchase_datetime"] = fallback_date
-                    purchase_datetime_source = fallback_source
-                    purchase_datetime_confidence = fallback_confidence
+                inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
+                if inferred_order_date:
+                    extracted["purchase_datetime"] = inferred_order_date
+                    purchase_datetime_source = "explicit_order_date"
+                    purchase_datetime_confidence = "medium"
                     RL.log(
                         "grabbingImportantEmailContent",
-                        f"{RL.ts()}  {file_path.name}: purchase_datetime fallback "
-                        f"from original email sent date -> {fallback_date}",
+                        f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
                     )
                 else:
-                    if fallback_source:
+                    fallback_date, fallback_source, fallback_confidence = _email_datetime_fallback_date(
+                        email_datetime,
+                        email_datetime_source,
+                    )
+                    if fallback_date:
+                        extracted["purchase_datetime"] = fallback_date
+                        purchase_datetime_source = fallback_source
+                        purchase_datetime_confidence = fallback_confidence
+                        RL.log(
+                            "grabbingImportantEmailContent",
+                            f"{RL.ts()}  {file_path.name}: purchase_datetime fallback "
+                            f"from original email sent date -> {fallback_date}",
+                        )
+                    else:
+                        if fallback_source:
+                            _log_warning(
+                                "grabbingImportantEmailContent",
+                                f"{file_path.name}: email_datetime source={fallback_source} "
+                                "not allowed as a purchase date",
+                            )
                         _log_warning(
                             "grabbingImportantEmailContent",
-                            f"{file_path.name}: email_datetime source={fallback_source} "
-                            "not allowed as a purchase date",
+                            f"{file_path.name}: purchase_datetime missing or non-ISO; leaving blank unless another email for this order supplies a verified date",
                         )
-                    _log_warning(
-                        "grabbingImportantEmailContent",
-                        f"{file_path.name}: purchase_datetime missing or non-ISO; leaving blank unless another email for this order supplies a verified date",
-                    )
         date_log_record = {
             "purchase_datetime": extracted.get("purchase_datetime"),
             "purchase_datetime_source": purchase_datetime_source,
@@ -2098,6 +2137,59 @@ def _extract_date_str(purchase_datetime: str | None) -> str | None:
     return None
 
 
+def _iter_date_context_matches(text: str | None) -> list[tuple[str, int, int]]:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return []
+    matches: list[tuple[str, int, int]] = []
+    for regex in (_ISO_DATE_TOKEN_RE, _US_DATE_TOKEN_RE, _MONTH_NAME_DATE_RE):
+        for match in regex.finditer(cleaned):
+            token = _extract_date_str(match.group(0))
+            if token:
+                matches.append((token, match.start(), match.end()))
+    matches.sort(key=lambda item: item[1])
+    return matches
+
+
+def infer_order_date_from_labeled_text(text: str | None) -> str | None:
+    """Find an order/invoice/receipt date only when a nearby label supports it."""
+    cleaned = clean_text(text)
+    if not cleaned:
+        return None
+    for date_str, start, end in _iter_date_context_matches(cleaned):
+        window = cleaned[max(0, start - 90) : min(len(cleaned), end + 90)]
+        if _ORDER_DATE_LABEL_RE.search(window):
+            return date_str
+    return None
+
+
+def infer_order_date_from_order_number_context(
+    text: str | None,
+    order_number: object,
+) -> str | None:
+    """Find merchant layouts like ``Order No. 1234 February 20, 2026``."""
+    cleaned = clean_text(text)
+    order = clean_text(order_number)
+    if not cleaned or not order:
+        return None
+    order_digits = re.sub(r"\D", "", order)
+    for date_str, start, end in _iter_date_context_matches(cleaned):
+        prefix = cleaned[max(0, start - 110) : start]
+        label_match = re.search(
+            r"\border\s*(?:no\.?|number|#)?\b",
+            prefix,
+            flags=re.IGNORECASE,
+        )
+        if not label_match:
+            continue
+        order_segment = prefix[label_match.start() :]
+        if order in order_segment:
+            return date_str
+        if order_digits and order_digits in re.sub(r"\D", "", order_segment):
+            return date_str
+    return None
+
+
 def _extract_order_last4(order_number: str | None) -> str | None:
     """Return last 4 useful order characters, or ``None`` when no order exists."""
     raw = clean_text(order_number) or ""
@@ -2112,6 +2204,33 @@ def _extract_order_last4(order_number: str | None) -> str | None:
     if alnum:
         return alnum
     return None
+
+
+def _numeric_amount(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = (
+        text.replace("$", "")
+        .replace(",", "")
+        .replace(" ", "")
+        .replace("\u00a0", "")
+    )
+    if normalized.startswith("(") and normalized.endswith(")"):
+        normalized = "-" + normalized[1:-1]
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _has_sales_tax(record: dict) -> bool:
+    amount = _numeric_amount(record.get("tax_paid"))
+    return amount is not None and amount > 0
 
 
 def _date_confidence_rank(value: object) -> int:
@@ -2288,41 +2407,29 @@ def build_convention_filename(record: dict, extension: str = ".pdf") -> str:
     suffix = _CATEGORY_SUFFIX_MAP.get(category)
 
     if category == "Gift Card":
-        if date_str and order_last4:
-            name = f"{store} {date_str}_{order_last4}"
-        elif date_str:
-            name = f"{store} {date_str}"
-        elif order_last4:
-            name = f"{store}_{order_last4}"
-        else:
-            name = store
-    elif category in {"Shipped", "Delivered"} and suffix:
-        if date_str and order_last4:
-            name = f"DOC {store} {date_str} {suffix}_{order_last4}"
-        elif date_str:
-            name = f"DOC {store} {date_str} {suffix}"
-        elif order_last4:
-            name = f"DOC {store} {order_last4} {suffix}"
-        else:
-            name = f"DOC {store} {suffix}"
+        parts = [store]
+        if order_last4:
+            parts.append(order_last4)
+        if date_str:
+            parts.append(date_str)
+        name = " ".join(parts)
     elif suffix:
-        if date_str and order_last4:
-            name = f"DOC {store} {date_str} {suffix}_{order_last4}"
-        elif date_str:
-            name = f"DOC {store} {date_str} {suffix}"
-        elif order_last4:
-            name = f"DOC {store} {order_last4} {suffix}"
-        else:
-            name = f"DOC {store} {suffix}"
+        parts = ["DOC", store]
+        if order_last4:
+            parts.append(order_last4)
+        if date_str:
+            parts.append(date_str)
+        parts.append(suffix)
+        if category == "Invoice" and _has_sales_tax(record):
+            parts.append("t")
+        name = " ".join(parts)
     else:
-        if date_str and order_last4:
-            name = f"DOC {store} {date_str}_{order_last4}"
-        elif date_str:
-            name = f"DOC {store} {date_str}"
-        elif order_last4:
-            name = f"DOC {store} {order_last4}"
-        else:
-            name = f"DOC {store}"
+        parts = ["DOC", store]
+        if order_last4:
+            parts.append(order_last4)
+        if date_str:
+            parts.append(date_str)
+        name = " ".join(parts)
 
     return name + extension
 
@@ -2550,9 +2657,132 @@ def _parse_email_datetime_for_sort(value: str | None) -> datetime | None:
     return dt
 
 
+def _path_from_record_source(record: dict) -> Path | None:
+    raw = clean_text(record.get("source_file"))
+    if not raw:
+        link = clean_text(record.get("source_file_link"))
+        if link and link.startswith("file:///"):
+            raw = urllib.parse.unquote(link.removeprefix("file:///"))
+    if not raw:
+        return None
+    try:
+        return Path(raw).resolve()
+    except OSError:
+        return None
+
+
+def _candidate_html_text_for_record(record: dict) -> str | None:
+    pdf_path = _path_from_record_source(record)
+    if pdf_path is None:
+        return None
+    html_path = pdf_path.parent.parent / "html" / f"{pdf_path.stem}.html"
+    if not html_path.is_file():
+        return None
+    try:
+        html = html_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    return html_to_plaintext(html)
+
+
+def _candidate_pdf_text_for_record(record: dict, max_pages: int = 3) -> str | None:
+    pdf_path = _path_from_record_source(record)
+    if pdf_path is None or not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+        return None
+    try:
+        from PyPDF2 import PdfReader
+
+        reader = PdfReader(str(pdf_path))
+        chunks: list[str] = []
+        for page in reader.pages[:max_pages]:
+            chunks.append(page.extract_text() or "")
+        return "\n".join(chunks)
+    except Exception as e:
+        RL.log(
+            "grabbingImportantEmailContent",
+            f"{RL.ts()}  WARNING: could not extract PDF text for date fallback "
+            f"{pdf_path.name!r}: {e}",
+        )
+        return None
+
+
+def infer_order_date_from_record(record: dict) -> tuple[str | None, str, str]:
+    """Conservative order-date fallback for existing parsed records."""
+    explicit_fields = (
+        "order_date",
+        "purchase_date",
+        "placed_date",
+        "invoice_date",
+        "receipt_date",
+        "confirmation_date",
+    )
+    for field in explicit_fields:
+        date_str = _extract_date_str(record.get(field))
+        if date_str:
+            return date_str, "metadata", "high"
+
+    subject_date = infer_order_date_from_labeled_text(record.get("subject"))
+    if subject_date:
+        return subject_date, "subject", "high"
+
+    links: list[str] = []
+    for key in ("tracking_links", "extracted_links"):
+        value = record.get(key)
+        if isinstance(value, list):
+            links.extend(str(x) for x in value if x)
+    link_date = infer_order_date_from_tracking_links(links)
+    if link_date:
+        return link_date, "explicit_order_date", "medium"
+
+    html_text = _candidate_html_text_for_record(record)
+    category = clean_text(record.get("email_category")) or "Unknown"
+    if category in {"Invoice", "Gift Card"}:
+        html_order_date = infer_order_date_from_order_number_context(
+            html_text,
+            record.get("order_number"),
+        )
+        if html_order_date:
+            return html_order_date, "html_text", "high"
+    html_date = infer_order_date_from_labeled_text(html_text)
+    if html_date:
+        return html_date, "html_text", "high"
+
+    pdf_text = _candidate_pdf_text_for_record(record)
+    if category in {"Invoice", "Gift Card"}:
+        pdf_order_date = infer_order_date_from_order_number_context(
+            pdf_text,
+            record.get("order_number"),
+        )
+        if pdf_order_date:
+            return pdf_order_date, "pdf_text", "high"
+    pdf_date = infer_order_date_from_labeled_text(pdf_text)
+    if pdf_date:
+        return pdf_date, "pdf_text", "high"
+
+    for key in ("source_file", "source_file_link"):
+        date_str = infer_order_date_from_labeled_text(record.get(key))
+        if date_str:
+            return date_str, "filename_date", "medium"
+        raw_source = clean_text(record.get(key)) or ""
+        source_date = _extract_date_str(raw_source)
+        if source_date and (
+            category == "Invoice"
+            or re.search(r"\b(invoice|receipt)\b", raw_source, flags=re.IGNORECASE)
+        ):
+            return source_date, "filename_date", "medium"
+
+    return None, "unknown", "low"
+
+
 def _record_date_candidate_for_consensus(record: dict) -> tuple[str | None, str, str]:
     date_str = _extract_date_str(record.get("purchase_datetime"))
     if not date_str:
+        return infer_order_date_from_record(record)
+    source = clean_text(record.get("purchase_datetime_source")) or ""
+    if source.casefold().startswith("order_consensus:"):
+        inferred_date, inferred_source, inferred_confidence = infer_order_date_from_record(record)
+        if inferred_date:
+            return inferred_date, inferred_source, inferred_confidence
         return None, "unknown", "low"
     if is_filename_date_allowed(record):
         return (
@@ -2564,7 +2794,25 @@ def _record_date_candidate_for_consensus(record: dict) -> tuple[str | None, str,
     category = clean_text(record.get("email_category")) or "Unknown"
     if not clean_text(record.get("purchase_datetime_source")) and category in {"Invoice", "Gift Card"}:
         return date_str, "explicit_order_date", "medium"
+    inferred_date, inferred_source, inferred_confidence = infer_order_date_from_record(record)
+    if inferred_date:
+        return inferred_date, inferred_source, inferred_confidence
     return None, "unknown", "low"
+
+
+def _consensus_date_source_rank(source: str) -> int:
+    canonical = _canonical_purchase_datetime_source(source)
+    if canonical in {"metadata", "subject", "html_text", "pdf_text", "explicit_order_date"}:
+        return 5
+    if canonical == "user_excel_edit":
+        return 6
+    if canonical == "filename_date":
+        return 4
+    if canonical == "original_email_sent_date":
+        return 3
+    if canonical == "event_date":
+        return 1
+    return 0
 
 
 def unify_purchase_dates_by_order(results: list[dict]) -> None:
@@ -2598,33 +2846,51 @@ def unify_purchase_dates_by_order(results: list[dict]) -> None:
             ),
         )
 
-        earliest_idx, earliest_record, earliest_dt = sorted_group[0]
-        (
-            earliest_extracted_date,
-            earliest_source,
-            earliest_confidence,
-        ) = _record_date_candidate_for_consensus(earliest_record)
-
         chosen_date: str | None = None
         chosen_source = ""
         chosen_confidence = "low"
+        chosen_detail = "no_valid_date_found"
 
-        if earliest_extracted_date:
-            chosen_date = earliest_extracted_date
-            chosen_source = earliest_source
-            chosen_confidence = earliest_confidence
-            chosen_detail = f"earliest_row_extracted:index={earliest_idx}"
-        else:
-            for row_idx, rec, _dt in sorted_group:
-                ds, ds_source, ds_confidence = _record_date_candidate_for_consensus(rec)
-                if ds:
-                    chosen_date = ds
-                    chosen_source = ds_source
-                    chosen_confidence = ds_confidence
-                    chosen_detail = f"first_allowed_in_order:index={row_idx}"
-                    break
-            if chosen_date is None:
-                chosen_detail = "no_valid_date_found"
+        candidates: list[tuple[int, int, bool, datetime | None, int, str, str, str]] = []
+        for row_idx, rec, dt in sorted_group:
+            ds, ds_source, ds_confidence = _record_date_candidate_for_consensus(rec)
+            if not ds:
+                continue
+            candidates.append(
+                (
+                    _consensus_date_source_rank(ds_source),
+                    _date_confidence_rank(ds_confidence),
+                    dt is None,
+                    dt,
+                    row_idx,
+                    ds,
+                    ds_source,
+                    ds_confidence,
+                )
+            )
+
+        if candidates:
+            best = sorted(
+                candidates,
+                key=lambda item: (
+                    -item[0],
+                    -item[1],
+                    item[2],
+                    item[3] or datetime.max,
+                    item[4],
+                ),
+            )[0]
+            (
+                _rank,
+                _confidence_rank,
+                _dt_missing,
+                _dt,
+                chosen_idx,
+                chosen_date,
+                chosen_source,
+                chosen_confidence,
+            ) = best
+            chosen_detail = f"best_order_date_evidence:index={chosen_idx}"
 
         if not chosen_date:
             _log_warning(

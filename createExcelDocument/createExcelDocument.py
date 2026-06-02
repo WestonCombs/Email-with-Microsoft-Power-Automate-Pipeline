@@ -37,6 +37,7 @@ from htmlHandler.tracking_hrefs import MULTIPLE_TRACKING_LINKS
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.hyperlink import Hyperlink
 from proofOfDelivery.pod_data import (
     AUTOMATION_HUB_CATEGORY,
@@ -193,6 +194,7 @@ def _column_order_keys() -> list[str]:
         [
             "total_amount_paid",
             "tax_paid",
+            "accounting",
             "gift_invoice_action",
         ]
     )
@@ -209,6 +211,7 @@ COLUMN_HEADERS = {
     "email":                 "Email",
     "total_amount_paid":     "Total Paid",
     "tax_paid":              "Tax Paid",
+    "accounting":            "Accounting",
     "tracking_quick_status": "Shipping Status",
     "open_tracking_list":    "View Tracking Links",
     "open_tracking_numbers_web": "View Tracking Numbers",
@@ -420,6 +423,8 @@ def _record_to_row(
             row.append(_html_file_uri_for_record(record))
         elif key == "gift_invoice_action":
             row.append(None)
+        elif key == "accounting":
+            row.append(clean_value(record.get("accounting")))
         elif key == "open_tracking_numbers_order":
             row.append(None)
         elif key == "tracking_quick_status":
@@ -480,6 +485,7 @@ def set_column_widths(ws, column_keys: list[str]):
         "email":                 30,
         "total_amount_paid":     14,
         "tax_paid":              12,
+        "accounting":            14,
         "tracking_quick_status":       40,
         "open_tracking_list":           20,
         "open_tracking_numbers_web":  22,
@@ -496,6 +502,103 @@ def set_column_widths(ws, column_keys: list[str]):
 def _col_indices(column_keys: list[str], key: str) -> list[int]:
     """Return 1-based column indices for every occurrence of *key* in *column_keys*."""
     return [i + 1 for i, k in enumerate(column_keys) if k == key]
+
+
+def _header_column_map(ws) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for col_idx in range(1, ws.max_column + 1):
+        label = ws.cell(row=HEADER_ROW, column=col_idx).value
+        if label is None:
+            continue
+        out[str(label).strip()] = col_idx
+    return out
+
+
+def _row_identity_from_sheet(ws, row_idx: int, headers: dict[str, int]) -> tuple[str, str]:
+    order_col = headers.get(COLUMN_HEADERS["order_number"])
+    source_col = headers.get(COLUMN_HEADERS["source_file_link"])
+    order_number = str(ws.cell(row=row_idx, column=order_col).value or "").strip() if order_col else ""
+    source_uri = ""
+    if source_col:
+        cell = ws.cell(row=row_idx, column=source_col)
+        if cell.hyperlink and cell.hyperlink.target:
+            source_uri = str(cell.hyperlink.target).strip()
+        elif cell.value:
+            source_uri = str(cell.value).strip()
+    return order_number, source_uri
+
+
+def _capture_existing_accounting_values(ws) -> dict[tuple[str, str], str]:
+    headers = _header_column_map(ws)
+    accounting_col = headers.get(COLUMN_HEADERS["accounting"])
+    if not accounting_col:
+        return {}
+    values: dict[tuple[str, str], str] = {}
+    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
+        value = clean_value(ws.cell(row=row_idx, column=accounting_col).value)
+        if value is None or str(value).strip() == "":
+            continue
+        key = _row_identity_from_sheet(ws, row_idx, headers)
+        if key[0] or key[1]:
+            values[key] = str(value).strip()
+    return values
+
+
+def _apply_preserved_accounting_values(
+    records: list[dict],
+    preserved: dict[tuple[str, str], str],
+) -> None:
+    if not preserved:
+        return
+    for record in records:
+        key = (
+            str(clean_value(record.get("order_number")) or "").strip(),
+            str(clean_value(record.get("source_file_link")) or "").strip(),
+        )
+        value = preserved.get(key)
+        if value is not None:
+            record["accounting"] = value
+
+
+def apply_accounting_dropdown(ws, column_keys: list[str], start_row: int = DATA_START_ROW) -> None:
+    cols = _col_indices(column_keys, "accounting")
+    if not cols:
+        return
+    max_row = max(ws.max_row, start_row)
+    for col_idx in cols:
+        letter = get_column_letter(col_idx)
+        dv = DataValidation(type="list", formula1='"Complete,Review"', allow_blank=True)
+        dv.error = "Choose Complete or Review, or leave blank."
+        dv.errorTitle = "Accounting"
+        dv.prompt = "Choose Complete or Review."
+        dv.promptTitle = "Accounting"
+        ws.add_data_validation(dv)
+        dv.add(f"{letter}{start_row}:{letter}{max_row}")
+
+
+def _migrate_accounting_column_if_missing(ws, desired_keys: list[str]) -> None:
+    headers = _header_column_map(ws)
+    if COLUMN_HEADERS["accounting"] in headers:
+        return
+    tax_col = headers.get(COLUMN_HEADERS["tax_paid"])
+    if not tax_col:
+        return
+    had_fixed_hidden_columns = ws.max_column >= COPY_PATH_URI_COL
+    insert_at = tax_col + 1
+    ws.insert_cols(insert_at)
+    if had_fixed_hidden_columns and ws.max_column >= COPY_PATH_URI_COL + 1:
+        ws.delete_cols(COPY_PATH_URI_COL)
+    cell = ws.cell(row=HEADER_ROW, column=insert_at, value=COLUMN_HEADERS["accounting"])
+    cell.fill = HEADER_FILL
+    cell.font = HEADER_FONT
+    cell.alignment = CENTER_ALIGN
+    width = 14
+    try:
+        accounting_idx = desired_keys.index("accounting") + 1
+        width = 14 if accounting_idx == insert_at else width
+    except ValueError:
+        pass
+    ws.column_dimensions[get_column_letter(insert_at)].width = width
 
 
 _FILE_LINK_DISPLAY = {
@@ -1171,11 +1274,14 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
         ws = wb.active
         ws.title = "Orders"
 
+    preserved_accounting = _capture_existing_accounting_values(ws)
+
     if ws.max_row >= 1:
         ws.delete_rows(1, ws.max_row)
 
     if hub_record is None:
         hub_record = automation_hub_record()
+    _apply_preserved_accounting_values(data_records, preserved_accounting)
     ws.append(_record_to_row(hub_record, column_keys, shipping_status_first_row=True))
     ws.append(header_labels)
     style_header_row(ws, len(column_keys))
@@ -1244,6 +1350,7 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
     apply_special_row_styles(ws, start_row=DATA_START_ROW, records=data_records, column_keys=column_keys)
 
     center_invoice_and_shipping_headers(ws, column_keys)
+    apply_accounting_dropdown(ws, column_keys)
 
     ws.freeze_panes = FREEZE_PANES_CELL
 
@@ -1477,6 +1584,8 @@ def refresh_orders_workbook_shipping_status(excel_path: str | Path) -> None:
     wb = _load_workbook_editable(str(path))
     ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
     column_keys, _ = _build_column_order()
+    _migrate_accounting_column_if_missing(ws, column_keys)
+    apply_accounting_dropdown(ws, column_keys)
 
     shipping_col_idx: int | None = None
     for c in range(1, ws.max_column + 1):
@@ -1557,11 +1666,12 @@ def append_to_workbook(path: str, records: list[dict]):
         wb, "vba_archive", None
     ) is not None
 
+    desired_keys, desired_labels = _build_column_order()
+
+    _migrate_accounting_column_if_missing(ws, desired_keys)
     existing_headers = [
         ws.cell(row=HEADER_ROW, column=c).value for c in range(1, ws.max_column + 1)
     ]
-
-    desired_keys, desired_labels = _build_column_order()
 
     if desired_labels != existing_headers:
         for col_idx, label in enumerate(desired_labels, start=1):
@@ -1656,6 +1766,7 @@ def append_to_workbook(path: str, records: list[dict]):
     apply_special_row_styles(ws, start_row=DATA_START_ROW, records=full_data_records, column_keys=desired_keys)
 
     center_invoice_and_shipping_headers(ws, desired_keys)
+    apply_accounting_dropdown(ws, desired_keys)
 
     ws.freeze_panes = FREEZE_PANES_CELL
 
