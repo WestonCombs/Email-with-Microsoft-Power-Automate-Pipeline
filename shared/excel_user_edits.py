@@ -7,11 +7,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ALLOWED_EXCEL_USER_EDIT_FIELDS = ("company", "total_amount_paid", "tax_paid")
-ALLOWED_EXCEL_USER_EDIT_LABELS = ("Company", "Total Paid", "Tax Paid")
+from shared.supplier_normalization import normalize_supplier_display_name
+
+ALLOWED_EXCEL_USER_EDIT_FIELDS = (
+    "company",
+    "purchase_datetime",
+    "total_amount_paid",
+    "tax_paid",
+)
+ALLOWED_EXCEL_USER_EDIT_LABELS = ("Company", "Purchase Date", "Total Paid", "Tax Paid")
 EXCEL_USER_EDITS_JSON_NAME = "excel_user_edits.json"
 LLM_OBTAINED_COMPANY_FIELD = "llm_obtained_company"
 ORIGINAL_LLM_OBTAINED_COMPANY_FIELD = "original_llm_obtained_company"
+PURCHASE_DATETIME_USER_EDIT_SOURCE = "user_excel_edit"
+PURCHASE_DATETIME_USER_EDIT_CONFIDENCE = "high"
 
 
 def excel_user_edits_path(project_root: Path) -> Path:
@@ -107,6 +116,9 @@ def _normalized_company_vote_key(company: Any) -> str:
     text = _clean_record_value(company)
     if not isinstance(text, str) or not text:
         return ""
+    normalized_supplier = normalize_supplier_display_name(text)
+    if normalized_supplier:
+        return normalized_supplier.casefold()
     normalized = text.casefold()
     normalized = re.sub(r"\s+", " ", normalized)
     normalized = normalized.replace("&", " and ")
@@ -121,6 +133,7 @@ def _company_consensus_value(values: list[str]) -> str | None:
         cleaned = _clean_record_value(value)
         if not isinstance(cleaned, str) or not cleaned:
             continue
+        cleaned = normalize_supplier_display_name(cleaned) or cleaned
         vote_key = _normalized_company_vote_key(cleaned)
         if not vote_key:
             continue
@@ -275,6 +288,8 @@ def coerce_user_edit_value(field: str, raw_value: Any) -> Any:
 
     if field == "company":
         return text
+    if field == "purchase_datetime":
+        return _coerce_purchase_datetime_edit(text)
 
     normalized = (
         text.replace("$", "")
@@ -288,6 +303,33 @@ def coerce_user_edit_value(field: str, raw_value: Any) -> Any:
         return round(float(normalized), 2)
     except ValueError as exc:
         raise ValueError(f"{field} must be a number-like value, got {text!r}") from exc
+
+
+def _coerce_purchase_datetime_edit(text: str) -> str:
+    text = str(text or "").strip()
+    formats = (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m-%d-%Y",
+        "%m-%d-%y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    raise ValueError(
+        "purchase_datetime must be a real date like 2026-05-22 or 5/22/2026"
+    )
 
 
 def record_identity(record: dict) -> str:
@@ -431,9 +473,12 @@ def apply_user_edits_to_records(project_root: Path, records: list[dict]) -> list
                     _clear_record_overlay(overlay, record, field)
                     overlay_changed = True
                     continue
-                record[field] = values[field]
-                record[modified_key(field)] = True
-                record["user_modified"] = True
+                _set_modified_value(
+                    record,
+                    field,
+                    values[field],
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
 
     if overlay_changed:
         save_user_edit_overlay(project_root, overlay)
@@ -461,6 +506,9 @@ def _json_paths(project_root: Path) -> tuple[Path, Path]:
 
 def _set_modified_value(record: dict, field: str, value: Any, timestamp: str) -> None:
     record[field] = value
+    if field == "purchase_datetime":
+        record["purchase_datetime_source"] = PURCHASE_DATETIME_USER_EDIT_SOURCE
+        record["purchase_datetime_confidence"] = PURCHASE_DATETIME_USER_EDIT_CONFIDENCE
     record[modified_key(field)] = True
     record["user_modified"] = True
     record["user_modified_at"] = timestamp
@@ -513,6 +561,10 @@ def _remember_original_value(overlay: dict, record: dict, field: str) -> None:
     original_values = item.setdefault("original_values", {})
     if field not in original_values:
         original_values[field] = record.get(field)
+    if field == "purchase_datetime":
+        for meta_field in ("purchase_datetime_source", "purchase_datetime_confidence"):
+            if meta_field not in original_values:
+                original_values[meta_field] = record.get(meta_field)
 
 
 def _original_value_for_clear(overlay: dict, record: dict, field: str) -> Any:
@@ -576,6 +628,9 @@ def _clear_record_overlay(overlay: dict, record: dict, field: str) -> None:
     original_values = item.get("original_values")
     if isinstance(original_values, dict):
         original_values.pop(field, None)
+        if field == "purchase_datetime":
+            original_values.pop("purchase_datetime_source", None)
+            original_values.pop("purchase_datetime_confidence", None)
         if not original_values:
             item.pop("original_values", None)
     if "values" not in item:
@@ -644,6 +699,17 @@ def record_excel_user_edit(
                 else:
                     restored_value = _original_value_for_clear(overlay, record, field)
                 _restore_unmodified_value(record, field, restored_value, timestamp)
+                if field == "purchase_datetime":
+                    record["purchase_datetime_source"] = _original_value_for_clear(
+                        overlay,
+                        record,
+                        "purchase_datetime_source",
+                    )
+                    record["purchase_datetime_confidence"] = _original_value_for_clear(
+                        overlay,
+                        record,
+                        "purchase_datetime_confidence",
+                    )
                 _clear_record_overlay(overlay, record, field)
             else:
                 _remember_original_value(overlay, record, field)

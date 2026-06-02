@@ -48,6 +48,27 @@ class PurchaseDateAccuracyTests(unittest.TestCase):
         self.assertNotIn("2026-05-13", filename)
         self.assertEqual(filename, "DOC Example Store 0001 INVOICE.pdf")
 
+    def test_missing_purchase_date_is_logged_for_review(self) -> None:
+        rows = [
+            {
+                "order_number": "A1",
+                "purchase_datetime": "",
+                "company": "Example Store",
+                "email_category": "Invoice",
+            }
+        ]
+        log_lines: list[str] = []
+        original_log = extractor.RL.log
+        try:
+            extractor.RL.log = lambda _segment, message: log_lines.append(str(message))
+            with redirect_stdout(StringIO()):
+                unify_purchase_dates_by_order(rows)
+        finally:
+            extractor.RL.log = original_log
+
+        self.assertEqual(rows[0]["purchase_datetime"], "")
+        self.assertTrue(any("could not resolve consolidated purchase date" in line for line in log_lines))
+
     def test_verified_order_date_from_same_order_is_shared(self) -> None:
         rows = [
             {
@@ -73,10 +94,51 @@ class PurchaseDateAccuracyTests(unittest.TestCase):
         self.assertEqual(rows[1]["purchase_datetime"], "2026-04-28")
         self.assertEqual(
             rows[0]["purchase_datetime_source"],
-            "order_consensus:source=explicit_order_date;first_allowed_in_order:index=1",
+            "order_consensus:source=explicit_order_date;best_order_date_evidence:index=1",
         )
         self.assertEqual(rows[0]["purchase_datetime_confidence"], "medium")
         self.assertIn("2026-04-28", build_convention_filename(rows[0]))
+
+    def test_invoice_order_date_beats_delivery_event_date_for_order(self) -> None:
+        rows = [
+            {
+                "source_file": "delivered.html",
+                "order_number": "228928",
+                "purchase_datetime": "2026-02-26",
+                "purchase_datetime_source": "event_date",
+                "purchase_datetime_confidence": "high",
+                "company": "Natasha Denona",
+                "email_category": "Delivered",
+            },
+            {
+                "source_file": "invoice.html",
+                "order_number": "228928",
+                "purchase_datetime": "2026-02-26",
+                "purchase_datetime_source": "order_consensus:source=event_date;earliest_row_extracted:index=0",
+                "purchase_datetime_confidence": "high",
+                "company": "Natasha Denona",
+                "email_category": "Invoice",
+            },
+        ]
+
+        original_html_reader = extractor._candidate_html_text_for_record
+        try:
+            extractor._candidate_html_text_for_record = lambda record: (
+                "Order No. 228928 February 20, 2026"
+                if record.get("source_file") == "invoice.html"
+                else ""
+            )
+            with redirect_stdout(StringIO()):
+                unify_purchase_dates_by_order(rows)
+        finally:
+            extractor._candidate_html_text_for_record = original_html_reader
+
+        self.assertEqual(rows[0]["purchase_datetime"], "2026-02-20")
+        self.assertEqual(rows[1]["purchase_datetime"], "2026-02-20")
+        self.assertEqual(
+            rows[1]["purchase_datetime_source"],
+            "order_consensus:source=html_text;best_order_date_evidence:index=1",
+        )
 
 
 if __name__ == "__main__":
