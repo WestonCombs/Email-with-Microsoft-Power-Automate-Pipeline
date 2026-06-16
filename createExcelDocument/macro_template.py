@@ -233,6 +233,8 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
     If LCase$(resultMode) = "cleared" Then
         If fieldKey = "company" And Len(orderNumber) > 0 Then
             EmailSorter_ApplyCompanyEditToOrder Sh, orderNumber, resultValue, False, resultValueKind
+        ElseIf fieldKey = "purchase_datetime" And Len(orderNumber) > 0 Then
+            EmailSorter_ApplyFieldEditToOrder Sh, orderNumber, "Purchase Date", resultValue, False, resultValueKind
         Else
             EmailSorter_ApplyPlainCellValue Target, resultValue, resultValueKind
         End If
@@ -243,7 +245,11 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
             Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
         End If
     ElseIf fieldKey = "purchase_datetime" Then
-        Target.Value = EmailSorter_DisplayModifiedValue(resultValue)
+        If Len(orderNumber) > 0 Then
+            EmailSorter_ApplyFieldEditToOrder Sh, orderNumber, "Purchase Date", resultValue
+        Else
+            Target.Value = EmailSorter_DisplayModifiedValue(resultValue)
+        End If
     Else
         Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
     End If
@@ -467,6 +473,30 @@ Private Sub EmailSorter_ApplyCompanyEditToOrder(ByVal Sh As Object, ByVal orderN
                 Sh.Cells(r, companyCol).Value = EmailSorter_DisplayModifiedValue(cleanValue)
             Else
                 EmailSorter_ApplyPlainCellValue Sh.Cells(r, companyCol), cleanValue, valueKind
+            End If
+        End If
+    Next r
+End Sub
+
+Private Sub EmailSorter_ApplyFieldEditToOrder(ByVal Sh As Object, ByVal orderNumber As String, ByVal headerLabel As String, ByVal cleanValue As String, Optional ByVal markModified As Boolean = True, Optional ByVal valueKind As String = "text")
+    Dim orderCol As Long
+    Dim fieldCol As Long
+    Dim lastData As Long
+    Dim r As Long
+
+    orderCol = HeaderColumn(Sh, "Order Number")
+    fieldCol = HeaderColumn(Sh, headerLabel)
+    If orderCol = 0 Or fieldCol = 0 Then Exit Sub
+    On Error Resume Next
+    lastData = Sh.Cells(Sh.Rows.Count, orderCol).End(xlUp).Row
+    On Error GoTo 0
+    If lastData < HeaderRow(Sh) + 1 Then Exit Sub
+    For r = HeaderRow(Sh) + 1 To lastData
+        If EmailSorter_CleanSubmittedValue(Sh.Cells(r, orderCol).Value) = orderNumber Then
+            If markModified Then
+                Sh.Cells(r, fieldCol).Value = EmailSorter_DisplayModifiedValue(cleanValue)
+            Else
+                EmailSorter_ApplyPlainCellValue Sh.Cells(r, fieldCol), cleanValue, valueKind
             End If
         End If
     Next r

@@ -4,7 +4,7 @@ Email Sorter replaces a Power Automate flow with a local Python pipeline and des
 
 1. Sign in to Microsoft Graph and fetch email bodies/attachments
 2. Extract structured order data with OpenAI
-3. Track shipment links/numbers and cache 17TRACK status
+3. Extract shipment links/numbers for carrier-page viewing and POD capture
 4. Build and maintain an Excel workbook (`orders.xlsm` when macro template is available)
 5. Support post-processing workflows (gift invoice linking, proof-of-delivery sync/capture, Excel user edits back to JSON)
 
@@ -35,7 +35,6 @@ python email_sorter_launcher.py
    - `AZURE_CLIENT_ID`
    - `AZURE_TENANT_ID` (optional override; defaults to `common`)
    - `OPENAI_API_KEY`
-   - `SEVENTEEN_TRACK_API_KEY`
 3. Click **Run** (or run `python mainRunner.py` directly).
 
 ## Main Pipeline (mainRunner.py)
@@ -89,7 +88,7 @@ Workbook capabilities:
   - View Tracking Links
   - View Tracking Numbers
   - View Tracking Numbers (All For Order)
-  - Shipping Status (17TRACK viewer)
+  - POD workflow / capture viewer
 - Gift invoice workflow launch from `Invoice Link`
 - Triple-Escape edit mode:
   - top-row rainbow cycle while armed
@@ -115,19 +114,17 @@ Workbook capabilities:
 - `web` mode: per-number quick open to carrier page
 - `order` mode: aggregated by tracking ID with frequency
 
-### Shipping status viewer (17TRACK)
+### POD capture viewer
 
 `trackingNumbersViewer/tracking_status_viewer.py`
 
-- Smart cache-backed 17TRACK status lookups
+- Lists parser-found tracking numbers without live tracking API validation
 - Row highlighting:
   - green: processed POD exists
-  - gray: NotFound temporary/final retry state
 - Right-click menu includes:
   - `Open` (plain browser open, no automation dependency)
   - `Delete` on processed rows (removes POD PDF + JSON references, marks as unprocessed again)
-  - `Force Check Tracking Number`
-- Assisted PDF capture controls (`Play`/`Pause`, toggle)
+- Assisted PDF capture controls
 
 ### POD data/workflow
 
@@ -149,7 +146,6 @@ Core settings keys:
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID` (runtime default: `common`)
 - `OPENAI_API_KEY`
-- `SEVENTEEN_TRACK_API_KEY`
 - `DEBUG_MODE`
 - `LOGIN_NEW_ACCOUNT_NEXT_RUN`
 
@@ -163,7 +159,6 @@ Common runtime env keys:
 - `EXCEL_CLIPBOARD_INI_PATH`
 - `EXCEL_OUTPUT_PATH`
 - `OPENAI_TRACKING_PDF_MODEL`
-- `SEVENTEEN_TRACK_MIN_INTERVAL_SEC`
 
 ## Authentication (Microsoft Graph)
 

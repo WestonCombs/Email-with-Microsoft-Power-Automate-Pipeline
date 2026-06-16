@@ -665,7 +665,7 @@ def record_excel_user_edit(
     for path, records in file_records:
         changed_by_path[path] = ensure_llm_obtained_company_fields(records, overlay)
         for record in records:
-            if field == "company" and clean_order:
+            if field in {"company", "purchase_datetime"} and clean_order:
                 match = str(record.get("order_number") or "").strip() == clean_order
             else:
                 match = record_matches_source_uri(record, source_uri)

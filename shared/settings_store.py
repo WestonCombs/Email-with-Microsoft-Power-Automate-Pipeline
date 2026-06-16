@@ -24,7 +24,6 @@ STORED_SETTING_KEYS = frozenset(
         "AZURE_CLIENT_ID",
         "AZURE_TENANT_ID",
         "OPENAI_API_KEY",
-        "SEVENTEEN_TRACK_API_KEY",
         "DEBUG_MODE",
         "LOGIN_NEW_ACCOUNT_NEXT_RUN",
         "DELETE_SAVED_EMAIL_DATA_NEXT_RUN",
@@ -38,7 +37,6 @@ ENV_FALLBACK_SETTING_KEYS = frozenset(
         "AZURE_CLIENT_ID",
         "AZURE_TENANT_ID",
         "OPENAI_API_KEY",
-        "SEVENTEEN_TRACK_API_KEY",
         "DEBUG_MODE",
     }
 )

@@ -34,7 +34,14 @@ class ExcelPurchaseDateEditTests(unittest.TestCase):
                             "purchase_datetime": "",
                             "email_category": "Invoice",
                             "company": "Example Store",
-                        }
+                        },
+                        {
+                            "source_file_link": "file:///C:/tmp/DOC Example Store 1234 SHIPPED.pdf",
+                            "order_number": "1234",
+                            "purchase_datetime": "",
+                            "email_category": "Shipped",
+                            "company": "Example Store",
+                        },
                     ],
                     indent=2,
                 ),
@@ -51,10 +58,15 @@ class ExcelPurchaseDateEditTests(unittest.TestCase):
 
             rows = json.loads(results_path.read_text(encoding="utf-8"))
             self.assertEqual(rows[0]["purchase_datetime"], "2026-05-22")
+            self.assertEqual(rows[1]["purchase_datetime"], "2026-05-22")
             self.assertEqual(rows[0]["purchase_datetime_source"], "user_excel_edit")
+            self.assertEqual(rows[1]["purchase_datetime_source"], "user_excel_edit")
             self.assertEqual(rows[0]["purchase_datetime_confidence"], "high")
+            self.assertEqual(rows[1]["purchase_datetime_confidence"], "high")
             self.assertTrue(rows[0]["modified_purchase_datetime"])
+            self.assertTrue(rows[1]["modified_purchase_datetime"])
             self.assertEqual(summary["display_value"], "2026-05-22")
+            self.assertEqual(summary["matched_records"], 2)
 
     def test_purchase_date_edit_rejects_not_a_date(self) -> None:
         with self.assertRaises(ValueError):
@@ -64,6 +76,7 @@ class ExcelPurchaseDateEditTests(unittest.TestCase):
         self.assertIn("Purchase Date", macro_template.EMAIL_SORTER_HOTKEYS_VBA)
         self.assertIn('Case "purchase date"', macro_template.EMAIL_SORTER_HOTKEYS_VBA)
         self.assertIn('EmailSorter_FieldKeyForColumn = "purchase_datetime"', macro_template.EMAIL_SORTER_HOTKEYS_VBA)
+        self.assertIn("EmailSorter_ApplyFieldEditToOrder Sh, orderNumber, \"Purchase Date\"", macro_template.EMAIL_SORTER_HOTKEYS_VBA)
 
 
 if __name__ == "__main__":

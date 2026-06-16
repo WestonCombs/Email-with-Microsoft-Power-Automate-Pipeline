@@ -34,6 +34,7 @@ class ExcelAccountingColumnTests(unittest.TestCase):
                     "purchase_datetime": "2026-05-22",
                     "company": "Walgreens",
                     "total_amount_paid": 10.0,
+                    "subtotal_amount": 9.0,
                     "tax_paid": 1.0,
                 }
             ],
@@ -41,8 +42,14 @@ class ExcelAccountingColumnTests(unittest.TestCase):
         ws = wb["Orders"]
         keys, _labels = excel_doc._build_column_order()
         accounting_col = keys.index("accounting") + 1
+        subtotal_col = keys.index("subtotal_amount") + 1
+        total_col = keys.index("total_amount_paid") + 1
         tax_col = keys.index("tax_paid") + 1
+        self.assertEqual(subtotal_col, total_col + 1)
+        self.assertEqual(tax_col, subtotal_col + 1)
         self.assertEqual(accounting_col, tax_col + 1)
+        self.assertEqual(ws.cell(row=excel_doc.HEADER_ROW, column=subtotal_col).value, "Subtotal")
+        self.assertEqual(ws.cell(row=excel_doc.DATA_START_ROW, column=subtotal_col).value, 9.0)
         self.assertEqual(ws.cell(row=excel_doc.HEADER_ROW, column=accounting_col).value, "Accounting")
         self.assertIsNone(ws.cell(row=excel_doc.DATA_START_ROW, column=accounting_col).value)
         validations = list(ws.data_validations.dataValidation)
@@ -82,6 +89,7 @@ class ExcelAccountingColumnTests(unittest.TestCase):
         row[old_labels.index("Purchase Date")] = "2026-05-22"
         row[old_labels.index("Company")] = "Walgreens"
         row[old_labels.index("Total Paid")] = 10
+        row[old_labels.index("Subtotal")] = 9
         row[old_labels.index("Tax Paid")] = 1
         row[old_labels.index("Invoice Link")] = "Invoice Link"
         ws.append(row)

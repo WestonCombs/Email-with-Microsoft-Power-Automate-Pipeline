@@ -71,9 +71,11 @@ def _openai_fields_log_line(extracted: dict) -> str:
         "company",
         "order_number",
         "purchase_datetime",
+        "subtotal_amount",
         "email_category",
         "total_amount_paid",
         "tax_paid",
+        "gift_card_amount",
     )
     parts: list[str] = []
     for k in keys:
@@ -1436,12 +1438,22 @@ Important rules:
 3. If a value is missing or unclear, return null.
 4. order_number is the retailer's confirmation/order ID (e.g. "112-3456789-1234567").
 5. total_amount_paid should be the exact total paid as a number if possible.
-6. tax_paid should be the tax dollar amount if present, or null if unknown.
-7. purchase_datetime should be "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD".
-8. company should be the retailer/store/merchant, not the recipient's name.
-9. order_number: check the subject line first, then the body. Strip any leading "#".
-10. Do NOT guess. If something is not clearly present, use null.
-11. tracking_numbers: Every distinct shipping carrier tracking ID visible in the text (e.g. UPS
+6. subtotal_amount should be the merchandise/order subtotal before tax, shipping, discounts,
+   gift cards, rewards, or store credit, if a subtotal is clearly shown.
+7. tax_paid should be the tax dollar amount if present, or null if unknown.
+8. gift_card_amount should be the amount paid by gift card, store credit, reward dollars,
+   or applied balance if clearly used as payment toward this order. Use null if none is shown
+   or if "gift card" is only the product being purchased.
+9. tax_was_paid should be true when tax was charged/paid, false when tax is explicitly zero
+   or not charged, and null when unclear.
+10. purchase_datetime should be "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD".
+11. company should be the retailer/store/merchant, not the recipient's name.
+12. order_number: check the subject line first, then the body. Strip any leading "#".
+13. Do NOT guess. If something is not clearly present, use null.
+14. invoice_total_needs_review should be true if subtotal/tax/gift card/total lines are
+   ambiguous, contradictory, unlabeled, duplicated, or cannot be reconciled confidently.
+   Explain the ambiguity in invoice_total_review_reason.
+15. tracking_numbers: Every distinct shipping carrier tracking ID visible in the text (e.g. UPS
     "1Z999AA10123456784", USPS 22- or 30-digit, FedEx 12-digit). NOT the retail order number —
     only IDs assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
     Include each real ID once (no duplicates). Use an empty array [] if none are clearly present.
@@ -1491,9 +1503,29 @@ EMAIL TEXT:
                             "type": ["number", "null"],
                             "description": "Exact total amount paid.",
                         },
+                        "subtotal_amount": {
+                            "type": ["number", "null"],
+                            "description": "Subtotal before tax, gift cards, store credit, rewards, and discounts.",
+                        },
                         "tax_paid": {
                             "type": ["number", "null"],
                             "description": "Tax amount in dollars, or null if unknown.",
+                        },
+                        "gift_card_amount": {
+                            "type": ["number", "null"],
+                            "description": "Amount paid by gift card, store credit, rewards, or applied balance.",
+                        },
+                        "tax_was_paid": {
+                            "type": ["boolean", "null"],
+                            "description": "Whether tax was charged or paid.",
+                        },
+                        "invoice_total_needs_review": {
+                            "type": "boolean",
+                            "description": "True when invoice total fields are ambiguous or contradictory.",
+                        },
+                        "invoice_total_review_reason": {
+                            "type": ["string", "null"],
+                            "description": "Short explanation when invoice_total_needs_review is true.",
                         },
                         "tracking_numbers": {
                             "type": "array",
@@ -1526,7 +1558,12 @@ EMAIL TEXT:
                         "order_number",
                         "purchase_datetime",
                         "total_amount_paid",
+                        "subtotal_amount",
                         "tax_paid",
+                        "gift_card_amount",
+                        "tax_was_paid",
+                        "invoice_total_needs_review",
+                        "invoice_total_review_reason",
                         "tracking_numbers",
                         "email_category",
                         "email_category_confidence",
@@ -1618,7 +1655,12 @@ def process_file(
         "order_number": None,
         "purchase_datetime": None,
         "total_amount_paid": None,
+        "subtotal_amount": None,
         "tax_paid": None,
+        "gift_card_amount": None,
+        "tax_was_paid": None,
+        "invoice_total_needs_review": False,
+        "invoice_total_review_reason": None,
         "tracking_numbers": [],
         "email_category": "Unknown",
         "email_category_confidence": 0,
@@ -1981,7 +2023,12 @@ def process_file(
             "purchase_datetime_source": clean_text(purchase_datetime_source),
             "purchase_datetime_confidence": clean_text(purchase_datetime_confidence),
             "total_amount_paid": extracted.get("total_amount_paid"),
+            "subtotal_amount": extracted.get("subtotal_amount"),
             "tax_paid": extracted.get("tax_paid"),
+            "gift_card_amount": extracted.get("gift_card_amount"),
+            "tax_was_paid": extracted.get("tax_was_paid"),
+            "invoice_total_needs_review": bool(extracted.get("invoice_total_needs_review")),
+            "invoice_total_review_reason": clean_text(extracted.get("invoice_total_review_reason")),
             "tracking_numbers": tracking_numbers_out,
             "tracking_numbers_link_confirmed": tracking_numbers_link_confirmed,
             "tracking_links": tracking_links,
@@ -2016,7 +2063,12 @@ def process_file(
             "purchase_datetime_source": None,
             "purchase_datetime_confidence": "low",
             "total_amount_paid": None,
+            "subtotal_amount": None,
             "tax_paid": None,
+            "gift_card_amount": None,
+            "tax_was_paid": None,
+            "invoice_total_needs_review": False,
+            "invoice_total_review_reason": None,
             "tracking_numbers": [],
             "tracking_numbers_link_confirmed": [],
             "tracking_links": [],
@@ -3006,6 +3058,12 @@ def _write_results_with_consensus(
     apply_order_company_consensus_and_sync(results, base)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
+    try:
+        from shared.help_ai import sync_help_ai_requests_for_records
+
+        sync_help_ai_requests_for_records(base, results)
+    except Exception as exc:
+        _log_warning("grabbingImportantEmailContent", f"Help AI request sync skipped: {exc}")
 
 
 # =========================

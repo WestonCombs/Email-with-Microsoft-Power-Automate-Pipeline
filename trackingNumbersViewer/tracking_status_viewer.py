@@ -1,5 +1,5 @@
 """
-17TRACK shipping status viewer (smart cache + milestones).
+Tracking/POD viewer with assisted proof-of-delivery capture.
 
 Reads the same temp file format as ``tracking_numbers_viewer`` (one number per line;
 optional ``number<TAB>0|1``). Optional ``.ctx.tsv`` beside the file supplies row context.
@@ -12,9 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import sys
+import threading
+import time
 import webbrowser
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,7 +31,11 @@ if str(_PYTHON_FILES_DIR) not in sys.path:
 
 from shared.gui_aux_singleton import detach_console_win32, register_current_aux_gui
 from shared.gui_treeview_copy import treeview_cell_text, treeview_row_text_tsv
-from htmlHandler.carrier_urls import normalize_carrier_for_public_url, public_tracking_url
+from htmlHandler.carrier_urls import (
+    infer_carrier,
+    normalize_carrier_for_public_url,
+    public_tracking_url,
+)
 from proofOfDelivery.pod_data import (
     POD_HUB_MODE,
     delete_processed_tracking_artifacts,
@@ -43,14 +51,6 @@ from tracking_pdf_audit import audit_path, load_tracking_pdf_audit_entries
 from tracking_pdf_capture import (
     read_hands_free_capture_enabled,
     write_hands_free_capture_enabled,
-)
-from trackingNumbersViewer.seventeen_track_api import api_key_from_env
-from trackingNumbersViewer.seventeen_track_smart import (
-    carrier_display_for_number,
-    fetch_tracking_smart,
-    load_cache,
-    quick_status_from_cache,
-    tracking_is_greyed_out,
 )
 from launcher_progress_ui import THEME
 from shared.tk_launcher_theme import (
@@ -68,6 +68,18 @@ _ROW_GREYED = "greyed_out"
 _ROW_POD_COMPLETE = "pod_pdf_saved"
 
 _NOTFOUND_STATUS_RE = re.compile(r"\bnot[\s_-]?found\b", re.IGNORECASE)
+
+
+def carrier_display_for_number(tracking_number: object) -> str:
+    return infer_carrier(str(tracking_number or "")) or "Unknown"
+
+
+def quick_status_from_cache(_tracking_number: object) -> str:
+    return ""
+
+
+def tracking_is_greyed_out(_tracking_number: object) -> bool:
+    return False
 
 
 def _quick_status_indicates_notfound(quick_status: str) -> bool:
@@ -211,8 +223,6 @@ class TrackingStatusViewerApp:
             if derived_company:
                 self._context["company"] = derived_company
 
-        self._row_infos = self._build_row_infos(numbers)
-        self._numbers = [str(info["tracking_number"]) for info in self._row_infos]
         self._hands_free_sync_after_id: str | None = None
         self._hands_free_state_syncing = False
         self._hands_free_capture_running = False
@@ -245,12 +255,55 @@ class TrackingStatusViewerApp:
         self._root.title(
             "Remaining PODs — proof of delivery"
             if self._hub_remaining_mode
-            else "Shipping status (17TRACK)"
+            else "Tracking numbers"
         )
         self._root.minsize(760, 400)
         self._root.geometry("960x520")
         apply_launcher_theme_root(self._root)
         configure_launcher_ttk_styles(self._root)
+
+        loading_frame = ttk.Frame(self._root, style="Launcher.TFrame", padding=18)
+        loading_frame.pack(fill=tk.BOTH, expand=True)
+        tk.Label(
+            loading_frame,
+            text="Loading POD tracking rows...",
+            fg=THEME["fg"],
+            bg=THEME["bg"],
+            font=theme_font("title"),
+            anchor=tk.W,
+        ).pack(fill=tk.X, anchor=tk.W)
+        tk.Label(
+            loading_frame,
+            text="Checking saved POD PDFs and preparing the capture list.",
+            fg=THEME["muted"],
+            bg=THEME["bg"],
+            font=theme_font("body"),
+            anchor=tk.W,
+        ).pack(fill=tk.X, anchor=tk.W, pady=(6, 12))
+        self._load_status_var = tk.StringVar(value="Starting...")
+        tk.Label(
+            loading_frame,
+            textvariable=self._load_status_var,
+            fg=THEME["muted"],
+            bg=THEME["bg"],
+            font=theme_font("body"),
+            anchor=tk.W,
+        ).pack(fill=tk.X, anchor=tk.W, pady=(0, 6))
+        loading_var = tk.DoubleVar(value=0.0)
+        loading_bar = ttk.Progressbar(
+            loading_frame,
+            mode="determinate",
+            variable=loading_var,
+            maximum=100,
+            length=420,
+        )
+        loading_bar.pack(fill=tk.X)
+        self._root.update_idletasks()
+
+        self._row_infos = self._load_row_infos_with_progress(numbers, loading_var)
+        self._numbers = [str(info["tracking_number"]) for info in self._row_infos]
+
+        loading_frame.destroy()
 
         self._frm = ttk.Frame(self._root, style="Launcher.TFrame", padding=8)
         self._frm.pack(fill=tk.BOTH, expand=True)
@@ -281,8 +334,8 @@ class TrackingStatusViewerApp:
         tk.Label(
             hint_frame,
             text=(
-                "NotFound tracking numbers appear with a grey row highlight for two weeks and expire "
-                "after a final retry occurs two weeks after their first check."
+                "Rows stay available for POD capture whenever the email parser found a tracking number. "
+                "Saved POD PDFs appear in green."
             ),
             wraplength=920,
             anchor=tk.W,
@@ -306,20 +359,20 @@ class TrackingStatusViewerApp:
         tk.Label(demo, text="processed", **settings_label_opts()).pack(side=tk.LEFT, padx=(0, 12))
         tk.Label(
             demo,
-            text=" GREY ",
+            text=" DARK ",
             bg="#475569",
             fg="#e2e8f0",
             padx=6,
             pady=2,
         ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Label(demo, text="NotFound / temporary", **settings_label_opts()).pack(side=tk.LEFT)
+        tk.Label(demo, text="needs POD", **settings_label_opts()).pack(side=tk.LEFT)
 
-        if not api_key_from_env():
+        if False:
             tk.Label(
                 self._frm,
                 text=(
-                    "No SEVENTEEN_TRACK_API_KEY — only cached tracking data will appear. "
-                    "Set the 17TRACK key in Email Sorter Settings."
+                    "Live tracking validation has been removed. "
+                    "Parser-found tracking numbers remain available for POD capture."
                 ),
                 wraplength=920,
                 anchor=tk.W,
@@ -407,7 +460,7 @@ class TrackingStatusViewerApp:
         self._pod_poll_after_id = None
         self._apply_pod_completion_layout(initial=True)
 
-        key = api_key_from_env()
+        key = None
         if key and self._row_infos:
             for idx, info in enumerate(self._row_infos):
                 num = str(info["tracking_number"])
@@ -472,9 +525,68 @@ class TrackingStatusViewerApp:
         except tk.TclError:
             pass
 
-    def _build_row_infos(self, numbers: list[str]) -> list[dict[str, object]]:
+    def _load_row_infos_with_progress(
+        self,
+        numbers: list[str],
+        loading_var: tk.DoubleVar,
+    ) -> list[dict[str, object]]:
+        work_q: queue.Queue[tuple[str, object]] = queue.Queue()
+
+        def progress(done: int, total: int) -> None:
+            work_q.put(("progress", (done, total)))
+
+        def worker() -> None:
+            try:
+                work_q.put(("done", self._build_row_infos(numbers, progress_callback=progress)))
+            except Exception as exc:
+                work_q.put(("error", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+        rows: list[dict[str, object]] | None = None
+        error: Exception | None = None
+        while rows is None and error is None:
+            try:
+                while True:
+                    kind, payload = work_q.get_nowait()
+                    if kind == "progress":
+                        done, total = payload  # type: ignore[misc]
+                        total_int = max(int(total), 1)
+                        done_int = max(0, min(int(done), total_int))
+                        pct = int(100 * done_int / total_int)
+                        loading_var.set(pct)
+                        self._load_status_var.set(
+                            f"Scanned {done_int} of {total_int} order records..."
+                        )
+                    elif kind == "done":
+                        rows = payload  # type: ignore[assignment]
+                    elif kind == "error":
+                        error = payload if isinstance(payload, Exception) else Exception(str(payload))
+            except queue.Empty:
+                pass
+            try:
+                self._root.update()
+            except tk.TclError:
+                return []
+            if rows is None and error is None:
+                time.sleep(0.03)
+        if error is not None:
+            messagebox.showerror("Tracking", f"Could not load POD tracking rows:\n{error}")
+            return []
+        loading_var.set(100)
+        self._load_status_var.set("Done.")
+        try:
+            self._root.update_idletasks()
+        except tk.TclError:
+            pass
+        return rows or []
+
+    def _build_row_infos(
+        self,
+        numbers: list[str],
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> list[dict[str, object]]:
         if self._hub_remaining_mode and self._project_root is not None:
-            rows = pod_status_viewer_rows(self._project_root)
+            rows = pod_status_viewer_rows(self._project_root, progress_callback=progress_callback)
             out: list[dict[str, object]] = []
             for row in rows:
                 num = str(row.get("tracking_number") or "").strip()
@@ -488,7 +600,7 @@ class TrackingStatusViewerApp:
                         "purchase_datetime": str(row.get("purchase_datetime") or "").strip(),
                         "order_number": str(row.get("order_number") or "").strip(),
                         "category": str(row.get("category") or "").strip(),
-                        "quick_status": quick_status_from_cache(num) or "—",
+                        "quick_status": "Needs POD",
                         "greyed_out": bool(row.get("greyed_out")),
                     }
                 )
@@ -499,9 +611,14 @@ class TrackingStatusViewerApp:
         purchase_datetime = str(self._context.get("purchase_datetime") or "").strip()
         order_number = str(self._context.get("order_number") or "").strip()
         category = str(self._context.get("email_category") or self._context.get("category") or "").strip()
-        for num in numbers:
+        total = len(numbers)
+        if progress_callback is not None:
+            progress_callback(0, total)
+        for idx, num in enumerate(numbers, start=1):
             s_num = str(num or "").strip()
             if not s_num:
+                if progress_callback is not None:
+                    progress_callback(idx, total)
                 continue
             out.append(
                 {
@@ -511,10 +628,12 @@ class TrackingStatusViewerApp:
                     "purchase_datetime": purchase_datetime,
                     "order_number": order_number,
                     "category": category,
-                    "quick_status": quick_status_from_cache(s_num) or "—",
+                    "quick_status": "Needs POD",
                     "greyed_out": tracking_is_greyed_out(s_num),
                 }
             )
+            if progress_callback is not None:
+                progress_callback(idx, total)
         return out
 
     def _selected_index(self) -> int | None:
@@ -593,10 +712,6 @@ class TrackingStatusViewerApp:
             self._tree_menu.add_command(label="Open", command=self._open_carrier_in_browser_only)
             if self._context_menu_can_delete():
                 self._tree_menu.add_command(label="Delete", command=self._delete_selected_processed_row)
-            self._tree_menu.add_command(
-                label="Force Check Tracking Number",
-                command=self._force_check_selected_tracking_number,
-            )
             self._tree_menu.add_separator()
             self._tree_menu.add_command(label="Copy cell", command=self._copy_context_cell)
             self._tree_menu.add_command(label="Copy row", command=self._copy_context_row)
@@ -704,8 +819,7 @@ class TrackingStatusViewerApp:
         return self._processed_pdf_path_for_info(info) is not None
 
     def _has_grey_status(self, info: dict[str, object]) -> bool:
-        quick_status = str(info.get("quick_status") or quick_status_from_cache(str(info.get("tracking_number") or "")) or "")
-        return bool(info.get("greyed_out")) or _quick_status_indicates_notfound(quick_status)
+        return False
 
     def _is_grey_row(self, info: dict[str, object]) -> bool:
         return (not self._is_processed(info)) and self._has_grey_status(info)
@@ -796,6 +910,7 @@ class TrackingStatusViewerApp:
     def _render_row(self, idx: int, info: dict[str, object]) -> None:
         num = str(info.get("tracking_number") or "").strip()
         carrier = str(info.get("carrier") or "").strip() or carrier_display_for_number(num)
+        info["quick_status"] = "POD saved" if self._is_processed(info) else str(info.get("quick_status") or "Needs POD")
         quick_status = str(info.get("quick_status") or quick_status_from_cache(num) or "—")
         values: tuple[object, ...] = (
             idx + 1,
@@ -1211,8 +1326,7 @@ class TrackingStatusViewerApp:
         if self._is_grey_row(info):
             messagebox.showinfo(
                 "PDF capture",
-                "This tracking number is greyed out after a final automatic NotFound retry.\n\n"
-                "Right-click it and choose Force Check Tracking Number to retry 17TRACK.",
+                "This tracking number is temporarily unavailable for assisted capture.",
             )
             return False
         url = self._carrier_url_for_index(idx)
@@ -1275,49 +1389,10 @@ class TrackingStatusViewerApp:
         self._open_carrier_in_browser_only()
 
     def _force_check_selected_tracking_number(self) -> None:
-        idx = self._selected_index()
-        if idx is None or idx < 0 or idx >= len(self._row_infos):
-            return
-        key = api_key_from_env()
-        if not key:
-            messagebox.showerror(
-                "Force Check Tracking Number",
-                "No 17TRACK API key is configured (set SEVENTEEN_TRACK_API_KEY in Email Sorter Settings).",
-            )
-            return
-        info = self._info_for_index(idx)
-        num = str(info.get("tracking_number") or "").strip()
-        if not num:
-            return
-        try:
-            result = fetch_tracking_smart(
-                key,
-                num,
-                force_refresh=True,
-                purchase_datetime=info.get("purchase_datetime"),
-            )
-        except Exception as exc:
-            messagebox.showerror("Force Check Tracking Number", f"17TRACK force check failed:\n{exc}")
-            return
-
-        info["quick_status"] = str(result.get("quick_status_label") or "—")
-        info["carrier"] = str(result.get("carrier_display") or info.get("carrier") or carrier_display_for_number(num))
-        info["greyed_out"] = bool(result.get("greyed_out"))
-        if self._project_root is not None:
-            self._apply_pod_completion_layout()
-        else:
-            self._render_row(idx, info)
-
-        if bool(result.get("greyed_out")):
-            messagebox.showinfo(
-                "Force Check Tracking Number",
-                "17TRACK still returned NotFound for this tracking number.",
-            )
-        else:
-            messagebox.showinfo(
-                "Force Check Tracking Number",
-                "17TRACK returned active tracking data and the row was restored.",
-            )
+        messagebox.showinfo(
+            "Tracking",
+            "Live tracking validation has been removed. The POD list keeps parser-found tracking numbers available for capture.",
+        )
 
     def run(self) -> None:
         self._root.mainloop()
@@ -1334,7 +1409,7 @@ def main() -> int:
     except Exception:
         pass
 
-    parser = argparse.ArgumentParser(description="View shipping status (17TRACK smart cache).")
+    parser = argparse.ArgumentParser(description="View tracking numbers and POD capture status.")
     parser.add_argument(
         "number_file",
         nargs="?",

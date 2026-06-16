@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
 from trackingNumbersViewer.mitm_readiness import sanitize_filename_token
+from htmlHandler.carrier_urls import infer_carrier
 
 POD_CATEGORY = "POD"
 AUTOMATION_HUB_CATEGORY = "Automation Hub"
@@ -18,6 +21,7 @@ AUTOMATION_HUB_COMPANY_LABEL = "Proof of Delivery"
 AUTOMATION_HUB_STATUS_LABEL = "Process Remaining PODs"
 POD_HUB_MODE = "remaining_pod_hub"
 PROOF_OF_DELIVERY_JSON_NAME = "proof_of_delivery.json"
+POD_ARCHIVE_DIR_NAME = "pod_archive"
 _LEGACY_CATEGORY_SUFFIX_MAP = {
     "Invoice": "INVOICE",
     "Shipped": "SHIPPED",
@@ -41,6 +45,44 @@ def proof_of_delivery_json_path(project_root: Path) -> Path:
 
 def pdf_output_dir(project_root: Path) -> Path:
     return project_root / "email_contents" / "pdf"
+
+
+def pod_archive_dir() -> Path:
+    """Long-lived POD backup outside ``email_contents`` cleanup."""
+    return Path(__file__).resolve().parent / POD_ARCHIVE_DIR_NAME
+
+
+def backup_pod_pdf(pdf_path: str | Path) -> Path | None:
+    """Copy a captured POD PDF into the persistent POD archive."""
+    try:
+        src = Path(pdf_path).expanduser().resolve()
+    except OSError:
+        return None
+    if not src.is_file() or src.suffix.lower() != ".pdf":
+        return None
+    archive = pod_archive_dir()
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    target = archive / src.name
+    if target.exists():
+        try:
+            if target.stat().st_size == src.stat().st_size:
+                return target
+        except OSError:
+            return None
+        stem = target.stem
+        suffix = target.suffix
+        counter = 2
+        while target.exists():
+            target = archive / f"{stem} ({counter}){suffix}"
+            counter += 1
+    try:
+        shutil.copy2(src, target)
+        return target
+    except OSError:
+        return None
 
 
 def clean_value(value: Any) -> Any:
@@ -143,12 +185,7 @@ def load_proof_of_delivery_records(project_root: Path) -> list[dict]:
 
 
 def _carrier_display_for_number(tracking_number: str) -> str:
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import carrier_display_for_number
-
-        return str(carrier_display_for_number(tracking_number) or "").strip() or "Unknown"
-    except Exception:
-        return "Unknown"
+    return str(infer_carrier(tracking_number) or "").strip() or "Unknown"
 
 
 def _purchase_date_token(value: object) -> str:
@@ -244,14 +281,39 @@ def first_existing_pdf_named(project_root: Path, basename: str) -> Path | None:
     out_dir = pdf_output_dir(project_root)
     direct = out_dir / f"{basename}.pdf"
     if direct.is_file():
+        backup_pod_pdf(direct)
         return direct
     collision_re = re.compile(rf"^{re.escape(basename)} \(\d+\)\.pdf$", re.IGNORECASE)
     try:
         for path in out_dir.glob("*.pdf"):
             if path.is_file() and collision_re.match(path.name):
+                backup_pod_pdf(path)
                 return path
     except OSError:
-        return None
+        pass
+    archive = pod_archive_dir()
+    archive_direct = archive / f"{basename}.pdf"
+    archive_candidates: list[Path] = []
+    if archive_direct.is_file():
+        archive_candidates.append(archive_direct)
+    try:
+        archive_candidates.extend(
+            path
+            for path in archive.glob("*.pdf")
+            if path.is_file() and collision_re.match(path.name)
+        )
+    except OSError:
+        pass
+    for archived in archive_candidates:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            restored = out_dir / archived.name
+            if not restored.exists():
+                shutil.copy2(archived, restored)
+            if restored.is_file():
+                return restored
+        except OSError:
+            continue
     return None
 
 
@@ -355,7 +417,10 @@ def automation_hub_record() -> dict:
         "source_file": None,
         "source_file_link": None,
         "total_amount_paid": None,
+        "subtotal_amount": None,
         "tax_paid": None,
+        "gift_card_amount": None,
+        "tax_was_paid": None,
         "tracking_numbers": [],
         "tracking_links": [],
         "tracking_numbers_link_confirmed": [],
@@ -379,12 +444,6 @@ def _pod_record_identity(record: dict) -> str:
 
 
 def discover_proof_of_delivery_records(project_root: Path, base_records: list[dict]) -> list[dict]:
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
-    except Exception:
-        def tracking_is_greyed_out(_tracking_number: str) -> bool:
-            return False
-
     discovered: list[dict] = []
     seen_links: set[str] = set()
     for source_index, record in enumerate(base_records):
@@ -396,8 +455,6 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
         source_category = clean_value(record.get("email_category"))
         source_email = clean_value(record.get("email"))
         for tracking_number in tracking_numbers_for_record(record):
-            if tracking_is_greyed_out(tracking_number):
-                continue
             carrier_display = _carrier_display_for_number(tracking_number)
             pdf_path = expected_pod_pdf_path(
                 project_root,
@@ -431,7 +488,10 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
                     "source_file_link": source_file_link,
                     "subject": f"Proof of delivery for {company} tracking {tracking_number}",
                     "total_amount_paid": None,
+                    "subtotal_amount": None,
                     "tax_paid": None,
+                    "gift_card_amount": None,
+                    "tax_was_paid": None,
                     "tracking_numbers": [tracking_number],
                     "tracking_links": [],
                     "tracking_numbers_link_confirmed": [True],
@@ -542,12 +602,6 @@ def load_excel_records(
 
 
 def remaining_pod_candidates(project_root: Path) -> list[dict]:
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
-    except Exception:
-        def tracking_is_greyed_out(_tracking_number: str) -> bool:
-            return False
-
     base_records = load_results_records(project_root)
     seen_numbers: set[str] = set()
     out: list[dict] = []
@@ -562,8 +616,6 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
             if tracking_number in seen_numbers:
                 continue
             seen_numbers.add(tracking_number)
-            if tracking_is_greyed_out(tracking_number):
-                continue
             carrier_display = _carrier_display_for_number(tracking_number)
             pdf_path = expected_pod_pdf_path(
                 project_root,
@@ -594,19 +646,22 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
     return out
 
 
-def pod_status_viewer_rows(project_root: Path) -> list[dict]:
-    """All tracking rows for the POD/status viewer, including processed and grey rows."""
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
-    except Exception:
-        def tracking_is_greyed_out(_tracking_number: str) -> bool:
-            return False
+def pod_status_viewer_rows(
+    project_root: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict]:
+    """All tracking rows for the POD viewer, including processed rows."""
 
     base_records = load_results_records(project_root)
+    total = len(base_records)
+    if progress_callback is not None:
+        progress_callback(0, total)
     seen_numbers: set[str] = set()
     out: list[dict] = []
-    for record in base_records:
+    for idx, record in enumerate(base_records, start=1):
         if is_pod_record(record) or is_automation_hub_record(record):
+            if progress_callback is not None:
+                progress_callback(idx, total)
             continue
         company = _base_record_company(record)
         purchase_datetime = clean_value(record.get("purchase_datetime"))
@@ -633,9 +688,11 @@ def pod_status_viewer_rows(project_root: Path) -> list[dict]:
                     "order_number": order_number,
                     "category": source_category,
                     "expected_pdf_path": str(pdf_path.resolve()),
-                    "greyed_out": bool(tracking_is_greyed_out(tracking_number)),
+                    "greyed_out": False,
                 }
             )
+        if progress_callback is not None:
+            progress_callback(idx, total)
     return out
 
 

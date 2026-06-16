@@ -1,7 +1,6 @@
 import importlib.util
 import json
 import os
-from collections.abc import Callable
 from copy import copy
 import re
 import sys
@@ -119,7 +118,7 @@ EXCEL_PATH = str(
 TRACKING_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingLinkViewer" / "tracking_link_viewer.py"
 # TRACKING_NUMBERS_VIEWER= in ini — "View Tracking Numbers" / "order" aggregate modes.
 TRACKING_NUMBERS_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingNumbersViewer" / "tracking_numbers_viewer.py"
-# TRACKING_STATUS_VIEWER= — "Shipping Status" column click → 17TRACK status viewer.
+# TRACKING_STATUS_VIEWER= — "Shipping Status" column click -> POD/tracking viewer.
 TRACKING_STATUS_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingNumbersViewer" / "tracking_status_viewer.py"
 # Launched from VBA (GIFTCARD_LINK= in ini) when the user follows an ``Invoice link`` cell.
 GIFT_INVOICE_LINK_SCRIPT = _PYTHON_FILES_DIR / "giftcardInvoiceLink" / "gift_invoice_link_workflow.py"
@@ -193,6 +192,7 @@ def _column_order_keys() -> list[str]:
     keys.extend(
         [
             "total_amount_paid",
+            "subtotal_amount",
             "tax_paid",
             "accounting",
             "gift_invoice_action",
@@ -210,6 +210,7 @@ COLUMN_HEADERS = {
     "company":               "Company",
     "email":                 "Email",
     "total_amount_paid":     "Total Paid",
+    "subtotal_amount":       "Subtotal",
     "tax_paid":              "Tax Paid",
     "accounting":            "Accounting",
     "tracking_quick_status": "Shipping Status",
@@ -484,6 +485,7 @@ def set_column_widths(ws, column_keys: list[str]):
         "company":               24,
         "email":                 30,
         "total_amount_paid":     14,
+        "subtotal_amount":       14,
         "tax_paid":              12,
         "accounting":            14,
         "tracking_quick_status":       40,
@@ -698,20 +700,8 @@ def _tracking_urls_for_record(record: dict) -> list[str]:
 
 
 def resolve_shipping_summary(record: dict) -> str | None:
-    """Aggregate delivered fraction from 17TRACK cache (see prefetch before Excel build)."""
-    nums = _tracking_numbers_for_record(record)
-    if not nums:
-        return None
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import (
-            format_shipping_summary_line,
-            shipping_summary_metrics,
-        )
-
-        valid, delivered = shipping_summary_metrics(nums)
-        return format_shipping_summary_line(valid, delivered)
-    except Exception:
-        return None
+    """Shipping-status API summaries have been removed; keep existing stored data untouched."""
+    return None
 
 
 def display_shipping_status_for_record(
@@ -823,8 +813,11 @@ def apply_shipping_summary_cells(
             cell.alignment = CENTER_ALIGN
             continue
         if nums and not display:
-            cell.value = "View Shipping Status"
-            display = cell.value
+            cell.value = None
+            cell.hyperlink = None
+            cell.font = CELL_FONT
+            cell.alignment = CENTER_ALIGN
+            continue
         pct = _shipping_summary_color_percent(display)
 
         if nums and vba_friendly and display:
@@ -1367,18 +1360,6 @@ def _emit_excel_launcher_progress(pct: int, msg: str = "") -> None:
     print(line, flush=True)
 
 
-def _excel_launcher_17track_skip_requested() -> bool:
-    """True when launcher set ``EMAIL_SORTER_17TRACK_SKIP_FLAG`` (user chose Skip 17Track)."""
-    raw = (os.getenv("EMAIL_SORTER_17TRACK_SKIP_FLAG") or "").strip()
-    if not raw:
-        return False
-    try:
-        p = Path(raw)
-        return p.is_file() and p.read_text(encoding="utf-8").strip() == "1"
-    except OSError:
-        return False
-
-
 def load_user_edit_aware_excel_records(
     *,
     include_automation_hub: bool = True,
@@ -1398,65 +1379,6 @@ def set_clipboard_ini_cell(wb: Workbook, ini_path: Path) -> None:
     ws = wb["Orders"]
     ws[CLIPBOARD_INI_CELL] = str(ini_path.resolve())
     ws.column_dimensions["AA"].hidden = True
-
-
-def _prefetch_17track_for_excel_build(
-    records: list[dict],
-    *,
-    quiet: bool = False,
-    on_prefetch_progress: Callable[[int, int], None] | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-) -> None:
-    """Prefetch 17TRACK rows for *records*.
-
-    When env ``EMAIL_SORTER_17TRACK_QUOTA_SESSION=1`` (Email Sorter launcher **Run** or **Excel**),
-    performs exactly **two** ``getquota`` checks with user dialogs: once before prefetch and
-    once after prefetch completes. Other callers (no env var) perform **no** quota checks here.
-    """
-    session = (os.getenv("EMAIL_SORTER_17TRACK_QUOTA_SESSION") or "").strip() == "1"
-    try:
-        from trackingNumbersViewer.seventeen_track_api import api_key_from_env
-        from trackingNumbersViewer.seventeen_track_smart import prefetch_tracking_for_records
-        from shared.load_17track_quota import get_17track_quota_module
-
-        if session and api_key_from_env():
-            _, skip = get_17track_quota_module().quota_prefetch_gate()
-            if skip:
-                try:
-                    from shared import runLogger as RL
-
-                    RL.log(
-                        "17track",
-                        f"{RL.ts()} prefetch skipped after quota gate (0 remaining)",
-                    )
-                except Exception:
-                    pass
-                print(
-                    "WARNING: 17TRACK prefetch skipped — API quota is exhausted (0 remaining).",
-                    file=sys.stderr,
-                )
-                return
-
-        if not quiet:
-            print("[createExcelDocument] Prefetching 17TRACK data for tracking numbers …")
-        prefetch_tracking_for_records(
-            records,
-            on_progress=on_prefetch_progress,
-            cancel_check=cancel_check,
-        )
-    except Exception as e:
-        if not quiet:
-            print(f"[createExcelDocument] Tracking prefetch skipped: {e}")
-    finally:
-        if session:
-            try:
-                from trackingNumbersViewer.seventeen_track_api import api_key_from_env
-                from shared.load_17track_quota import get_17track_quota_module
-
-                if api_key_from_env():
-                    get_17track_quota_module().quota_session_end_notify()
-            except Exception:
-                pass
 
 
 def _build_populated_orders_workbook(
@@ -1520,21 +1442,8 @@ def rebuild_orders_workbook(excel_output_path: str | Path) -> None:
         sync_pod_json=True,
     )
 
-    def _on_track(done: int, total: int) -> None:
-        if total <= 0:
-            _emit_excel_launcher_progress(50, "17TRACK (no IDs)")
-            return
-        # Reserve 5–95% for 17TRACK; workbook build uses the tail.
-        pct = 5 + int(90 * done / max(total, 1))
-        _emit_excel_launcher_progress(pct, f"17TRACK {done}/{total}")
-
-    _emit_excel_launcher_progress(4, "Prefetching 17TRACK…")
-    _prefetch_17track_for_excel_build(
-        records,
-        quiet=True,
-        on_prefetch_progress=_on_track,
-        cancel_check=_excel_launcher_17track_skip_requested,
-    )
+    _emit_excel_launcher_progress(4, "Preparing workbook")
+    _emit_excel_launcher_progress(12, "Building workbook")
     _emit_excel_launcher_progress(96, "Building workbook…")
     wb, _using_template = _build_populated_orders_workbook(records, verbose_clipboard_log=False)
     _emit_excel_launcher_progress(98, "Saving…")
@@ -1565,8 +1474,7 @@ def _header_cell_matches_shipping_status(val) -> bool:
 
 def refresh_orders_workbook_shipping_status(excel_path: str | Path) -> None:
     """
-    Run smart 17TRACK prefetch (same rules as Excel build — skip needless terminal refreshes),
-    then rewrite the Shipping Status column from ``results.json`` (one cell per order block).
+    Rewrite the Shipping Status column from ``results.json`` (one cell per order block).
     """
     path = Path(excel_path).expanduser().resolve()
     if not path.is_file():
@@ -1576,11 +1484,6 @@ def refresh_orders_workbook_shipping_status(excel_path: str | Path) -> None:
         sync_pod_json=True,
     )
     _hub_record, data_records = _split_automation_hub_record(records)
-    try:
-        _prefetch_17track_for_excel_build(records, quiet=True)
-    except Exception:
-        pass
-
     wb = _load_workbook_editable(str(path))
     ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
     column_keys, _ = _build_column_order()
@@ -1655,11 +1558,6 @@ def refresh_orders_workbook_shipping_status(excel_path: str | Path) -> None:
 
 
 def append_to_workbook(path: str, records: list[dict]):
-    try:
-        _prefetch_17track_for_excel_build(records, quiet=True)
-    except Exception:
-        pass
-
     wb = _load_workbook_editable(path)
     ws = wb.active
     vba_friendly = Path(path).suffix.lower() == ".xlsm" and getattr(
@@ -1828,7 +1726,6 @@ def main():
         include_automation_hub=True,
         sync_pod_json=True,
     )
-    _prefetch_17track_for_excel_build(records, quiet=False)
 
     wb, using_template = _build_populated_orders_workbook(records, verbose_clipboard_log=True)
 
