@@ -27,6 +27,7 @@ STORED_SETTING_KEYS = frozenset(
         "DEBUG_MODE",
         "LOGIN_NEW_ACCOUNT_NEXT_RUN",
         "DELETE_SAVED_EMAIL_DATA_NEXT_RUN",
+        "POD_READINESS_DEBUG",
     }
 )
 
@@ -211,3 +212,9 @@ def apply_runtime_settings_from_json() -> None:
         os.environ["DELETE_SAVED_EMAIL_DATA_NEXT_RUN"] = delete_saved_email_data
     else:
         os.environ.pop("DELETE_SAVED_EMAIL_DATA_NEXT_RUN", None)
+
+    pod_readiness_debug = (json_data.get("POD_READINESS_DEBUG") or "").strip()
+    if pod_readiness_debug:
+        os.environ["POD_READINESS_DEBUG"] = pod_readiness_debug
+    else:
+        os.environ.pop("POD_READINESS_DEBUG", None)

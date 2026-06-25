@@ -247,6 +247,21 @@ _CUSTOM_IMPORT_EMAIL = "customImportHTML@local.invalid"
 _EXCEL_STEP_WARN_SECONDS_DEFAULT = 120.0
 _DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV = "EMAIL_SORTER_DELETE_SAVED_EMAIL_DATA_THIS_RUN"
 _REMOTE_IMAGE_PRESERVE_CACHE: dict[str, str | None] = {}
+_SAVED_EMAIL_DATA_CLEANUP_DIRS = (
+    "attachments",
+    "html",
+    "html_debug",
+    "json",
+    "pdf",
+    "tracking_link_viewer_state",
+    "tracking_status_cache",
+)
+_SAVED_EMAIL_DATA_CLEANUP_FILES = (
+    "tracking_pdf_hands_free_state.json",
+)
+_SAVED_EMAIL_DATA_CLEANUP_EXTRA_DIRS = (
+    _PYTHON_FILES_DIR / "proofOfDelivery" / "pod_archive",
+)
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -265,6 +280,9 @@ def _env_truthy(name: str) -> bool:
 
 
 def _remote_image_preservation_enabled() -> bool:
+    assisted_pdf = (os.getenv("EMAIL_SORTER_ASSISTED_HTML_PDF") or "").strip().lower()
+    if assisted_pdf in ("1", "true", "yes", "on", "remote", "images", "problematic"):
+        return False
     raw = (os.getenv("EMAIL_SORTER_PRESERVE_REMOTE_IMAGES") or "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
 
@@ -383,16 +401,101 @@ def _delete_saved_email_data_if_requested(base_dir: Path) -> None:
 
     email_contents_dir = base_dir / "email_contents"
     print(
-        "[Startup] Saved-email-data cleanup is ON - deleting previous email_contents data..."
+        "[Startup] Saved-email-data cleanup is ON - clearing previous saved email data..."
     )
+
+    removed_count = 0
+    failures: list[str] = []
+
+    def remove_tree(path: Path) -> None:
+        def onerror(func, path_str, exc_info):  # type: ignore[no-untyped-def]
+            try:
+                os.chmod(path_str, 0o700)
+                func(path_str)
+            except OSError:
+                raise
+
+        shutil.rmtree(path, onerror=onerror)
+
+    def remove_item(path: Path) -> None:
+        if path.is_dir() and not path.is_symlink():
+            remove_tree(path)
+        else:
+            try:
+                path.unlink()
+            except PermissionError:
+                os.chmod(path, 0o600)
+                path.unlink()
+
+    def clear_directory_contents(path: Path) -> None:
+        nonlocal removed_count
+        if not path.exists():
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                failures.append(f"{path}: {e}")
+            return
+        if not path.is_dir():
+            try:
+                remove_item(path)
+                removed_count += 1
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                failures.append(f"{path}: {e}")
+            return
+
+        try:
+            items = list(path.iterdir())
+        except OSError as e:
+            failures.append(f"{path}: {e}")
+            return
+
+        for item in items:
+            try:
+                remove_item(item)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                failures.append(f"{item}: {e}")
+            else:
+                removed_count += 1
+
     try:
-        shutil.rmtree(email_contents_dir)
-    except FileNotFoundError:
-        print("  email_contents folder was already missing.")
+        email_contents_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        _fatal(1, f"Could not delete saved email data folder {email_contents_dir}: {e}")
-    else:
-        print(f"  Deleted: {email_contents_dir}")
+        _fatal(1, f"Could not create saved email data folder {email_contents_dir}: {e}")
+
+    for rel in _SAVED_EMAIL_DATA_CLEANUP_DIRS:
+        clear_directory_contents(email_contents_dir / rel)
+
+    for path in _SAVED_EMAIL_DATA_CLEANUP_EXTRA_DIRS:
+        clear_directory_contents(path)
+
+    for rel in _SAVED_EMAIL_DATA_CLEANUP_FILES:
+        path = email_contents_dir / rel
+        if not path.exists():
+            continue
+        try:
+            remove_item(path)
+        except OSError as e:
+            failures.append(f"{path}: {e}")
+        else:
+            removed_count += 1
+
+    print(f"  Cleared saved email data ({removed_count} item(s) removed).")
+    if failures:
+        print(
+            "  WARNING: Some saved email data could not be removed; "
+            "the run will continue."
+        )
+        for failure in failures[:10]:
+            print(f"    {failure}")
+        if len(failures) > 10:
+            print(f"    ... {len(failures) - 10} more cleanup issue(s)")
+        RL.log(
+            "timing",
+            f"{RL.ts()}  saved_email_data_cleanup_warning  failures={len(failures)}",
+        )
 
 
 def _custom_import_outlook_env() -> dict[str, str]:

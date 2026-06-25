@@ -78,7 +78,7 @@ Primary workbook output:
 Macro/template support (`createExcelDocument/macro_template.py`):
 
 - Builds/refreshes `orders_template.xlsm` through Excel COM
-- Wires in `ThisWorkbook` VBA + hotkey module
+- Wires in `ThisWorkbook` VBA + edit-sync module
 - Writes `excel_clipboard_launch.ini` with paths to helper scripts
 
 Workbook capabilities:
@@ -90,9 +90,10 @@ Workbook capabilities:
   - View Tracking Numbers (All For Order)
   - POD workflow / capture viewer
 - Gift invoice workflow launch from `Invoice Link`
-- Triple-Escape edit mode:
-  - top-row rainbow cycle while armed
-  - editable fields: company, total paid, tax paid
+- Live edit sync:
+  - supported order-field edits save immediately
+  - top-row rainbow success cycle runs for 3 seconds after a saved edit
+  - editable fields: category, order number, company, purchase date, subtotal, total paid, tax paid, gift card, accounting
   - writes edits back to JSON via `createExcelDocument/excel_user_edit_sync.py`
   - persists overlay in `email_contents/json/excel_user_edits.json`
   - clearing an edited field restores original value and removes `*` marker
@@ -125,6 +126,8 @@ Workbook capabilities:
   - `Open` (plain browser open, no automation dependency)
   - `Delete` on processed rows (removes POD PDF + JSON references, marks as unprocessed again)
 - Assisted PDF capture controls
+  - Normal assisted mode opens each remaining POD carrier page, watches DOM/CSS changes, and saves the PDF automatically once the page is ready.
+  - `POD_READINESS_DEBUG` keeps Chrome open with a blue DOM selection box and manual selector controls before each PDF is saved.
 
 ### POD data/workflow
 
@@ -148,6 +151,7 @@ Core settings keys:
 - `OPENAI_API_KEY`
 - `DEBUG_MODE`
 - `LOGIN_NEW_ACCOUNT_NEXT_RUN`
+- `POD_READINESS_DEBUG`
 
 Common runtime env keys:
 
@@ -193,6 +197,8 @@ Logs:
 - `<BASE_DIR>/logs/` (timing, extraction/debug segments, OpenAI usage files)
 - `<BASE_DIR>/logs/program_errors.txt`
 - Tracking PDF audit: `email_contents/json/tracking_pdf_audit.json`
+- POD readiness profiles: `email_contents/json/tracking_page_readiness_profiles.json`
+- POD readiness event log: `email_contents/logs/pod_readiness_events.jsonl`
 
 ## Important Scripts
 

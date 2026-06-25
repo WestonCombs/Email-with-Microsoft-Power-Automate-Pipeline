@@ -191,6 +191,11 @@ def configure_launcher_ttk_styles(win: tk.Misc) -> ttk.Style:
         font=theme_font("button"),
     )
     style.map(
+        "Launcher.Treeview.Heading",
+        background=[("active", "#dbeafe"), ("pressed", "#bfdbfe")],
+        foreground=[("active", "#111827"), ("pressed", "#111827")],
+    )
+    style.map(
         "Launcher.Treeview",
         background=[("selected", THEME["run_accent_dim"])],
         foreground=[("selected", "#ffffff")],

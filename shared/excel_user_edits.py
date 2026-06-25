@@ -10,12 +10,35 @@ from typing import Any
 from shared.supplier_normalization import normalize_supplier_display_name
 
 ALLOWED_EXCEL_USER_EDIT_FIELDS = (
+    "email_category",
+    "order_number",
     "company",
     "purchase_datetime",
+    "subtotal_amount",
     "total_amount_paid",
     "tax_paid",
+    "gift_card_amount",
+    "accounting",
 )
-ALLOWED_EXCEL_USER_EDIT_LABELS = ("Company", "Purchase Date", "Total Paid", "Tax Paid")
+ALLOWED_EXCEL_CATEGORIES = (
+    "Delivered",
+    "Invoice",
+    "Shipped",
+    "Gift Card",
+    "Unknown",
+    "POD",
+)
+ALLOWED_EXCEL_USER_EDIT_LABELS = (
+    "Category",
+    "Order Number",
+    "Company",
+    "Purchase Date",
+    "Subtotal",
+    "Total Paid",
+    "Tax Paid",
+    "GC Paid",
+    "Accounting",
+)
 EXCEL_USER_EDITS_JSON_NAME = "excel_user_edits.json"
 LLM_OBTAINED_COMPANY_FIELD = "llm_obtained_company"
 ORIGINAL_LLM_OBTAINED_COMPANY_FIELD = "original_llm_obtained_company"
@@ -275,6 +298,32 @@ def display_value_for_excel(record: dict, field: str, value: Any) -> Any:
     return f"{text}*"
 
 
+def _values_match_for_user_edit(field: str, current_value: Any, new_value: Any) -> bool:
+    try:
+        current = coerce_user_edit_value(field, current_value)
+    except ValueError:
+        current = _clean_record_value(current_value)
+    try:
+        new = coerce_user_edit_value(field, new_value)
+    except ValueError:
+        new = _clean_record_value(new_value)
+    return current == new
+
+
+def _record_value_matches_user_edit(record: dict, field: str, value: Any) -> bool:
+    return _values_match_for_user_edit(field, display_value_for_field(record, field), value)
+
+
+def _coerce_excel_category(text: str) -> str:
+    wanted = re.sub(r"\s+", " ", str(text or "").strip()).casefold()
+    for category in ALLOWED_EXCEL_CATEGORIES:
+        if category.casefold() == wanted:
+            return category
+    raise ValueError(
+        "Category must be one of: " + ", ".join(ALLOWED_EXCEL_CATEGORIES)
+    )
+
+
 def coerce_user_edit_value(field: str, raw_value: Any) -> Any:
     if field not in ALLOWED_EXCEL_USER_EDIT_FIELDS:
         raise ValueError(f"Unsupported Excel user-edit field: {field}")
@@ -286,11 +335,12 @@ def coerce_user_edit_value(field: str, raw_value: Any) -> Any:
     if not text:
         return None
 
-    if field == "company":
+    if field == "email_category":
+        return _coerce_excel_category(text)
+    if field in {"company", "order_number", "accounting"}:
         return text
     if field == "purchase_datetime":
         return _coerce_purchase_datetime_edit(text)
-
     normalized = (
         text.replace("$", "")
         .replace(",", "")
@@ -560,25 +610,47 @@ def _remember_original_value(overlay: dict, record: dict, field: str) -> None:
     item = _ensure_overlay_item(overlay, record)
     original_values = item.setdefault("original_values", {})
     if field not in original_values:
-        original_values[field] = record.get(field)
+        original_values[field] = _baseline_value_for_clear(record, field)
     if field == "purchase_datetime":
         for meta_field in ("purchase_datetime_source", "purchase_datetime_confidence"):
             if meta_field not in original_values:
                 original_values[meta_field] = record.get(meta_field)
 
 
+def _baseline_value_for_clear(record: dict, field: str) -> Any:
+    if field == "company":
+        for value in (
+            record.get(ORIGINAL_LLM_OBTAINED_COMPANY_FIELD),
+            record.get(LLM_OBTAINED_COMPANY_FIELD),
+            None if is_modified(record, "company") else record.get("company"),
+            _infer_company_from_subject(record.get("subject")),
+            _infer_company_from_source_file(record.get("source_file")),
+        ):
+            cleaned = _clean_record_value(value)
+            if cleaned is not None:
+                return cleaned
+        return None
+    return record.get(field)
+
+
+def original_value_for_user_clear(record: dict, field: str, overlay: dict | None = None) -> Any:
+    if overlay is None:
+        return _baseline_value_for_clear(record, field)
+    return _original_value_for_clear(overlay, record, field)
+
+
 def _original_value_for_clear(overlay: dict, record: dict, field: str) -> Any:
     records_overlay = overlay.get("records")
     if not isinstance(records_overlay, dict):
-        return record.get(field)
+        return _baseline_value_for_clear(record, field)
     item = records_overlay.get(record_identity(record))
     if not isinstance(item, dict):
-        return record.get(field)
+        return _baseline_value_for_clear(record, field)
     original_values = item.get("original_values")
     if not isinstance(original_values, dict):
-        return record.get(field)
+        return _baseline_value_for_clear(record, field)
     if field not in original_values:
-        return record.get(field)
+        return _baseline_value_for_clear(record, field)
     return original_values.get(field)
 
 
@@ -644,6 +716,7 @@ def record_excel_user_edit(
     raw_value: Any,
     order_number: str = "",
     source_uri: str = "",
+    record_id: str = "",
 ) -> dict:
     clear_requested = str(strip_excel_modified_marker(raw_value) or "").strip() == ""
     value = None if clear_requested else coerce_user_edit_value(field, raw_value)
@@ -662,11 +735,14 @@ def record_excel_user_edit(
     matched_entries: list[tuple[Path, dict]] = []
 
     clean_order = str(order_number or "").strip()
+    clean_record_id = str(record_id or "").strip()
     for path, records in file_records:
         changed_by_path[path] = ensure_llm_obtained_company_fields(records, overlay)
         for record in records:
             if field in {"company", "purchase_datetime"} and clean_order:
                 match = str(record.get("order_number") or "").strip() == clean_order
+            elif clean_record_id:
+                match = str(record.get("_record_id") or "").strip() == clean_record_id
             else:
                 match = record_matches_source_uri(record, source_uri)
             if not match:
@@ -683,6 +759,13 @@ def record_excel_user_edit(
             for _path, record in matched_entries
         )
     )
+    unchanged_requested = (
+        not reset_requested
+        and all(
+            _record_value_matches_user_edit(record, field, value)
+            for _path, record in matched_entries
+        )
+    )
 
     matched_by_path: dict[Path, list[dict]] = defaultdict(list)
     for path, record in matched_entries:
@@ -691,9 +774,15 @@ def record_excel_user_edit(
     for path, records in file_records:
         changed = changed_by_path.get(path, False)
         for record in matched_by_path.get(path, []):
-            if reset_requested:
+            if unchanged_requested:
+                pass
+            elif reset_requested:
                 if field == "company":
-                    restored_value = _clean_record_value(record.get(LLM_OBTAINED_COMPANY_FIELD))
+                    restored_value = _clean_record_value(
+                        record.get(ORIGINAL_LLM_OBTAINED_COMPANY_FIELD)
+                    )
+                    if restored_value is None:
+                        restored_value = _clean_record_value(record.get(LLM_OBTAINED_COMPANY_FIELD))
                     if restored_value is None:
                         restored_value = _original_value_for_clear(overlay, record, field)
                 else:
@@ -725,7 +814,9 @@ def record_excel_user_edit(
             save_json_records(path, records)
             changed_files.append(str(path))
 
-    if reset_requested:
+    if unchanged_requested:
+        pass
+    elif reset_requested:
         order_company = overlay.get("order_company")
         if field == "company" and clean_order and isinstance(order_company, dict):
             order_company.pop(clean_order, None)
@@ -741,9 +832,16 @@ def record_excel_user_edit(
         "value": None if reset_requested else value,
         "order_number": clean_order,
         "source_uri": source_uri,
+        "record_id": clean_record_id,
         "matched_records": matched,
         "changed_files": changed_files,
-        "mode": "cleared" if reset_requested else "modified",
+        "mode": (
+            "unchanged"
+            if unchanged_requested
+            else "cleared"
+            if reset_requested
+            else "modified"
+        ),
         "display_value": display_value,
         "display_value_kind": display_value_kind(display_value),
     }

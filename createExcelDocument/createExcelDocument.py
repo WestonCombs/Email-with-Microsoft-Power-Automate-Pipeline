@@ -25,6 +25,12 @@ from shared.excel_user_edits import (
     company_display_value,
     display_value_for_excel,
 )
+from shared.order_store import (
+    RECORD_ID_HEADER,
+    ensure_record_ids,
+    ensure_results_record_ids,
+    stable_record_id,
+)
 from giftcardInvoiceLink.link_store import (
     gift_order_link_label,
     load_edges,
@@ -66,7 +72,7 @@ if not _base_dir_raw:
 PROJECT_ROOT = Path(_base_dir_raw).expanduser().resolve()
 _JSON_DIR = PROJECT_ROOT / "email_contents" / "json"
 JSON_PATH = str(_JSON_DIR / "results.json")
-# Written after each full Orders rebuild; used to skip redundant rebuilds when only Shipping Status refresh is needed.
+# Written after each full Orders rebuild; used to skip redundant rebuilds when only layout-independent refreshes are needed.
 EXCEL_BUILD_STATE_PATH = _JSON_DIR / "excel_build_state.json"
 
 # Hidden on Orders; VBA reads this before ThisWorkbook.Path (works if Path is empty).
@@ -74,7 +80,7 @@ CLIPBOARD_INI_CELL = "AA1"
 ACTION_ROW = 1
 HEADER_ROW = 2
 DATA_START_ROW = 3
-FREEZE_PANES_CELL = "B3"
+FREEZE_PANES_CELL = "D3"
 # Hidden: plain-text file:/// URI per row. Open File Location cells use internal # links only
 # (Excel hyperlink events cannot cancel file:// navigation).
 COPY_PATH_URI_COL = 29  # column AC — keep equal to COL_FILE_URI in macro_template.py
@@ -90,6 +96,8 @@ TRACKING_NUMBER_SLOT_COUNT = TRACKING_LINK_VISIBLE_SLOTS
 # Hidden 1/0: ID also found on a classified tracking URL (cross-check with link pipeline). BE–BU (60–74).
 TRACKING_NUM_CONFIRM_COL_START = TRACKING_NUMBER_COL_START + TRACKING_NUMBER_SLOT_COUNT  # 60
 TRACKING_NUM_CONFIRM_SLOT_COUNT = TRACKING_LINK_VISIBLE_SLOTS
+# Hidden stable row identity for Python/Excel sync. Must match COL_RECORD_ID in macro_template.py.
+RECORD_ID_COL = TRACKING_NUM_CONFIRM_COL_START + TRACKING_NUM_CONFIRM_SLOT_COUNT  # 75 (BW)
 
 # Optional .env overrides (absolute or relative paths expand from user / cwd).
 def _optional_path(env_name: str, default: Path) -> Path:
@@ -118,7 +126,7 @@ EXCEL_PATH = str(
 TRACKING_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingLinkViewer" / "tracking_link_viewer.py"
 # TRACKING_NUMBERS_VIEWER= in ini — "View Tracking Numbers" / "order" aggregate modes.
 TRACKING_NUMBERS_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingNumbersViewer" / "tracking_numbers_viewer.py"
-# TRACKING_STATUS_VIEWER= — "Shipping Status" column click -> POD/tracking viewer.
+# TRACKING_STATUS_VIEWER= in ini — legacy shipping-status viewer launcher.
 TRACKING_STATUS_VIEWER_SCRIPT = _PYTHON_FILES_DIR / "trackingNumbersViewer" / "tracking_status_viewer.py"
 # Launched from VBA (GIFTCARD_LINK= in ini) when the user follows an ``Invoice link`` cell.
 GIFT_INVOICE_LINK_SCRIPT = _PYTHON_FILES_DIR / "giftcardInvoiceLink" / "gift_invoice_link_workflow.py"
@@ -179,8 +187,9 @@ _COLUMN_ORDER_SUFFIX = [
 
 def _column_order_keys() -> list[str]:
     keys = [
-        "email_category",
+        "excel_flagged",
         "order_number",
+        "email_category",
         "purchase_datetime",
         "company",
         "email",
@@ -194,15 +203,16 @@ def _column_order_keys() -> list[str]:
             "total_amount_paid",
             "subtotal_amount",
             "tax_paid",
+            "gift_card_amount",
             "accounting",
             "gift_invoice_action",
         ]
     )
-    keys.append("tracking_quick_status")
     keys.extend(_COLUMN_ORDER_SUFFIX)
     return keys
 
 COLUMN_HEADERS = {
+    "excel_flagged":         "Flagged",
     "email_category":        "Category",
     "order_number":          "Order Number",
     "gift_invoice_action":   "Invoice Link",
@@ -212,8 +222,9 @@ COLUMN_HEADERS = {
     "total_amount_paid":     "Total Paid",
     "subtotal_amount":       "Subtotal",
     "tax_paid":              "Tax Paid",
+    "gift_card_amount":      "GC Paid",
     "accounting":            "Accounting",
-    "tracking_quick_status": "Shipping Status",
+    "tracking_quick_status": "POD status",
     "open_tracking_list":    "View Tracking Links",
     "open_tracking_numbers_web": "View Tracking Numbers",
     "open_tracking_numbers_order": "View Tracking Numbers (All For Order)",
@@ -226,6 +237,7 @@ COLUMN_HEADERS = {
 SHIPPING_STATUS_HEADER_ALIASES = frozenset(
     {
         COLUMN_HEADERS["tracking_quick_status"],
+        "Shipping Status",
         "Shipping summary",
         "View shipping status",
         "View Shipping Status",
@@ -416,8 +428,12 @@ def _record_to_row(
     """Convert a single JSON record to a flat row list matching column_keys."""
     row: list = []
     for key in column_keys:
-        if key == "company":
+        if key == "excel_flagged":
+            row.append("True" if bool(record.get("excel_flagged") or record.get("excel_active")) else None)
+        elif key == "company":
             row.append(display_value_for_excel(record, key, get_company_value(record)))
+        elif key == "total_amount_paid" and is_automation_hub_record(record):
+            row.append(AUTOMATION_HUB_STATUS_LABEL)
         elif key == "copy_file_path":
             row.append(clean_value(record.get("source_file_link")))
         elif key == "html_source_link":
@@ -470,14 +486,15 @@ def style_automation_hub_row(ws, col_count: int, row_idx: int = ACTION_ROW) -> N
 
 
 def center_invoice_and_shipping_headers(ws, column_keys: list[str]) -> None:
-    """Force center alignment for Invoice Link and Shipping Status (template/Excel defaults may differ)."""
-    for key in ("gift_invoice_action", "tracking_quick_status"):
+    """Force center alignment for the action columns (template/Excel defaults may differ)."""
+    for key in ("gift_invoice_action", "tracking_quick_status", "total_amount_paid"):
         for col_idx in _col_indices(column_keys, key):
             ws.cell(row=HEADER_ROW, column=col_idx).alignment = CENTER_ALIGN
 
 
 def set_column_widths(ws, column_keys: list[str]):
     width_map = {
+        "excel_flagged":         8,
         "email_category":        22,
         "order_number":          18,
         "gift_invoice_action":   14,
@@ -487,6 +504,7 @@ def set_column_widths(ws, column_keys: list[str]):
         "total_amount_paid":     14,
         "subtotal_amount":       14,
         "tax_paid":              12,
+        "gift_card_amount":      12,
         "accounting":            14,
         "tracking_quick_status":       40,
         "open_tracking_list":           20,
@@ -578,6 +596,77 @@ def apply_accounting_dropdown(ws, column_keys: list[str], start_row: int = DATA_
         dv.add(f"{letter}{start_row}:{letter}{max_row}")
 
 
+def apply_flagged_dropdown(ws, column_keys: list[str], start_row: int = DATA_START_ROW) -> None:
+    cols = _col_indices(column_keys, "excel_flagged")
+    if not cols:
+        return
+    max_row = max(ws.max_row, start_row)
+    for col_idx in cols:
+        letter = get_column_letter(col_idx)
+        dv = DataValidation(type="list", formula1='"True,False"', allow_blank=True)
+        dv.error = "Choose True or False, or leave blank."
+        dv.errorTitle = "Flagged"
+        dv.prompt = "Choose True to flag this row for Fix Flagged, or clear/False to unflag."
+        dv.promptTitle = "Flagged"
+        ws.add_data_validation(dv)
+        dv.add(f"{letter}{start_row}:{letter}{max_row}")
+
+
+def apply_category_dropdown(ws, column_keys: list[str], start_row: int = DATA_START_ROW) -> None:
+    cols = _col_indices(column_keys, "email_category")
+    if not cols:
+        return
+    max_row = max(ws.max_row, start_row)
+    valid = "Delivered,Invoice,Shipped,Gift Card,Unknown,POD"
+    for col_idx in cols:
+        letter = get_column_letter(col_idx)
+        dv = DataValidation(type="list", formula1=f'"{valid}"', allow_blank=False)
+        dv.errorStyle = "stop"
+        dv.showErrorMessage = True
+        dv.error = "Choose a valid category."
+        dv.errorTitle = "Category"
+        dv.prompt = "Choose Delivered, Invoice, Shipped, Gift Card, Unknown, or POD."
+        dv.promptTitle = "Category"
+        ws.add_data_validation(dv)
+        dv.add(f"{letter}{start_row}:{letter}{max_row}")
+
+
+def apply_order_category_outline_groups(ws, records: list[dict], start_row: int = DATA_START_ROW) -> None:
+    """Group contiguous rows that share order number + category under the first row."""
+    try:
+        outline = ws.sheet_properties.outlinePr
+        outline.summaryBelow = False
+        outline.applyStyles = True
+        ws.sheet_view.showOutlineSymbols = True
+    except Exception:
+        pass
+    for row_idx in range(start_row, ws.max_row + 1):
+        dim = ws.row_dimensions[row_idx]
+        dim.outlineLevel = 0
+        dim.hidden = False
+        dim.collapsed = False
+    if not records:
+        return
+
+    def key_for(record: dict) -> tuple[str, str]:
+        return (
+            str(record.get("order_number") or "").strip(),
+            str(record.get("email_category") or "").strip(),
+        )
+
+    block_start = 0
+    while block_start < len(records):
+        block_key = key_for(records[block_start])
+        block_end = block_start
+        while block_end + 1 < len(records) and key_for(records[block_end + 1]) == block_key:
+            block_end += 1
+        if block_key[0] and block_key[1] and block_end > block_start:
+            detail_start = start_row + block_start + 1
+            detail_end = start_row + block_end
+            ws.row_dimensions.group(detail_start, detail_end, outline_level=1, hidden=False)
+        block_start = block_end + 1
+
+
 def _migrate_accounting_column_if_missing(ws, desired_keys: list[str]) -> None:
     headers = _header_column_map(ws)
     if COLUMN_HEADERS["accounting"] in headers:
@@ -586,7 +675,10 @@ def _migrate_accounting_column_if_missing(ws, desired_keys: list[str]) -> None:
     if not tax_col:
         return
     had_fixed_hidden_columns = ws.max_column >= COPY_PATH_URI_COL
-    insert_at = tax_col + 1
+    try:
+        insert_at = desired_keys.index("accounting") + 1
+    except ValueError:
+        insert_at = tax_col + 1
     ws.insert_cols(insert_at)
     if had_fixed_hidden_columns and ws.max_column >= COPY_PATH_URI_COL + 1:
         ws.delete_cols(COPY_PATH_URI_COL)
@@ -974,6 +1066,15 @@ def apply_hidden_tracking_number_columns(
             ws.column_dimensions[get_column_letter(uc)].hidden = True
 
 
+def apply_hidden_record_id_column(ws, records: list[dict], start_row: int) -> None:
+    """Write stable per-record IDs for VBA/Python sync without showing them to users."""
+    ws.cell(row=HEADER_ROW, column=RECORD_ID_COL, value=RECORD_ID_HEADER)
+    ws.cell(row=ACTION_ROW, column=RECORD_ID_COL, value=None)
+    for i, record in enumerate(records):
+        ws.cell(row=start_row + i, column=RECORD_ID_COL, value=stable_record_id(record))
+    ws.column_dimensions[get_column_letter(RECORD_ID_COL)].hidden = True
+
+
 def apply_gift_invoice_link_columns(
     ws,
     column_keys: list[str],
@@ -987,8 +1088,9 @@ def apply_gift_invoice_link_columns(
         return
     gcol = gift_cols[0]
     sn = _sheet_name_for_excel_ref(ws.title)
-    # Anchor on Category (same row), not the Invoice link cell. Self-referential #links
-    # often skip Workbook_SheetFollowHyperlink because Excel does not change selection.
+    # Anchor on Category (same row), not the Invoice Link cell. Self-referential
+    # in-sheet links can skip Workbook_SheetFollowHyperlink because selection
+    # does not actually move.
     cat_col = column_keys.index("email_category") + 1
     anchor_letter = get_column_letter(cat_col)
     link_path = links_path_for_project_root(project_root)
@@ -1203,7 +1305,11 @@ def apply_order_number_row_colors(ws, start_row: int, records: list[dict]) -> No
 
 
 def apply_special_row_styles(ws, start_row: int, records: list[dict], column_keys: list[str]) -> None:
-    shipping_col = column_keys.index("tracking_quick_status") + 1
+    action_cols = _col_indices(column_keys, "tracking_quick_status") or _col_indices(
+        column_keys,
+        "total_amount_paid",
+    )
+    action_col = action_cols[0] if action_cols else None
     for offset, row_idx in enumerate(range(start_row, ws.max_row + 1)):
         rec = records[offset] if offset < len(records) else {}
         if not is_automation_hub_record(rec):
@@ -1211,8 +1317,10 @@ def apply_special_row_styles(ws, start_row: int, records: list[dict], column_key
         for col_idx in range(1, ws.max_column + 1):
             cell = ws.cell(row=row_idx, column=col_idx)
             cell.font = AUTOMATION_HUB_FONT
-            cell.alignment = CENTER_ALIGN if col_idx == shipping_col else LEFT_ALIGN
-        hub_cell = ws.cell(row=row_idx, column=shipping_col)
+            cell.alignment = CENTER_ALIGN if action_col and col_idx == action_col else LEFT_ALIGN
+        if not action_col:
+            continue
+        hub_cell = ws.cell(row=row_idx, column=action_col)
         if hub_cell.value:
             hub_cell.font = AUTOMATION_HUB_LINK_FONT if hub_cell.hyperlink else AUTOMATION_HUB_FONT
             hub_cell.alignment = CENTER_ALIGN
@@ -1255,9 +1363,19 @@ def apply_header_border(ws):
                       top=HAIR_SIDE, bottom=HAIR_SIDE)
 
 
+def apply_header_autofilter(ws) -> None:
+    """Apply Excel filter dropdowns to row 2 without changing row order."""
+    if ws.max_column < 1 or ws.max_row < HEADER_ROW:
+        return
+    last_col = get_column_letter(ws.max_column)
+    last_row = max(ws.max_row, HEADER_ROW)
+    ws.auto_filter.ref = f"A{HEADER_ROW}:{last_col}{last_row}"
+
+
 def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
     """Rebuild the Orders sheet from scratch (headers + rows + styling + hyperlinks)."""
     vba_friendly = getattr(wb, "vba_archive", None) is not None
+    ensure_record_ids(records)
     column_keys, header_labels = _build_column_order()
     hub_record, data_records = _split_automation_hub_record(records)
 
@@ -1311,6 +1429,7 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
         start_row=ACTION_ROW,
         vba_friendly=vba_friendly,
         end_row=ACTION_ROW,
+        shipping_status_col_idx=column_keys.index("total_amount_paid") + 1,
     )
 
     apply_row_borders(ws, start_row=DATA_START_ROW)
@@ -1328,6 +1447,7 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
     apply_file_link_hyperlinks(ws, column_keys, start_row=DATA_START_ROW)
     apply_hidden_tracking_url_columns(ws, data_records, start_row=DATA_START_ROW, vba_friendly=vba_friendly)
     apply_hidden_tracking_number_columns(ws, data_records, start_row=DATA_START_ROW, vba_friendly=vba_friendly)
+    apply_hidden_record_id_column(ws, data_records, start_row=DATA_START_ROW)
     apply_open_tracking_list_column(
         ws, column_keys, data_records, start_row=DATA_START_ROW, vba_friendly=vba_friendly
     )
@@ -1343,9 +1463,13 @@ def populate_orders_sheet(wb: Workbook, records: list[dict]) -> None:
     apply_special_row_styles(ws, start_row=DATA_START_ROW, records=data_records, column_keys=column_keys)
 
     center_invoice_and_shipping_headers(ws, column_keys)
+    apply_flagged_dropdown(ws, column_keys)
+    apply_category_dropdown(ws, column_keys)
     apply_accounting_dropdown(ws, column_keys)
+    apply_order_category_outline_groups(ws, data_records, DATA_START_ROW)
 
     ws.freeze_panes = FREEZE_PANES_CELL
+    apply_header_autofilter(ws)
 
 
 def _emit_excel_launcher_progress(pct: int, msg: str = "") -> None:
@@ -1365,12 +1489,14 @@ def load_user_edit_aware_excel_records(
     include_automation_hub: bool = True,
     sync_pod_json: bool = True,
 ) -> list[dict]:
+    ensure_results_record_ids(PROJECT_ROOT)
     apply_user_edits_to_json_files(PROJECT_ROOT)
     records = load_excel_records(
         PROJECT_ROOT,
         include_automation_hub=include_automation_hub,
         sync_pod_json=sync_pod_json,
     )
+    ensure_record_ids(records)
     return apply_user_edits_to_records(PROJECT_ROOT, records)
 
 
@@ -1474,90 +1600,17 @@ def _header_cell_matches_shipping_status(val) -> bool:
 
 def refresh_orders_workbook_shipping_status(excel_path: str | Path) -> None:
     """
-    Rewrite the Shipping Status column from ``results.json`` (one cell per order block).
+    Legacy compatibility hook. Shipping Status is no longer a visible Orders column,
+    so a caller asking for this refresh gets a layout-aware workbook rebuild.
     """
     path = Path(excel_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(str(path))
-    records = load_user_edit_aware_excel_records(
-        include_automation_hub=True,
-        sync_pod_json=True,
-    )
-    _hub_record, data_records = _split_automation_hub_record(records)
-    wb = _load_workbook_editable(str(path))
-    ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
-    column_keys, _ = _build_column_order()
-    _migrate_accounting_column_if_missing(ws, column_keys)
-    apply_accounting_dropdown(ws, column_keys)
-
-    shipping_col_idx: int | None = None
-    for c in range(1, ws.max_column + 1):
-        if _header_cell_matches_shipping_status(ws.cell(row=HEADER_ROW, column=c).value):
-            shipping_col_idx = c
-            break
-    if shipping_col_idx is None:
-        raise ValueError(
-            "Could not find the Shipping Status column in the header row. Regenerate the workbook."
-        )
-    hdr = ws.cell(row=HEADER_ROW, column=shipping_col_idx)
-    if hdr.value != COLUMN_HEADERS["tracking_quick_status"]:
-        hdr.value = COLUMN_HEADERS["tracking_quick_status"]
-    center_invoice_and_shipping_headers(ws, column_keys)
-
-    order_col_idx: int | None = None
-    want_order = COLUMN_HEADERS["order_number"]
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(row=HEADER_ROW, column=c).value
-        if isinstance(v, str) and v.strip() == want_order:
-            order_col_idx = c
-            break
-    if order_col_idx is None:
-        order_col_idx = column_keys.index("order_number") + 1
-
-    n_rows = min(ws.max_row - DATA_START_ROW + 1, len(data_records))
-    if n_rows < 1:
-        wb.save(str(path))
-        record_excel_build_debug_mode()
-        return
-
-    for offset in range(n_rows):
-        row_idx = DATA_START_ROW + offset
-        record = data_records[offset]
-        cell = ws.cell(row=row_idx, column=shipping_col_idx)
-        is_first = _is_first_row_for_order(
-            record,
-            offset,
-            data_records,
-            sheet_row=row_idx,
-            ws=ws,
-            order_number_col_idx=order_col_idx,
-        )
-        if not is_first:
-            cell.value = None
-            continue
-        cell.value = display_shipping_status_for_record(
-            record,
-            shipping_status_first_row=is_first,
-        )
-
-    vba_friendly = path.suffix.lower() == ".xlsm" and getattr(
-        wb, "vba_archive", None
-    ) is not None
-    apply_shipping_summary_cells(
-        ws,
-        column_keys,
-        data_records[:n_rows],
-        start_row=DATA_START_ROW,
-        vba_friendly=vba_friendly,
-        end_row=DATA_START_ROW + n_rows - 1,
-        shipping_status_col_idx=shipping_col_idx,
-        order_number_col_idx=order_col_idx,
-    )
-    wb.save(str(path))
-    record_excel_build_debug_mode()
+    rebuild_orders_workbook(path)
 
 
 def append_to_workbook(path: str, records: list[dict]):
+    ensure_record_ids(records)
     wb = _load_workbook_editable(path)
     ws = wb.active
     vba_friendly = Path(path).suffix.lower() == ".xlsm" and getattr(
@@ -1657,6 +1710,7 @@ def append_to_workbook(path: str, records: list[dict]):
         sync_pod_json=False,
     )
     hub_record, full_data_records = _split_automation_hub_record(full_records)
+    apply_hidden_record_id_column(ws, full_data_records, DATA_START_ROW)
     apply_gift_invoice_link_columns(ws, desired_keys, full_data_records, DATA_START_ROW, PROJECT_ROOT)
     apply_debug_gated_tracking_tool_columns(ws, desired_keys)
     if hub_record is not None:
@@ -1664,9 +1718,13 @@ def append_to_workbook(path: str, records: list[dict]):
     apply_special_row_styles(ws, start_row=DATA_START_ROW, records=full_data_records, column_keys=desired_keys)
 
     center_invoice_and_shipping_headers(ws, desired_keys)
+    apply_flagged_dropdown(ws, desired_keys)
+    apply_category_dropdown(ws, desired_keys)
     apply_accounting_dropdown(ws, desired_keys)
+    apply_order_category_outline_groups(ws, full_data_records, DATA_START_ROW)
 
     ws.freeze_panes = FREEZE_PANES_CELL
+    apply_header_autofilter(ws)
 
     if Path(path).suffix.lower() == ".xlsm" and "Orders" in wb.sheetnames:
         macro_mod = _macro_template_module() if sys.platform == "win32" else None

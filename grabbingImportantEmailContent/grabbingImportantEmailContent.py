@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -105,6 +106,34 @@ def _log_warning(segment: str, message: str) -> None:
 
 def _log_error(segment: str, message: str) -> None:
     RL.log(segment, f"{RL.ts()}  ERROR: {message}")
+
+
+def _env_truthy_value(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _assisted_html_pdf_enabled(image_diag: dict) -> bool:
+    raw = (os.getenv("EMAIL_SORTER_ASSISTED_HTML_PDF") or "").strip().lower()
+    if raw in ("0", "false", "no", "off", ""):
+        return False
+    if raw in ("remote", "images", "problematic"):
+        return bool(
+            image_diag.get("remote_src")
+            or image_diag.get("blocked_images_message_present")
+            or image_diag.get("delivery_image_text_present")
+        )
+    return _env_truthy_value(raw)
+
+
+def _assisted_html_pdf_timeout_s() -> float:
+    raw = (os.getenv("EMAIL_SORTER_ASSISTED_HTML_PDF_TIMEOUT_S") or "").strip()
+    if not raw:
+        return 900.0
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return 900.0
+    return timeout if timeout > 0 else 900.0
 
 
 def _record_fatal_exit(
@@ -933,6 +962,64 @@ document.addEventListener('DOMContentLoaded', function () {
     return prep_block + "\n" + prepared
 
 
+def _convert_html_to_pdf_with_assisted_chrome(
+    html_path: Path,
+    pdf_path: Path,
+    *,
+    source_name: str,
+) -> bool:
+    try:
+        from pdfCaptureFromChrome.html_capture import HtmlCaptureController
+        from pdfCaptureFromChrome.html_capture.hotkey_win32 import CAPTURE_HOTKEY_LABEL
+    except Exception as exc:
+        _log_warning("htmlHandler", f"Assisted Chrome PDF capture is unavailable for {source_name}: {exc}")
+        return False
+
+    saved = threading.Event()
+
+    def _notify(level: str, message: str) -> None:
+        safe = console_safe_text(message).replace("\r", "")
+        if safe:
+            print(f"  Assisted PDF capture [{level}]: {safe}")
+
+    controller = HtmlCaptureController(on_notify=_notify, on_saved=saved.set, verbose=False)
+    try:
+        if not controller.start():
+            _log_warning("htmlHandler", f"Assisted Chrome PDF capture could not start for {source_name}")
+            return False
+
+        url = html_path.resolve().as_uri()
+        if not controller.enqueue_capture(url, pdf_path, auto_print_pdf=False):
+            _log_warning("htmlHandler", f"Assisted Chrome PDF capture could not open {source_name}")
+            return False
+
+        timeout = _assisted_html_pdf_timeout_s()
+        print(
+            f"  Opened {source_name} in capture Chrome. "
+            f"Wait for the images to look right, then press {CAPTURE_HOTKEY_LABEL} in Chrome."
+        )
+        RL.log(
+            "htmlHandler",
+            f"{RL.ts()}  assisted_html_pdf_waiting source={source_name} "
+            f"output={pdf_path.name} hotkey={CAPTURE_HOTKEY_LABEL} timeout_s={timeout:g}",
+        )
+        ok = saved.wait(timeout)
+        if ok and pdf_path.exists() and pdf_path.stat().st_size > 0:
+            RL.log(
+                "htmlHandler",
+                f"{RL.ts()}  converted_to_pdf assisted_chrome source={source_name} output={pdf_path.name}",
+            )
+            return True
+
+        _log_warning(
+            "htmlHandler",
+            f"Assisted Chrome PDF capture timed out or did not create a PDF for {source_name}",
+        )
+        return False
+    finally:
+        controller.stop()
+
+
 def _find_browser() -> Path | None:
     """Find Edge or Chrome for headless PDF conversion (Edge ships with Win 10+)."""
     candidates = []
@@ -1018,6 +1105,30 @@ def convert_html_to_pdf(
                 pass
 
     file_uri = tmp_print.resolve().as_uri()
+
+    # --- Optional strategy: visible Chrome + existing Ctrl+Shift+P capture path ---
+    if _assisted_html_pdf_enabled(image_diag):
+        try:
+            if _convert_html_to_pdf_with_assisted_chrome(
+                tmp_print,
+                pdf_path,
+                source_name=html_path.name,
+            ):
+                _cleanup_print_tmp()
+                html_path.unlink()
+                print(f"  Converted to PDF: {pdf_path.name}")
+                return pdf_path
+        except Exception as e:
+            print(f"  Assisted Chrome PDF conversion failed: {console_safe_text(e)}")
+            _log_warning(
+                "htmlHandler",
+                f"Assisted Chrome PDF conversion failed for {html_path.name}: {e}",
+            )
+            if pdf_path.exists():
+                try:
+                    pdf_path.unlink()
+                except OSError:
+                    pass
 
     # --- Strategy 1: capture-profile Chrome via CDP (retail hosts may block headless) ---
     try:
@@ -1444,16 +1555,14 @@ Important rules:
 8. gift_card_amount should be the amount paid by gift card, store credit, reward dollars,
    or applied balance if clearly used as payment toward this order. Use null if none is shown
    or if "gift card" is only the product being purchased.
-9. tax_was_paid should be true when tax was charged/paid, false when tax is explicitly zero
-   or not charged, and null when unclear.
-10. purchase_datetime should be "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD".
-11. company should be the retailer/store/merchant, not the recipient's name.
-12. order_number: check the subject line first, then the body. Strip any leading "#".
-13. Do NOT guess. If something is not clearly present, use null.
-14. invoice_total_needs_review should be true if subtotal/tax/gift card/total lines are
+9. purchase_datetime should be "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD".
+10. company should be the retailer/store/merchant, not the recipient's name.
+11. order_number: check the subject line first, then the body. Strip any leading "#".
+12. Do NOT guess. If something is not clearly present, use null.
+13. invoice_total_needs_review should be true if subtotal/tax/gift card/total lines are
    ambiguous, contradictory, unlabeled, duplicated, or cannot be reconciled confidently.
    Explain the ambiguity in invoice_total_review_reason.
-15. tracking_numbers: Every distinct shipping carrier tracking ID visible in the text (e.g. UPS
+14. tracking_numbers: Every distinct shipping carrier tracking ID visible in the text (e.g. UPS
     "1Z999AA10123456784", USPS 22- or 30-digit, FedEx 12-digit). NOT the retail order number —
     only IDs assigned by UPS, FedEx, USPS, DHL, or another carrier for package tracking.
     Include each real ID once (no duplicates). Use an empty array [] if none are clearly present.
@@ -1515,10 +1624,6 @@ EMAIL TEXT:
                             "type": ["number", "null"],
                             "description": "Amount paid by gift card, store credit, rewards, or applied balance.",
                         },
-                        "tax_was_paid": {
-                            "type": ["boolean", "null"],
-                            "description": "Whether tax was charged or paid.",
-                        },
                         "invoice_total_needs_review": {
                             "type": "boolean",
                             "description": "True when invoice total fields are ambiguous or contradictory.",
@@ -1561,7 +1666,6 @@ EMAIL TEXT:
                         "subtotal_amount",
                         "tax_paid",
                         "gift_card_amount",
-                        "tax_was_paid",
                         "invoice_total_needs_review",
                         "invoice_total_review_reason",
                         "tracking_numbers",
@@ -1658,7 +1762,6 @@ def process_file(
         "subtotal_amount": None,
         "tax_paid": None,
         "gift_card_amount": None,
-        "tax_was_paid": None,
         "invoice_total_needs_review": False,
         "invoice_total_review_reason": None,
         "tracking_numbers": [],
@@ -2026,7 +2129,6 @@ def process_file(
             "subtotal_amount": extracted.get("subtotal_amount"),
             "tax_paid": extracted.get("tax_paid"),
             "gift_card_amount": extracted.get("gift_card_amount"),
-            "tax_was_paid": extracted.get("tax_was_paid"),
             "invoice_total_needs_review": bool(extracted.get("invoice_total_needs_review")),
             "invoice_total_review_reason": clean_text(extracted.get("invoice_total_review_reason")),
             "tracking_numbers": tracking_numbers_out,
@@ -2066,7 +2168,6 @@ def process_file(
             "subtotal_amount": None,
             "tax_paid": None,
             "gift_card_amount": None,
-            "tax_was_paid": None,
             "invoice_total_needs_review": False,
             "invoice_total_review_reason": None,
             "tracking_numbers": [],
@@ -3059,11 +3160,11 @@ def _write_results_with_consensus(
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     try:
-        from shared.help_ai import sync_help_ai_requests_for_records
+        from shared.fix_flagged import sync_fix_flagged_requests_for_records
 
-        sync_help_ai_requests_for_records(base, results)
+        sync_fix_flagged_requests_for_records(base, results)
     except Exception as exc:
-        _log_warning("grabbingImportantEmailContent", f"Help AI request sync skipped: {exc}")
+        _log_warning("grabbingImportantEmailContent", f"Fix Flagged request sync skipped: {exc}")
 
 
 # =========================

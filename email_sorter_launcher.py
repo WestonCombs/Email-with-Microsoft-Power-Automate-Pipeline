@@ -21,7 +21,7 @@ from launcher_progress_ui import (
     parse_excel_progress_line,
     parse_run_progress_line,
 )
-from help_ai_dialog import HelpAIDialog
+from fix_flagged_dialog import FixFlaggedDialog
 from shared.project_paths import ensure_base_dir_in_environ
 from shared.settings_store import (
     apply_runtime_settings_from_json,
@@ -749,6 +749,25 @@ def orders_workbook_open_in_excel(target: Path) -> bool:
     return _find_workbook_by_path(excel, str(target.resolve())) is not None
 
 
+def ensure_orders_workbook_row2_filter(target: Path) -> None:
+    """Ensure the Orders sheet has Excel filter arrows on row 2 before opening."""
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+    except Exception:
+        return
+    try:
+        path = target.expanduser().resolve()
+        wb = load_workbook(str(path), keep_vba=path.suffix.lower() == ".xlsm")
+        ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
+        if ws.max_row >= 2 and ws.max_column >= 1:
+            ws.auto_filter.ref = f"A2:{get_column_letter(ws.max_column)}{max(ws.max_row, 2)}"
+            wb.save(str(path))
+        wb.close()
+    except Exception:
+        pass
+
+
 def focus_or_open_orders_workbook() -> None:
     target = resolve_orders_workbook_path()
     if target is None:
@@ -764,6 +783,7 @@ def focus_or_open_orders_workbook() -> None:
         )
         return
     path_str = str(target.resolve())
+    ensure_orders_workbook_row2_filter(target)
 
     if sys.platform == "win32":
         try:
@@ -912,6 +932,7 @@ class SettingsDialog:
         delete_saved_email_data = _settings_truthy(
             cfg.get("DELETE_SAVED_EMAIL_DATA_NEXT_RUN")
         )
+        pod_readiness_debug = _settings_truthy(cfg.get("POD_READINESS_DEBUG"))
 
         content = self._win
         outer = tk.Frame(content, padx=18, pady=18, bg=THEME["bg"])
@@ -998,6 +1019,18 @@ class SettingsDialog:
             "write", lambda *_: self._refresh_delete_saved_email_label()
         )
         self._refresh_delete_saved_email_label()
+        r += 1
+
+        self._pod_readiness_debug = tk.IntVar(value=1 if pod_readiness_debug else 0)
+        pod_debug_row = tk.Frame(outer, bg=THEME["bg"])
+        pod_debug_row.grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        _SettingsSwitch(pod_debug_row, self._pod_readiness_debug).pack(side=tk.LEFT)
+        tk.Label(
+            pod_debug_row,
+            text="POD selector debug (blue box + manual element controls)",
+            anchor=tk.W,
+            **label_opts,
+        ).pack(side=tk.LEFT, padx=(10, 0))
         r += 1
 
         tk.Label(
@@ -1109,6 +1142,7 @@ class SettingsDialog:
             "DELETE_SAVED_EMAIL_DATA_NEXT_RUN": (
                 "1" if self._delete_saved_email_data.get() else "0"
             ),
+            "POD_READINESS_DEBUG": "1" if self._pod_readiness_debug.get() else "0",
         }
         try:
             write_settings_json(updates)
@@ -1756,18 +1790,18 @@ def main() -> None:
     _attach_tooltip(pdf_folder_btn, "Open PDF folder")
     pdf_folder_btn.pack(side=tk.LEFT, fill=tk.Y)
 
-    help_ai_btn = tk.Button(
+    fix_flagged_btn = tk.Button(
         inner,
-        text="Help AI",
+        text="Fix Flagged",
         bg=_UPDATE_BG,
         fg="#0f1117",
         activebackground=_UPDATE_ACTIVE_BG,
         activeforeground="#0f1117",
-        command=lambda: HelpAIDialog(root),
+        command=lambda: FixFlaggedDialog(root),
         **common_btn,
     )
-    _add_button_hover(help_ai_btn, normal_bg=_UPDATE_BG, hover_bg="#fbbf24")
-    help_ai_btn.pack(fill=tk.X, **pad)
+    _add_button_hover(fix_flagged_btn, normal_bg=_UPDATE_BG, hover_bg="#fbbf24")
+    fix_flagged_btn.pack(fill=tk.X, **pad)
 
     settings_btn = tk.Button(
         inner,

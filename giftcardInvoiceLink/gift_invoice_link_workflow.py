@@ -36,6 +36,20 @@ JSON_PATH = PROJECT_ROOT / "email_contents" / "json" / "results.json"
 
 _REFRESH_ATTEMPTS = 3
 _REFRESH_BACKOFF_SEC = 0.35
+_WAITING_BLUE = (0, 122, 255)
+_CONFIRMED_GREEN = (52, 199, 89)
+_DEFAULT_TOP_ORANGE = (244, 177, 131)
+_ROW_RAINBOW_SECONDS = 0.45
+_ROW_RAINBOW_FRAME_SECONDS = 0.075
+_RAINBOW_PALETTE = (
+    (255, 59, 48),
+    (255, 149, 0),
+    (255, 214, 10),
+    (52, 199, 89),
+    (0, 122, 255),
+    (88, 86, 214),
+    (191, 90, 242),
+)
 
 _MSG_REFRESH_FAILED = (
     "Your link changes were saved on disk, but Excel could not finish refreshing "
@@ -106,6 +120,273 @@ def _record_index_for_row(records: list[dict], row: int, data_start_row: int) ->
     return idx
 
 
+def _excel_rgb(red: int, green: int, blue: int) -> int:
+    """Return the COLORREF integer Excel expects for Interior.Color."""
+    return int(red) + (int(green) * 256) + (int(blue) * 65536)
+
+
+def _last_visible_action_col(ws, header_row: int) -> int:
+    try:
+        used = ws.UsedRange
+        last_col = int(used.Column) + int(used.Columns.Count) - 1
+    except Exception:
+        last_col = 1
+    if last_col < 1:
+        last_col = 1
+
+    last_visible = 1
+    for col in range(1, last_col + 1):
+        try:
+            if bool(ws.Columns(col).Hidden):
+                continue
+            row1 = ws.Cells(1, col).Value
+            head = ws.Cells(header_row, col).Value
+            if str(row1 or "").strip() or str(head or "").strip():
+                last_visible = col
+        except Exception:
+            continue
+    return max(last_visible, 1)
+
+
+def _set_top_row_color(ws, header_row: int, color_rgb: tuple[int, int, int]) -> None:
+    color = _excel_rgb(*color_rgb)
+    last_col = _last_visible_action_col(ws, header_row)
+    for col in range(1, last_col + 1):
+        try:
+            if bool(ws.Columns(col).Hidden):
+                continue
+            cell = ws.Cells(1, col)
+            cell.Interior.Pattern = 1
+            cell.Interior.Color = color
+            cell.Interior.TintAndShade = 0
+            cell.Interior.PatternTintAndShade = 0
+        except Exception:
+            continue
+
+
+def _set_status(excel, text: str | None) -> None:
+    try:
+        excel.StatusBar = False if text is None else text
+    except Exception:
+        pass
+
+
+def _row_display_color(ws, row: int, fallback_col: int) -> int:
+    try:
+        return int(ws.Cells(row, fallback_col).Interior.Color)
+    except Exception:
+        return _excel_rgb(255, 255, 255)
+
+
+def _excel_col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _contiguous_spans(values: list[int]) -> list[tuple[int, int]]:
+    if not values:
+        return []
+    spans: list[tuple[int, int]] = []
+    start = prev = values[0]
+    for value in values[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        spans.append((start, prev))
+        start = prev = value
+    spans.append((start, prev))
+    return spans
+
+
+def _visible_col_spans(ws, last_col: int) -> list[tuple[int, int]]:
+    visible: list[int] = []
+    for col in range(1, last_col + 1):
+        try:
+            if not bool(ws.Columns(col).Hidden):
+                visible.append(col)
+        except Exception:
+            continue
+    return _contiguous_spans(visible)
+
+
+def _cell_address(row: int, col: int) -> str:
+    return f"${_excel_col_letter(col)}${row}"
+
+
+def _range_address(row_start: int, row_end: int, col_start: int, col_end: int) -> str:
+    first = _cell_address(row_start, col_start)
+    last = _cell_address(row_end, col_end)
+    return first if first == last else f"{first}:{last}"
+
+
+def _range_addresses(
+    row_spans: list[tuple[int, int]],
+    col_spans: list[tuple[int, int]],
+) -> list[str]:
+    return [
+        _range_address(row_start, row_end, col_start, col_end)
+        for row_start, row_end in row_spans
+        for col_start, col_end in col_spans
+    ]
+
+
+def _range_chunks(addresses: list[str], limit: int = 220) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for address in addresses:
+        added_len = len(address) + (1 if current else 0)
+        if current and current_len + added_len > limit:
+            chunks.append(",".join(current))
+            current = [address]
+            current_len = len(address)
+        else:
+            current.append(address)
+            current_len += added_len
+    if current:
+        chunks.append(",".join(current))
+    return chunks
+
+
+def _apply_interior_to_addresses(
+    ws,
+    addresses: list[str],
+    *,
+    pattern: int,
+    color: int,
+    tint: float = 0.0,
+    pattern_tint: float = 0.0,
+) -> None:
+    for chunk in _range_chunks(addresses):
+        try:
+            interior = ws.Range(chunk).Interior
+            interior.Pattern = pattern
+            interior.Color = color
+            interior.TintAndShade = tint
+            interior.PatternTintAndShade = pattern_tint
+        except Exception:
+            continue
+
+
+def _snapshot_rows(
+    ws,
+    rows: list[int],
+    visible_col_spans: list[tuple[int, int]],
+) -> dict[tuple[int, int, float, float], list[str]]:
+    saved: dict[tuple[int, int, float, float], list[str]] = {}
+    for row in rows:
+        for col_start, col_end in visible_col_spans:
+            for col in range(col_start, col_end + 1):
+                try:
+                    interior = ws.Cells(row, col).Interior
+                    style = (
+                        int(interior.Pattern),
+                        int(interior.Color),
+                        float(interior.TintAndShade),
+                        float(interior.PatternTintAndShade),
+                    )
+                    saved.setdefault(style, []).append(_cell_address(row, col))
+                except Exception:
+                    continue
+    return saved
+
+
+def _restore_row_snapshot(
+    ws,
+    saved: dict[tuple[int, int, float, float], list[str]],
+) -> None:
+    for (pattern, color, tint, pattern_tint), addresses in saved.items():
+        _apply_interior_to_addresses(
+            ws,
+            addresses,
+            pattern=pattern,
+            color=color,
+            tint=tint,
+            pattern_tint=pattern_tint,
+        )
+
+
+def _rows_for_link_flash(
+    records: list[dict],
+    gidx: int,
+    xidx: int,
+    data_start_row: int,
+    linked_order_number: str,
+) -> list[int]:
+    rows = {data_start_row + gidx, data_start_row + xidx}
+    order_nums = {linked_order_number}
+    gift_order = normalized_order_number(records[gidx])
+    if gift_order:
+        order_nums.add(gift_order)
+    for i, record in enumerate(records):
+        if normalized_order_number(record) in order_nums:
+            rows.add(data_start_row + i)
+    return sorted(rows)
+
+
+def _rows_for_unlink_flash(
+    records: list[dict],
+    gift_indices: list[int],
+    order_numbers: list[str],
+    data_start_row: int,
+) -> list[int]:
+    rows = {data_start_row + idx for idx in gift_indices if 0 <= idx < len(records)}
+    order_set = {
+        str(order_number).strip()
+        for order_number in order_numbers
+        if str(order_number).strip()
+    }
+    for i, record in enumerate(records):
+        if normalized_order_number(record) in order_set:
+            rows.add(data_start_row + i)
+    return sorted(rows)
+
+
+def _flash_rows_rainbow(
+    excel,
+    ws,
+    rows: list[int],
+    header_row: int,
+    fallback_col: int,
+) -> None:
+    if not rows:
+        return
+    last_col = _last_visible_action_col(ws, header_row)
+    visible_col_spans = _visible_col_spans(ws, last_col)
+    flash_addresses = _range_addresses(_contiguous_spans(rows), visible_col_spans)
+    saved = _snapshot_rows(ws, rows, visible_col_spans)
+    started = time.time()
+    frame = 0
+    try:
+        while time.time() - started < _ROW_RAINBOW_SECONDS:
+            color = _excel_rgb(*_RAINBOW_PALETTE[frame % len(_RAINBOW_PALETTE)])
+            _apply_interior_to_addresses(
+                ws,
+                flash_addresses,
+                pattern=1,
+                color=color,
+            )
+            try:
+                excel.ScreenUpdating = True
+            except Exception:
+                pass
+            time.sleep(_ROW_RAINBOW_FRAME_SECONDS)
+            frame += 1
+    finally:
+        if saved:
+            _restore_row_snapshot(ws, saved)
+        else:
+            _apply_interior_to_addresses(
+                ws,
+                flash_addresses,
+                pattern=1,
+                color=_row_display_color(ws, rows[0], fallback_col),
+            )
+
+
 def _order_summary(records: list[dict], idx: int, data_start_row: int | None = None) -> str:
     if idx < 0 or idx >= len(records):
         return "?"
@@ -140,6 +421,8 @@ def _remove_flow(
     records: list[dict],
     origin_row: int,
     data_start_row: int,
+    header_row: int,
+    excel,
     ws,
     col_cat: int,
 ) -> None:
@@ -164,8 +447,12 @@ def _remove_flow(
         r = messagebox.askyesnocancel("Remove gift / order links", msg)
         if r is not True:
             return
+        affected_rows = _rows_for_unlink_flash(records, [idx], nums, data_start_row)
         new_edges = remove_all_edges_for_gift(edges, key)
         save_edges(link_path, new_edges)
+        _set_top_row_color(ws, header_row, _CONFIRMED_GREEN)
+        _set_status(excel, "Invoice Link removed.")
+        _flash_rows_rainbow(excel, ws, affected_rows, header_row, col_cat)
         return
 
     on = normalized_order_number(records[idx])
@@ -193,14 +480,24 @@ def _remove_flow(
     r = messagebox.askyesnocancel("Remove gift / order links", msg)
     if r is not True:
         return
+    gift_indices = [
+        gi
+        for e in rel
+        if (gi := index_for_key(records, e.gift_key)) is not None
+    ]
+    affected_rows = _rows_for_unlink_flash(records, gift_indices, [on], data_start_row)
     new_edges = remove_all_edges_for_order_number(edges, on)
     save_edges(link_path, new_edges)
+    _set_top_row_color(ws, header_row, _CONFIRMED_GREEN)
+    _set_status(excel, "Invoice Link removed.")
+    _flash_rows_rainbow(excel, ws, affected_rows, header_row, col_cat)
 
 
 def _add_flow(
     records: list[dict],
     origin_row: int,
     data_start_row: int,
+    header_row: int,
     excel,
     ws,
     col_cat: int,
@@ -211,8 +508,15 @@ def _add_flow(
         return
     ocat = _category(ws, origin_row, col_cat)
 
+    _set_top_row_color(ws, header_row, _WAITING_BLUE)
+    _set_status(
+        excel,
+        "Invoice Link: waiting for the matching gift card/order row. Click the row to link.",
+    )
     target_row = _wait_different_row(excel, origin_row)
     if target_row is None:
+        _set_top_row_color(ws, header_row, _DEFAULT_TOP_ORANGE)
+        _set_status(excel, None)
         messagebox.showwarning("Invoice link", "Timed out waiting for a new row selection.")
         return
     tidx = _record_index_for_row(records, target_row, data_start_row)
@@ -255,12 +559,23 @@ def _add_flow(
     )
     r = messagebox.askyesnocancel("Confirm gift / order link", msg)
     if r is not True:
+        _set_top_row_color(ws, header_row, _DEFAULT_TOP_ORANGE)
+        _set_status(excel, None)
         return
 
     link_path = links_path_for_project_root(PROJECT_ROOT)
     edges = load_edges(link_path, records)
     edges = add_edge(edges, g_key, order_on)
     save_edges(link_path, edges)
+    _set_top_row_color(ws, header_row, _CONFIRMED_GREEN)
+    _set_status(excel, "Invoice Link confirmed.")
+    _flash_rows_rainbow(
+        excel,
+        ws,
+        _rows_for_link_flash(records, gidx, xidx, data_start_row, order_on),
+        header_row,
+        col_cat,
+    )
 
 
 def main() -> None:
@@ -351,9 +666,9 @@ def main() -> None:
         txt = str(cell_txt).strip() if cell_txt is not None else ""
 
         if txt == "Linked":
-            _remove_flow(records, origin_row, data_start_row, ws, col_cat)
+            _remove_flow(records, origin_row, data_start_row, header_row, excel, ws, col_cat)
         elif txt in ("Link to order", "Link to Gift Card"):
-            _add_flow(records, origin_row, data_start_row, excel, ws, col_cat)
+            _add_flow(records, origin_row, data_start_row, header_row, excel, ws, col_cat)
         else:
             messagebox.showinfo(
                 "Invoice link",
@@ -376,6 +691,12 @@ def main() -> None:
         root.withdraw()
         messagebox.showwarning("Invoice link", _MSG_REFRESH_FAILED + str(ex))
         root.destroy()
+    finally:
+        try:
+            _set_top_row_color(ws, header_row, _DEFAULT_TOP_ORANGE)
+            _set_status(excel, None)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
