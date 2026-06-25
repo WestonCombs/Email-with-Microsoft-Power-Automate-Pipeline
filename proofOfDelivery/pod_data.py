@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,7 @@ from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
 from trackingNumbersViewer.mitm_readiness import sanitize_filename_token
+from htmlHandler.carrier_urls import infer_carrier
 
 POD_CATEGORY = "POD"
 AUTOMATION_HUB_CATEGORY = "Automation Hub"
@@ -18,6 +21,7 @@ AUTOMATION_HUB_COMPANY_LABEL = "Proof of Delivery"
 AUTOMATION_HUB_STATUS_LABEL = "Process Remaining PODs"
 POD_HUB_MODE = "remaining_pod_hub"
 PROOF_OF_DELIVERY_JSON_NAME = "proof_of_delivery.json"
+POD_ARCHIVE_DIR_NAME = "pod_archive"
 _LEGACY_CATEGORY_SUFFIX_MAP = {
     "Invoice": "INVOICE",
     "Shipped": "SHIPPED",
@@ -39,8 +43,50 @@ def proof_of_delivery_json_path(project_root: Path) -> Path:
     return project_root / "email_contents" / "json" / PROOF_OF_DELIVERY_JSON_NAME
 
 
+def tracking_pdf_audit_json_path(project_root: Path) -> Path:
+    return project_root / "email_contents" / "json" / "tracking_pdf_audit.json"
+
+
 def pdf_output_dir(project_root: Path) -> Path:
     return project_root / "email_contents" / "pdf"
+
+
+def pod_archive_dir() -> Path:
+    """Long-lived POD backup outside ``email_contents`` cleanup."""
+    return Path(__file__).resolve().parent / POD_ARCHIVE_DIR_NAME
+
+
+def backup_pod_pdf(pdf_path: str | Path) -> Path | None:
+    """Copy a captured POD PDF into the persistent POD archive."""
+    try:
+        src = Path(pdf_path).expanduser().resolve()
+    except OSError:
+        return None
+    if not src.is_file() or src.suffix.lower() != ".pdf":
+        return None
+    archive = pod_archive_dir()
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    target = archive / src.name
+    if target.exists():
+        try:
+            if target.stat().st_size == src.stat().st_size:
+                return target
+        except OSError:
+            return None
+        stem = target.stem
+        suffix = target.suffix
+        counter = 2
+        while target.exists():
+            target = archive / f"{stem} ({counter}){suffix}"
+            counter += 1
+    try:
+        shutil.copy2(src, target)
+        return target
+    except OSError:
+        return None
 
 
 def clean_value(value: Any) -> Any:
@@ -143,12 +189,7 @@ def load_proof_of_delivery_records(project_root: Path) -> list[dict]:
 
 
 def _carrier_display_for_number(tracking_number: str) -> str:
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import carrier_display_for_number
-
-        return str(carrier_display_for_number(tracking_number) or "").strip() or "Unknown"
-    except Exception:
-        return "Unknown"
+    return str(infer_carrier(tracking_number) or "").strip() or "Unknown"
 
 
 def _purchase_date_token(value: object) -> str:
@@ -244,14 +285,39 @@ def first_existing_pdf_named(project_root: Path, basename: str) -> Path | None:
     out_dir = pdf_output_dir(project_root)
     direct = out_dir / f"{basename}.pdf"
     if direct.is_file():
+        backup_pod_pdf(direct)
         return direct
     collision_re = re.compile(rf"^{re.escape(basename)} \(\d+\)\.pdf$", re.IGNORECASE)
     try:
         for path in out_dir.glob("*.pdf"):
             if path.is_file() and collision_re.match(path.name):
+                backup_pod_pdf(path)
                 return path
     except OSError:
-        return None
+        pass
+    archive = pod_archive_dir()
+    archive_direct = archive / f"{basename}.pdf"
+    archive_candidates: list[Path] = []
+    if archive_direct.is_file():
+        archive_candidates.append(archive_direct)
+    try:
+        archive_candidates.extend(
+            path
+            for path in archive.glob("*.pdf")
+            if path.is_file() and collision_re.match(path.name)
+        )
+    except OSError:
+        pass
+    for archived in archive_candidates:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            restored = out_dir / archived.name
+            if not restored.exists():
+                shutil.copy2(archived, restored)
+            if restored.is_file():
+                return restored
+        except OSError:
+            continue
     return None
 
 
@@ -355,7 +421,9 @@ def automation_hub_record() -> dict:
         "source_file": None,
         "source_file_link": None,
         "total_amount_paid": None,
+        "subtotal_amount": None,
         "tax_paid": None,
+        "gift_card_amount": None,
         "tracking_numbers": [],
         "tracking_links": [],
         "tracking_numbers_link_confirmed": [],
@@ -375,18 +443,269 @@ def _base_record_company(record: dict) -> str:
 
 
 def _pod_record_identity(record: dict) -> str:
-    return str(clean_value(record.get("source_file_link")) or "").strip()
+    return str(
+        clean_value(record.get("source_file_link"))
+        or clean_value(record.get("source_file"))
+        or ""
+    ).strip()
+
+
+def _load_tracking_pdf_audit_entries(project_root: Path) -> list[dict]:
+    entries = load_json_records(tracking_pdf_audit_json_path(project_root))
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    entries.sort(key=lambda entry: str(entry.get("timestamp_captured") or ""), reverse=True)
+    return entries
+
+
+def _pdf_path_from_audit_entry(project_root: Path, entry: dict) -> Path | None:
+    path = _safe_path(entry.get("path"))
+    if path is not None and path.is_file():
+        backup_pod_pdf(path)
+        return path
+
+    filename = str(clean_value(entry.get("filename")) or "").strip()
+    if not filename and path is not None:
+        filename = path.name
+    if not filename:
+        return None
+    return first_existing_pdf_named(project_root, Path(filename).stem)
+
+
+def _audit_entries_by_tracking(project_root: Path) -> dict[str, list[tuple[dict, Path]]]:
+    by_tracking: dict[str, list[tuple[dict, Path]]] = {}
+    for entry in _load_tracking_pdf_audit_entries(project_root):
+        if entry.get("latest_tracking_info_visible") is False:
+            continue
+        tracking_number = _normalize_tracking_number(entry.get("tracking_number"))
+        if not tracking_number:
+            continue
+        pdf_path = _pdf_path_from_audit_entry(project_root, entry)
+        if pdf_path is None:
+            continue
+        by_tracking.setdefault(tracking_number, []).append((entry, pdf_path))
+    return by_tracking
+
+
+def _select_audited_pdf_for_record(
+    audit_entries: dict[str, list[tuple[dict, Path]]],
+    *,
+    tracking_number: object,
+    order_number: object,
+    category: object,
+) -> tuple[dict, Path] | None:
+    candidates = audit_entries.get(_normalize_tracking_number(tracking_number), [])
+    if not candidates:
+        return None
+
+    wanted_order = _normalized_text(order_number)
+    wanted_category = _normalized_text(category)
+
+    def entry_order(entry: dict) -> str:
+        return _normalized_text(entry.get("order_number"))
+
+    def entry_category(entry: dict) -> str:
+        return _normalized_text(entry.get("category"))
+
+    for entry, path in candidates:
+        if (
+            wanted_order
+            and wanted_category
+            and entry_order(entry) == wanted_order
+            and entry_category(entry) == wanted_category
+        ):
+            return entry, path
+    for entry, path in candidates:
+        if wanted_order and entry_order(entry) == wanted_order:
+            return entry, path
+    for entry, path in candidates:
+        if wanted_category and entry_category(entry) == wanted_category:
+            return entry, path
+    return candidates[0]
+
+
+def _pod_record_for_pdf(
+    *,
+    project_root: Path,
+    pdf_path: Path,
+    company: object,
+    purchase_datetime: object,
+    order_number: object,
+    source_category: object,
+    source_email: object,
+    tracking_number: object,
+    carrier_display: object,
+    source_index: int | None,
+) -> dict:
+    resolved_pdf = pdf_path.resolve()
+    tracking_text = _normalize_tracking_number(tracking_number)
+    company_text = str(clean_value(company) or "Unknown").strip() or "Unknown"
+    return {
+        "email_category": POD_CATEGORY,
+        "order_number": clean_value(order_number),
+        "purchase_datetime": None,
+        "company": company_text,
+        "email": None,
+        "source_file": str(resolved_pdf),
+        "source_file_link": resolved_pdf.as_uri(),
+        "subject": f"Proof of delivery for {company_text} tracking {tracking_text}",
+        "total_amount_paid": None,
+        "subtotal_amount": None,
+        "tax_paid": None,
+        "gift_card_amount": None,
+        "tracking_numbers": [tracking_text] if tracking_text else [],
+        "tracking_links": [],
+        "tracking_numbers_link_confirmed": [True] if tracking_text else [],
+        "pod_tracking_number": tracking_text,
+        "pod_carrier": (
+            str(clean_value(carrier_display) or "").strip()
+            or _carrier_display_for_number(tracking_text)
+        ),
+        "pod_expected_file_name": expected_pod_pdf_path(
+            project_root,
+            company_text,
+            purchase_datetime,
+            tracking_text,
+            carrier_display,
+        ).name,
+        "pod_generated_file_name": resolved_pdf.name,
+        "pod_source_category": clean_value(source_category),
+        "pod_source_email": clean_value(source_email),
+        "pod_source_purchase_datetime": clean_value(purchase_datetime),
+        "pod_source_index": source_index,
+    }
+
+
+def upsert_pod_review_record(
+    project_root: Path,
+    *,
+    pdf_path: str | Path,
+    source_record: dict,
+    reason: object = "",
+) -> dict:
+    """Create or update a flagged POD review row for a captured page that needs manual review."""
+    try:
+        resolved_pdf = Path(pdf_path).expanduser().resolve()
+    except OSError:
+        resolved_pdf = Path(pdf_path)
+    tracking_number = _normalize_tracking_number(source_record.get("tracking_number"))
+    carrier_display = (
+        str(clean_value(source_record.get("carrier")) or "").strip()
+        or _carrier_display_for_number(tracking_number)
+    )
+    review = _pod_record_for_pdf(
+        project_root=project_root,
+        pdf_path=resolved_pdf,
+        company=source_record.get("company"),
+        purchase_datetime=source_record.get("purchase_datetime"),
+        order_number=source_record.get("order_number"),
+        source_category=source_record.get("email_category") or source_record.get("category"),
+        source_email=source_record.get("email"),
+        tracking_number=tracking_number,
+        carrier_display=carrier_display,
+        source_index=None,
+    )
+    reason_text = str(clean_value(reason) or "").strip()
+    if not reason_text:
+        reason_text = "Tracking details were not visible enough for automatic approval."
+    review.update(
+        {
+            "excel_flagged": True,
+            "pod_review_required": True,
+            "pod_review_status": "active",
+            "pod_review_reason": reason_text,
+            "pod_review_created_at": datetime.now().isoformat(timespec="seconds"),
+            "pod_capture_review_pdf": str(resolved_pdf),
+            "latest_tracking_info_visible": False,
+            "subject": f"POD needs review for {review.get('company') or 'Unknown'} tracking {tracking_number}",
+        }
+    )
+
+    path = proof_of_delivery_json_path(project_root)
+    records = load_proof_of_delivery_records(project_root)
+    source_link = str(review.get("source_file_link") or "").strip()
+    match_idx: int | None = None
+    for idx, existing in enumerate(records):
+        if str(existing.get("source_file_link") or "").strip() == source_link:
+            match_idx = idx
+            break
+        if (
+            _normalize_tracking_number(existing.get("pod_tracking_number")) == tracking_number
+            and _normalized_text(existing.get("order_number")) == _normalized_text(review.get("order_number"))
+            and bool(existing.get("pod_review_required"))
+        ):
+            match_idx = idx
+            break
+    if match_idx is None:
+        records.append(review)
+        match_idx = len(records) - 1
+    else:
+        preserved = {
+            key: records[match_idx].get(key)
+            for key in ("user_modified", "user_modified_at")
+            if key in records[match_idx]
+        }
+        records[match_idx].update(review)
+        records[match_idx].update(preserved)
+
+    try:
+        from shared.order_store import ensure_record_ids, try_sync_open_excel_records
+
+        ensure_record_ids(records)
+        record_id = str(records[match_idx].get("_record_id") or "")
+        save_json_records(path, records)
+        try_sync_open_excel_records(
+            project_root,
+            records=records,
+            record_ids={record_id},
+            fields={"excel_flagged", "excel_active"},
+            show_success=False,
+        )
+    except Exception:
+        save_json_records(path, records)
+
+    backup_pod_pdf(resolved_pdf)
+    try:
+        from shared.fix_flagged import sync_fix_flagged_requests
+
+        sync_fix_flagged_requests(project_root)
+    except Exception:
+        pass
+    return records[match_idx]
+
+
+def _existing_pdf_for_pod_record(project_root: Path, record: dict) -> Path | None:
+    for candidate in (
+        _safe_path(record.get("source_file")),
+        _path_from_file_uri(record.get("source_file_link")),
+    ):
+        if candidate is not None and candidate.is_file():
+            backup_pod_pdf(candidate)
+            return candidate
+
+    for key in ("pod_generated_file_name", "pod_expected_file_name"):
+        filename = str(clean_value(record.get(key)) or "").strip()
+        if not filename:
+            continue
+        found = first_existing_pdf_named(project_root, Path(filename).stem)
+        if found is not None:
+            return found
+
+    tracking_number = _record_tracking_number(record)
+    if not tracking_number:
+        return None
+    return first_existing_pod_pdf_path(
+        project_root,
+        record.get("company"),
+        record.get("pod_source_purchase_datetime") or record.get("purchase_datetime"),
+        tracking_number,
+        record.get("pod_carrier"),
+    )
 
 
 def discover_proof_of_delivery_records(project_root: Path, base_records: list[dict]) -> list[dict]:
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
-    except Exception:
-        def tracking_is_greyed_out(_tracking_number: str) -> bool:
-            return False
-
     discovered: list[dict] = []
     seen_links: set[str] = set()
+    audit_entries = _audit_entries_by_tracking(project_root)
     for source_index, record in enumerate(base_records):
         if is_pod_record(record) or is_automation_hub_record(record):
             continue
@@ -396,16 +715,7 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
         source_category = clean_value(record.get("email_category"))
         source_email = clean_value(record.get("email"))
         for tracking_number in tracking_numbers_for_record(record):
-            if tracking_is_greyed_out(tracking_number):
-                continue
             carrier_display = _carrier_display_for_number(tracking_number)
-            pdf_path = expected_pod_pdf_path(
-                project_root,
-                company,
-                purchase_datetime,
-                tracking_number,
-                carrier_display,
-            )
             existing_pdf_path = first_existing_pod_pdf_path(
                 project_root,
                 company,
@@ -414,36 +724,34 @@ def discover_proof_of_delivery_records(project_root: Path, base_records: list[di
                 carrier_display,
             )
             if existing_pdf_path is None:
+                audited = _select_audited_pdf_for_record(
+                    audit_entries,
+                    tracking_number=tracking_number,
+                    order_number=order_number,
+                    category=source_category,
+                )
+                if audited is not None:
+                    _audit_entry, audited_pdf_path = audited
+                    existing_pdf_path = audited_pdf_path
+            if existing_pdf_path is None:
                 continue
-            pdf_path = existing_pdf_path
-            source_file_link = pdf_path.resolve().as_uri()
+            source_file_link = existing_pdf_path.resolve().as_uri()
             if source_file_link in seen_links:
                 continue
             seen_links.add(source_file_link)
             discovered.append(
-                {
-                    "email_category": POD_CATEGORY,
-                    "order_number": order_number,
-                    "purchase_datetime": None,
-                    "company": company,
-                    "email": None,
-                    "source_file": str(pdf_path.resolve()),
-                    "source_file_link": source_file_link,
-                    "subject": f"Proof of delivery for {company} tracking {tracking_number}",
-                    "total_amount_paid": None,
-                    "tax_paid": None,
-                    "tracking_numbers": [tracking_number],
-                    "tracking_links": [],
-                    "tracking_numbers_link_confirmed": [True],
-                    "pod_tracking_number": tracking_number,
-                    "pod_carrier": carrier_display,
-                    "pod_expected_file_name": pdf_path.name,
-                    "pod_generated_file_name": pdf_path.name,
-                    "pod_source_category": source_category,
-                    "pod_source_email": source_email,
-                    "pod_source_purchase_datetime": purchase_datetime,
-                    "pod_source_index": source_index,
-                }
+                _pod_record_for_pdf(
+                    project_root=project_root,
+                    pdf_path=existing_pdf_path,
+                    company=company,
+                    purchase_datetime=purchase_datetime,
+                    order_number=order_number,
+                    source_category=source_category,
+                    source_email=source_email,
+                    tracking_number=tracking_number,
+                    carrier_display=carrier_display,
+                    source_index=source_index,
+                )
             )
     return discovered
 
@@ -467,14 +775,25 @@ def sync_proof_of_delivery_records(project_root: Path) -> tuple[list[dict], bool
     for record in current:
         if not isinstance(record, dict):
             continue
-        if not record.get("user_modified") and not any(
+        existing_pdf = _existing_pdf_for_pod_record(project_root, record)
+        has_user_edits = bool(record.get("user_modified")) or any(
             str(k).startswith("modified_") and bool(v) for k, v in record.items()
-        ):
+        )
+        if existing_pdf is None and not has_user_edits:
             continue
         ident = _pod_record_identity(record)
-        if ident and ident not in desired_ids:
+        if ident and ident in desired_ids:
+            continue
+        if existing_pdf is not None:
+            resolved_pdf = existing_pdf.resolve()
+            record["source_file"] = str(resolved_pdf)
+            record["source_file_link"] = resolved_pdf.as_uri()
+            record["pod_generated_file_name"] = resolved_pdf.name
+            ident = _pod_record_identity(record)
+        if not ident or ident not in desired_ids:
             desired.append(record)
-            desired_ids.add(ident)
+            if ident:
+                desired_ids.add(ident)
     changed = json.dumps(current, sort_keys=True, ensure_ascii=False) != json.dumps(
         desired,
         sort_keys=True,
@@ -542,12 +861,6 @@ def load_excel_records(
 
 
 def remaining_pod_candidates(project_root: Path) -> list[dict]:
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
-    except Exception:
-        def tracking_is_greyed_out(_tracking_number: str) -> bool:
-            return False
-
     base_records = load_results_records(project_root)
     seen_numbers: set[str] = set()
     out: list[dict] = []
@@ -562,8 +875,6 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
             if tracking_number in seen_numbers:
                 continue
             seen_numbers.add(tracking_number)
-            if tracking_is_greyed_out(tracking_number):
-                continue
             carrier_display = _carrier_display_for_number(tracking_number)
             pdf_path = expected_pod_pdf_path(
                 project_root,
@@ -594,19 +905,31 @@ def remaining_pod_candidates(project_root: Path) -> list[dict]:
     return out
 
 
-def pod_status_viewer_rows(project_root: Path) -> list[dict]:
-    """All tracking rows for the POD/status viewer, including processed and grey rows."""
-    try:
-        from trackingNumbersViewer.seventeen_track_smart import tracking_is_greyed_out
-    except Exception:
-        def tracking_is_greyed_out(_tracking_number: str) -> bool:
-            return False
+def pod_status_viewer_rows(
+    project_root: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict]:
+    """All tracking rows for the POD viewer, including processed rows."""
 
     base_records = load_results_records(project_root)
+    resolved_reviews_by_tracking: dict[str, dict] = {}
+    for review in load_proof_of_delivery_records(project_root):
+        tracking_number = _normalize_tracking_number(review.get("pod_tracking_number") or review.get("tracking_number"))
+        if not tracking_number:
+            continue
+        status = str(review.get("pod_review_status") or "").strip().lower()
+        if status != "resolved" and not bool(review.get("pod_review_skipped_eternally")):
+            continue
+        resolved_reviews_by_tracking[tracking_number] = review
+    total = len(base_records)
+    if progress_callback is not None:
+        progress_callback(0, total)
     seen_numbers: set[str] = set()
     out: list[dict] = []
-    for record in base_records:
+    for idx, record in enumerate(base_records, start=1):
         if is_pod_record(record) or is_automation_hub_record(record):
+            if progress_callback is not None:
+                progress_callback(idx, total)
             continue
         company = _base_record_company(record)
         purchase_datetime = clean_value(record.get("purchase_datetime"))
@@ -624,6 +947,7 @@ def pod_status_viewer_rows(project_root: Path) -> list[dict]:
                 tracking_number,
                 carrier_display,
             )
+            resolved_review = resolved_reviews_by_tracking.get(tracking_number)
             out.append(
                 {
                     "tracking_number": tracking_number,
@@ -633,9 +957,16 @@ def pod_status_viewer_rows(project_root: Path) -> list[dict]:
                     "order_number": order_number,
                     "category": source_category,
                     "expected_pdf_path": str(pdf_path.resolve()),
-                    "greyed_out": bool(tracking_is_greyed_out(tracking_number)),
+                    "pod_review_status": "resolved" if resolved_review is not None else "",
+                    "pod_review_resolved": resolved_review is not None,
+                    "pod_review_skipped_eternally": bool(
+                        resolved_review and resolved_review.get("pod_review_skipped_eternally")
+                    ),
+                    "greyed_out": False,
                 }
             )
+        if progress_callback is not None:
+            progress_callback(idx, total)
     return out
 
 

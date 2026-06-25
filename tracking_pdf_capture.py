@@ -124,6 +124,12 @@ def _write_pdf_with_collision(record: dict, pdf_bytes: bytes) -> Path:
         try:
             with candidate.open("xb") as handle:
                 handle.write(pdf_bytes)
+            try:
+                from proofOfDelivery.pod_data import backup_pod_pdf
+
+                backup_pod_pdf(candidate)
+            except Exception:
+                pass
             return candidate
         except FileExistsError:
             continue

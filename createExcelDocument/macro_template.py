@@ -21,13 +21,11 @@ CLIPBOARD_INI_NAME = "excel_clipboard_launch.ini"
 
 # Workbook_SheetFollowHyperlink: Open File Location uses # in-sheet links; file URI in column 29 (AC).
 # Tracking URLs: 30…44. Tracking numbers: 45…59. Link-cross-check flags: 60…74 (1 = also found on tracking URL).
-# Reads UTF-8 ini (PY=, SCRIPT=, VIEWER=, TRACKING_NUMBERS_VIEWER=, TRACKING_STATUS_VIEWER=) from AA1 / excel_clipboard_launch.ini.
-# Triple-Escape handler lives in standard module EMAIL_SORTER_HOTKEYS_VBA (Application.OnKey cannot target ThisWorkbook reliably).
+# Reads UTF-8 ini (PY=, SCRIPT=, VIEWER=, GIFTCARD_LINK=, TRACKING_NUMBERS_VIEWER=, TRACKING_STATUS_VIEWER=) from AA1 / excel_clipboard_launch.ini.
+# Excel edit sync handler lives in a standard module so workbook events can call shared helpers reliably.
 EMAIL_SORTER_HOTKEYS_VBA = r'''Option Explicit
 
-' Application.OnKey must reference a Public Sub in a standard module (not ThisWorkbook).
-Private escPresses As Long
-Private escLastAt As Date
+' Workbook events call these helpers from ThisWorkbook.
 Private editModeEnabled As Boolean
 Private editEventsBusy As Boolean
 Private editExpiresAt As Date
@@ -41,19 +39,20 @@ Private editSelectedHadFormula As Boolean
 Private editRainbowFrame As Long
 Private editRainbowPalette As Variant
 
-Private Const TRIPLE_ESC_MAX_GAP_SEC As Long = 2
 Private Const EDIT_MODE_SECONDS As Long = 10
 Private Const EDIT_RAINBOW_FRAME_SECONDS As Double = 0.12
+Private Const SUCCESS_RAINBOW_SECONDS As Double = 3
 Private Const TOP_ROW As Long = 1
 Private Const DEFAULT_HEADER_ROW As Long = 2
 Private Const COL_FILE_URI As Long = 29
+Private Const COL_RECORD_ID As Long = 75
 Private Const TOP_ORANGE_R As Long = 244
 Private Const TOP_ORANGE_G As Long = 177
 Private Const TOP_ORANGE_B As Long = 131
 Private Const TOP_GREEN_R As Long = 52
 Private Const TOP_GREEN_G As Long = 199
 Private Const TOP_GREEN_B As Long = 89
-Private Const USER_EDIT_ALLOWED_LABELS As String = "Company, Purchase Date, Total Paid, Tax Paid, Accounting"
+Private Const USER_EDIT_ALLOWED_LABELS As String = "Flagged, Category, Order Number, Company, Purchase Date, Subtotal, Total Paid, Tax Paid, GC Paid, Accounting"
 Private Const USER_EDIT_LOG_FILE As String = "email_sorter_user_edit.log"
 Private lastUserEditContextTsv As String
 
@@ -74,29 +73,6 @@ Private Sub EmailSorter_LogUserEdit(ByVal detail As String)
     Set ts = fso.OpenTextFile(p, 8, True, -1)
     ts.WriteLine Format(Now, "yyyy-mm-dd hh:nn:ss") & " [VBA] " & detail
     ts.Close
-End Sub
-
-Public Sub EmailSorter_TripleEscapeHandler()
-    On Error GoTo CleanFail
-    If ActiveWorkbook Is Nothing Then Exit Sub
-    If Not ActiveWorkbook Is ThisWorkbook Then Exit Sub
-
-    Dim t As Date
-    t = Now
-    If escPresses > 0 Then
-        If DateDiff("s", escLastAt, t) > TRIPLE_ESC_MAX_GAP_SEC Then escPresses = 0
-    End If
-
-    escPresses = escPresses + 1
-    escLastAt = t
-
-    If escPresses >= 3 Then
-        escPresses = 0
-        EmailSorter_StartEditMode
-    End If
-    Exit Sub
-CleanFail:
-    escPresses = 0
 End Sub
 
 Public Sub EmailSorter_StartEditMode()
@@ -171,19 +147,20 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
     Dim cleanValue As String
     Dim orderNumber As String
     Dim sourceUri As String
+    Dim recordId As String
     Dim rc As Long
     Dim resultMode As String
     Dim resultValue As String
     Dim resultValueKind As String
 
     On Error GoTo CleanFail
-    If Not editModeEnabled Then Exit Sub
     If editEventsBusy Then Exit Sub
     If Target Is Nothing Then Exit Sub
     If Not EmailSorter_IsOrdersSheet(Sh) Then Exit Sub
+    editOldStatusBar = Application.StatusBar
 
     If Target.Cells.CountLarge <> 1 Then
-        EmailSorter_DisallowEdit Target, "Only one cell can be edited while triple-Esc edit mode is active."
+        EmailSorter_DisallowEdit Target, "Only one editable order cell can be changed at a time."
         Exit Sub
     End If
     If Target.Row <= HeaderRow(Sh) Then
@@ -198,21 +175,50 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
     End If
 
     cleanValue = EmailSorter_CleanSubmittedValue(Target.Value)
+    orderNumber = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, HeaderColumn(Sh, "Order Number")).Value)
+    sourceUri = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_FILE_URI).Value)
+    recordId = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_RECORD_ID).Value)
+
+    If fieldKey = "excel_flagged" Then
+        cleanValue = EmailSorter_NormalizedFlaggedValue(cleanValue)
+        rc = EmailSorter_RunUserEditSync(Sh, fieldKey, cleanValue, orderNumber, sourceUri, recordId, Target.Row)
+        If rc <> 0 Then
+            EmailSorter_RestoreEditedTarget Target
+            MsgBox "I could not record that Flagged toggle, so the cell was restored." & vbCrLf & vbCrLf & "Diagnostics were appended to:" & vbCrLf & EmailSorter_UserEditLogFullPath(), vbExclamation, "Email Sorter"
+            EmailSorter_EndEditMode False
+            Exit Sub
+        End If
+        EmailSorter_ReadUserEditSyncResult lastUserEditContextTsv, resultMode, resultValue, resultValueKind
+        editEventsBusy = True
+        Application.EnableEvents = False
+        EmailSorter_ApplyPlainCellValue Target, resultValue, resultValueKind
+        Application.EnableEvents = True
+        editEventsBusy = False
+        lastUserEditContextTsv = ""
+        EmailSorter_EndEditMode True
+        Application.StatusBar = "Flagged saved."
+        Exit Sub
+    End If
+
     If fieldKey = "accounting" Then
+        rc = EmailSorter_RunUserEditSync(Sh, fieldKey, cleanValue, orderNumber, sourceUri, recordId, Target.Row)
+        If rc <> 0 Then
+            EmailSorter_RestoreEditedTarget Target
+            MsgBox "I could not record that edit, so the cell was restored." & vbCrLf & vbCrLf & "Diagnostics were appended to:" & vbCrLf & EmailSorter_UserEditLogFullPath(), vbExclamation, "Email Sorter"
+            EmailSorter_EndEditMode False
+            Exit Sub
+        End If
         editEventsBusy = True
         Application.EnableEvents = False
         Target.Value = cleanValue
         Application.EnableEvents = True
         editEventsBusy = False
         EmailSorter_EndEditMode True
-        Application.StatusBar = "Accounting saved in workbook."
+        Application.StatusBar = "Accounting saved."
         Exit Sub
     End If
 
-    orderNumber = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, HeaderColumn(Sh, "Order Number")).Value)
-    sourceUri = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_FILE_URI).Value)
-
-    rc = EmailSorter_RunUserEditSync(Sh, fieldKey, cleanValue, orderNumber, sourceUri, Target.Row)
+    rc = EmailSorter_RunUserEditSync(Sh, fieldKey, cleanValue, orderNumber, sourceUri, recordId, Target.Row)
     If rc <> 0 Then
         EmailSorter_RestoreEditedTarget Target
         Dim failMsg As String
@@ -230,9 +236,13 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
     EmailSorter_ReadUserEditSyncResult lastUserEditContextTsv, resultMode, resultValue, resultValueKind
     editEventsBusy = True
     Application.EnableEvents = False
-    If LCase$(resultMode) = "cleared" Then
+    If LCase$(resultMode) = "unchanged" Then
+        EmailSorter_RestoreEditedTarget Target
+    ElseIf LCase$(resultMode) = "cleared" Then
         If fieldKey = "company" And Len(orderNumber) > 0 Then
             EmailSorter_ApplyCompanyEditToOrder Sh, orderNumber, resultValue, False, resultValueKind
+        ElseIf fieldKey = "purchase_datetime" And Len(orderNumber) > 0 Then
+            EmailSorter_ApplyFieldEditToOrder Sh, orderNumber, "Purchase Date", resultValue, False, resultValueKind
         Else
             EmailSorter_ApplyPlainCellValue Target, resultValue, resultValueKind
         End If
@@ -243,7 +253,11 @@ Public Sub EmailSorter_HandleSheetChange(ByVal Sh As Object, ByVal Target As Ran
             Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
         End If
     ElseIf fieldKey = "purchase_datetime" Then
-        Target.Value = EmailSorter_DisplayModifiedValue(resultValue)
+        If Len(orderNumber) > 0 Then
+            EmailSorter_ApplyFieldEditToOrder Sh, orderNumber, "Purchase Date", resultValue
+        Else
+            Target.Value = EmailSorter_DisplayModifiedValue(resultValue)
+        End If
     Else
         Target.Value = EmailSorter_DisplayModifiedValue(cleanValue)
     End If
@@ -258,6 +272,52 @@ CleanFail:
     Application.EnableEvents = True
     editEventsBusy = False
     EmailSorter_EndEditMode False
+End Sub
+
+Public Sub EmailSorter_HandleBeforeDoubleClick(ByVal Sh As Object, ByVal Target As Range, ByRef Cancel As Boolean)
+    Dim cleanValue As String
+    Dim orderNumber As String
+    Dim sourceUri As String
+    Dim recordId As String
+    Dim rc As Long
+    Dim resultMode As String
+    Dim resultValue As String
+    Dim resultValueKind As String
+
+    On Error GoTo CleanFail
+    If Target Is Nothing Then Exit Sub
+    If Target.Cells.CountLarge <> 1 Then Exit Sub
+    If Not EmailSorter_IsOrdersSheet(Sh) Then Exit Sub
+    If Target.Row <= HeaderRow(Sh) Then Exit Sub
+    If EmailSorter_FieldKeyForColumn(Sh, Target.Column) <> "excel_flagged" Then Exit Sub
+
+    Cancel = True
+    cleanValue = IIf(EmailSorter_IsFlaggedChecked(Target.Value), "", "True")
+    orderNumber = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, HeaderColumn(Sh, "Order Number")).Value)
+    sourceUri = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_FILE_URI).Value)
+    recordId = EmailSorter_CleanSubmittedValue(Sh.Cells(Target.Row, COL_RECORD_ID).Value)
+
+    rc = EmailSorter_RunUserEditSync(Sh, "excel_flagged", cleanValue, orderNumber, sourceUri, recordId, Target.Row)
+    If rc <> 0 Then
+        MsgBox "I could not record that Flagged toggle." & vbCrLf & vbCrLf & "Diagnostics were appended to:" & vbCrLf & EmailSorter_UserEditLogFullPath(), vbExclamation, "Email Sorter"
+        Exit Sub
+    End If
+
+    EmailSorter_ReadUserEditSyncResult lastUserEditContextTsv, resultMode, resultValue, resultValueKind
+    editEventsBusy = True
+    Application.EnableEvents = False
+    EmailSorter_ApplyPlainCellValue Target, resultValue, resultValueKind
+    Application.EnableEvents = True
+    editEventsBusy = False
+    lastUserEditContextTsv = ""
+    EmailSorter_ShowSuccessRainbow Sh
+    Application.StatusBar = "Flagged saved."
+    Exit Sub
+
+CleanFail:
+    On Error Resume Next
+    Application.EnableEvents = True
+    editEventsBusy = False
 End Sub
 
 Private Sub EmailSorter_DisallowEdit(ByVal Target As Range, ByVal reason As String)
@@ -293,10 +353,8 @@ Private Sub EmailSorter_EndEditMode(ByVal success As Boolean)
     editModeEnabled = False
     editSelectedAddress = ""
     If success Then
-        If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_SetTopRowColor ActiveSheet, RGB(TOP_GREEN_R, TOP_GREEN_G, TOP_GREEN_B)
-        Application.StatusBar = "Saved to JSON. Modified values are marked with *."
-        editResetAt = Now + TimeSerial(0, 0, 1)
-        Application.OnTime editResetAt, EmailSorter_ProcedureBinding("EmailSorter_ResetTopRowAfterSuccess")
+        If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_ShowSuccessRainbow ActiveSheet
+        Application.StatusBar = "Saved. Modified values are marked with *."
     Else
         If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_SetTopRowColor ActiveSheet, RGB(TOP_ORANGE_R, TOP_ORANGE_G, TOP_ORANGE_B)
         Application.StatusBar = editOldStatusBar
@@ -364,7 +422,19 @@ CleanFail:
 End Function
 
 Private Function HeaderRow(ByVal Sh As Object) As Long
-    If Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 1).Value)) = "Category" Then
+    Dim h1 As String
+    Dim h2 As String
+    Dim h3 As String
+    h1 = Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 1).Value))
+    h2 = Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 2).Value))
+    h3 = Trim(CStr(Sh.Cells(DEFAULT_HEADER_ROW, 3).Value))
+    If StrComp(h1, "Flagged", vbTextCompare) = 0 _
+        Or StrComp(h1, "Active", vbTextCompare) = 0 _
+        Or StrComp(h1, "Category", vbTextCompare) = 0 _
+        Or StrComp(h1, "Order Number", vbTextCompare) = 0 _
+        Or StrComp(h2, "Category", vbTextCompare) = 0 _
+        Or StrComp(h2, "Order Number", vbTextCompare) = 0 _
+        Or StrComp(h3, "Category", vbTextCompare) = 0 Then
         HeaderRow = DEFAULT_HEADER_ROW
     Else
         HeaderRow = 1
@@ -395,19 +465,43 @@ Private Function EmailSorter_FieldKeyForColumn(ByVal Sh As Object, ByVal colNum 
     Dim h As String
     h = Trim(CStr(Sh.Cells(HeaderRow(Sh), colNum).Value))
     Select Case LCase(h)
+        Case "flagged", "active"
+            EmailSorter_FieldKeyForColumn = "excel_flagged"
         Case "company"
             EmailSorter_FieldKeyForColumn = "company"
         Case "purchase date"
             EmailSorter_FieldKeyForColumn = "purchase_datetime"
         Case "total paid"
             EmailSorter_FieldKeyForColumn = "total_amount_paid"
+        Case "subtotal"
+            EmailSorter_FieldKeyForColumn = "subtotal_amount"
         Case "tax paid"
             EmailSorter_FieldKeyForColumn = "tax_paid"
+        Case "gc paid", "gift card"
+            EmailSorter_FieldKeyForColumn = "gift_card_amount"
+        Case "order number"
+            EmailSorter_FieldKeyForColumn = "order_number"
+        Case "category"
+            EmailSorter_FieldKeyForColumn = "email_category"
         Case "accounting"
             EmailSorter_FieldKeyForColumn = "accounting"
         Case Else
             EmailSorter_FieldKeyForColumn = ""
     End Select
+End Function
+
+Private Function EmailSorter_IsFlaggedChecked(ByVal v As Variant) As Boolean
+    Dim s As String
+    s = LCase$(EmailSorter_CleanSubmittedValue(v))
+    EmailSorter_IsFlaggedChecked = (s = "true" Or s = "1" Or s = "yes" Or s = "y" Or s = "active" Or s = "flagged" Or s = "checked" Or s = "x")
+End Function
+
+Private Function EmailSorter_NormalizedFlaggedValue(ByVal v As Variant) As String
+    If EmailSorter_IsFlaggedChecked(v) Then
+        EmailSorter_NormalizedFlaggedValue = "True"
+    Else
+        EmailSorter_NormalizedFlaggedValue = ""
+    End If
 End Function
 
 Private Function EmailSorter_CleanSubmittedValue(ByVal v As Variant) As String
@@ -472,6 +566,30 @@ Private Sub EmailSorter_ApplyCompanyEditToOrder(ByVal Sh As Object, ByVal orderN
     Next r
 End Sub
 
+Private Sub EmailSorter_ApplyFieldEditToOrder(ByVal Sh As Object, ByVal orderNumber As String, ByVal headerLabel As String, ByVal cleanValue As String, Optional ByVal markModified As Boolean = True, Optional ByVal valueKind As String = "text")
+    Dim orderCol As Long
+    Dim fieldCol As Long
+    Dim lastData As Long
+    Dim r As Long
+
+    orderCol = HeaderColumn(Sh, "Order Number")
+    fieldCol = HeaderColumn(Sh, headerLabel)
+    If orderCol = 0 Or fieldCol = 0 Then Exit Sub
+    On Error Resume Next
+    lastData = Sh.Cells(Sh.Rows.Count, orderCol).End(xlUp).Row
+    On Error GoTo 0
+    If lastData < HeaderRow(Sh) + 1 Then Exit Sub
+    For r = HeaderRow(Sh) + 1 To lastData
+        If EmailSorter_CleanSubmittedValue(Sh.Cells(r, orderCol).Value) = orderNumber Then
+            If markModified Then
+                Sh.Cells(r, fieldCol).Value = EmailSorter_DisplayModifiedValue(cleanValue)
+            Else
+                EmailSorter_ApplyPlainCellValue Sh.Cells(r, fieldCol), cleanValue, valueKind
+            End If
+        End If
+    Next r
+End Sub
+
 Private Function EmailSorter_TsvValue(ByVal allText As String, ByVal key As String) As String
     Dim lines As Variant
     Dim i As Long
@@ -518,7 +636,7 @@ Private Sub EmailSorter_ReadUserEditSyncResult(ByVal ctxPath As String, ByRef mo
     valueKind = LCase$(EmailSorter_TsvValue(allText, "display_value_kind"))
 End Sub
 
-Private Function EmailSorter_RunUserEditSync(ByVal Sh As Object, ByVal fieldKey As String, ByVal cleanValue As String, ByVal orderNumber As String, ByVal sourceUri As String, ByVal rowNum As Long) As Long
+Private Function EmailSorter_RunUserEditSync(ByVal Sh As Object, ByVal fieldKey As String, ByVal cleanValue As String, ByVal orderNumber As String, ByVal sourceUri As String, ByVal recordId As String, ByVal rowNum As Long) As Long
     Dim fso As Object
     Dim tempPath As String
     Dim iniPath As String
@@ -539,6 +657,7 @@ Private Function EmailSorter_RunUserEditSync(ByVal Sh As Object, ByVal fieldKey 
         CtxLine("value", cleanValue) & _
         CtxLine("order_number", orderNumber) & _
         CtxLine("source_uri", sourceUri) & _
+        CtxLine("record_id", recordId) & _
         CtxLine("row_number", CStr(rowNum)) & _
         CtxLine("workbook_path", ThisWorkbook.FullName) & _
         CtxLine("sheet_name", Sh.Name))
@@ -736,12 +855,65 @@ Private Sub EmailSorter_SetTopRowColor(ByVal ws As Worksheet, ByVal colorValue A
     Next cell
 End Sub
 
+Public Sub EmailSorter_ShowSuccessRainbowForActiveSheet()
+    On Error Resume Next
+    If TypeName(ActiveSheet) = "Worksheet" Then EmailSorter_ShowSuccessRainbow ActiveSheet
+End Sub
+
+Public Sub EmailSorter_ShowSuccessRainbow(ByVal ws As Worksheet)
+    Dim startedAt As Double
+    Dim frameStartedAt As Double
+    Dim oldStatus As Variant
+
+    On Error GoTo CleanFail
+    oldStatus = Application.StatusBar
+    editRainbowFrame = 0
+    editRainbowPalette = EmailSorter_RainbowPalette()
+    Application.StatusBar = "Saving complete."
+    startedAt = Timer
+    Do While EmailSorter_ElapsedSeconds(startedAt) < SUCCESS_RAINBOW_SECONDS
+        editRainbowFrame = editRainbowFrame + 1
+        EmailSorter_ApplyTopRowRainbowCycle ws
+        frameStartedAt = Timer
+        Do While EmailSorter_ElapsedSeconds(frameStartedAt) < EDIT_RAINBOW_FRAME_SECONDS _
+            And EmailSorter_ElapsedSeconds(startedAt) < SUCCESS_RAINBOW_SECONDS
+            DoEvents
+        Loop
+    Loop
+    EmailSorter_SetTopRowColor ws, RGB(TOP_ORANGE_R, TOP_ORANGE_G, TOP_ORANGE_B)
+    Application.StatusBar = oldStatus
+    Exit Sub
+CleanFail:
+    On Error Resume Next
+    EmailSorter_SetTopRowColor ws, RGB(TOP_ORANGE_R, TOP_ORANGE_G, TOP_ORANGE_B)
+End Sub
+
 Private Function EmailSorter_ElapsedSeconds(ByVal startedAt As Double) As Double
     Dim t As Double
     t = Timer
     If t < startedAt Then t = t + 86400#
     EmailSorter_ElapsedSeconds = t - startedAt
 End Function
+'''
+
+ORDERS_SHEET_VBA = r'''Option Explicit
+
+Private Sub Worksheet_FollowHyperlink(ByVal Target As Hyperlink)
+    Dim header As String
+    On Error GoTo CleanFail
+    If Target Is Nothing Then Exit Sub
+    If Target.Range.Row <= 2 Then Exit Sub
+
+    header = Trim(CStr(Me.Cells(2, Target.Range.Column).Value))
+    If StrComp(header, "Invoice Link", vbTextCompare) = 0 _
+        Or StrComp(header, "Invoice link", vbTextCompare) = 0 Then
+        ThisWorkbook.LaunchGiftInvoiceLinkWorkflow Me, Target.Range.Row
+        Exit Sub
+    End If
+    Exit Sub
+CleanFail:
+    MsgBox "Could not handle Invoice Link click." & vbCrLf & vbCrLf & Err.Description, vbExclamation, "Invoice Link"
+End Sub
 '''
 
 THISWORKBOOK_VBA = r'''Option Explicit
@@ -752,23 +924,11 @@ Private Const COL_TRACK_NUM_START As Long = 45
 Private Const COL_TRACK_NUM_END As Long = 59
 Private Const COL_TRACK_CONF_START As Long = 60
 Private Const COL_TRACK_CONF_END As Long = 74
+Private Const TOP_ROW As Long = 1
 Private Const DEFAULT_HEADER_ROW As Long = 2
-
-' Triple-Escape: register OnKey to EmailSorterHotkeys.EmailSorter_TripleEscapeHandler while this workbook is active.
-Private Function EmailSorter_TripleEscapeBinding() As String
-    ' Workbook name may contain spaces or apostrophes — Excel requires doubled single quotes inside the book token.
-    EmailSorter_TripleEscapeBinding = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!EmailSorter_TripleEscapeHandler"
-End Function
-
-Private Sub EmailSorter_RegisterTripleEscapeHotkey()
-    On Error Resume Next
-    Application.OnKey "{ESC}", EmailSorter_TripleEscapeBinding()
-End Sub
-
-Private Sub EmailSorter_UnregisterTripleEscapeHotkey()
-    On Error Resume Next
-    Application.OnKey "{ESC}"
-End Sub
+Private lastRemainingPodLaunchAt As Double
+Private lastInvoiceLinkLaunchAt As Double
+Private lastInvoiceLinkLaunchRow As Long
 
 Private Function ReadUtf8File(ByVal path As String) As String
     Dim stm As Object
@@ -1247,20 +1407,100 @@ Private Function IniValue(ByVal allText As String, ByVal key As String) As Strin
     IniValue = ""
 End Function
 
+Private Function EmailSorter_ElapsedSeconds(ByVal startedAt As Double) As Double
+    Dim t As Double
+    t = Timer
+    If t < startedAt Then t = t + 86400#
+    EmailSorter_ElapsedSeconds = t - startedAt
+End Function
+
+Private Function EmailSorter_IsRemainingPodHubCell(ByVal Sh As Object, ByVal Target As Range) As Boolean
+    Dim header As String
+    Dim linkText As String
+    Dim catCol As Long
+    Dim catValue As String
+
+    On Error GoTo CleanFail
+    If Target Is Nothing Then Exit Function
+    If Target.Cells.CountLarge <> 1 Then Exit Function
+    If StrComp(CStr(Sh.Name), "Orders", vbTextCompare) <> 0 Then Exit Function
+    If Target.Row <> TOP_ROW Then Exit Function
+
+    header = Trim(CStr(Sh.Cells(HeaderRow(Sh), Target.Column).Value))
+    linkText = TrimmedCellText(Target.Value)
+    If StrComp(linkText, "Process Remaining PODs", vbTextCompare) = 0 Then
+        EmailSorter_IsRemainingPodHubCell = True
+        Exit Function
+    End If
+
+    If StrComp(header, "POD status", vbTextCompare) = 0 _
+        Or StrComp(header, "POD Status", vbTextCompare) = 0 _
+        Or StrComp(header, "Shipping Status", vbTextCompare) = 0 _
+        Or StrComp(header, "Shipping summary", vbTextCompare) = 0 _
+        Or StrComp(header, "View shipping status", vbTextCompare) = 0 _
+        Or StrComp(header, "View Shipping Status", vbTextCompare) = 0 _
+        Or StrComp(header, "Total Paid", vbTextCompare) = 0 Then
+        catCol = HeaderColumn(Sh, "Category")
+        If catCol > 0 Then
+            catValue = TrimmedCellText(Sh.Cells(Target.Row, catCol).Value)
+            EmailSorter_IsRemainingPodHubCell = (StrComp(catValue, "Automation Hub", vbTextCompare) = 0)
+        End If
+    End If
+    Exit Function
+CleanFail:
+    EmailSorter_IsRemainingPodHubCell = False
+End Function
+
+Private Function EmailSorter_IsInvoiceLinkActionText(ByVal linkText As String) As Boolean
+    EmailSorter_IsInvoiceLinkActionText = ( _
+        StrComp(linkText, "Link to order", vbTextCompare) = 0 _
+        Or StrComp(linkText, "Link to Gift Card", vbTextCompare) = 0 _
+        Or StrComp(linkText, "Linked", vbTextCompare) = 0)
+End Function
+
+Private Function EmailSorter_IsInvoiceLinkCell(ByVal Sh As Object, ByVal Target As Range) As Boolean
+    Dim header As String
+    Dim linkText As String
+
+    On Error GoTo CleanFail
+    If Target Is Nothing Then Exit Function
+    If Target.Cells.CountLarge <> 1 Then Exit Function
+    If StrComp(CStr(Sh.Name), "Orders", vbTextCompare) <> 0 Then Exit Function
+    If Target.Row <= HeaderRow(Sh) Then Exit Function
+
+    header = Trim(CStr(Sh.Cells(HeaderRow(Sh), Target.Column).Value))
+    If StrComp(header, "Invoice Link", vbTextCompare) <> 0 _
+        And StrComp(header, "Invoice link", vbTextCompare) <> 0 Then Exit Function
+
+    linkText = TrimmedCellText(Target.Value)
+    EmailSorter_IsInvoiceLinkCell = EmailSorter_IsInvoiceLinkActionText(linkText)
+    Exit Function
+CleanFail:
+    EmailSorter_IsInvoiceLinkCell = False
+End Function
+
 Private Sub Workbook_Open()
     On Error Resume Next
     Call LaunchPodWorkflowWatcher
-    Call EmailSorter_RegisterTripleEscapeHotkey
 End Sub
 
 Private Sub Workbook_Activate()
     On Error Resume Next
-    Call EmailSorter_RegisterTripleEscapeHotkey
 End Sub
 
 Private Sub Workbook_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
-    On Error Resume Next
+    On Error GoTo CleanFail
+    If EmailSorter_IsRemainingPodHubCell(Sh, Target) Then
+        Call LaunchRemainingPodViewer(Target.Row)
+        Exit Sub
+    End If
+    If EmailSorter_IsInvoiceLinkCell(Sh, Target) Then
+        Call LaunchGiftInvoiceLinkWorkflow(Sh, Target.Row)
+        Exit Sub
+    End If
     Call EmailSorter_HandleSelectionChange(Sh, Target)
+    Exit Sub
+CleanFail:
 End Sub
 
 Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
@@ -1268,19 +1508,34 @@ Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
     Call EmailSorter_HandleSheetChange(Sh, Target)
 End Sub
 
+Private Sub Workbook_SheetBeforeDoubleClick(ByVal Sh As Object, ByVal Target As Range, Cancel As Boolean)
+    On Error GoTo CleanFail
+    If EmailSorter_IsRemainingPodHubCell(Sh, Target) Then
+        Cancel = True
+        Call LaunchRemainingPodViewer(Target.Row)
+        Exit Sub
+    End If
+    If EmailSorter_IsInvoiceLinkCell(Sh, Target) Then
+        Cancel = True
+        Call LaunchGiftInvoiceLinkWorkflow(Sh, Target.Row)
+        Exit Sub
+    End If
+    Call EmailSorter_HandleBeforeDoubleClick(Sh, Target, Cancel)
+    Exit Sub
+CleanFail:
+End Sub
+
 Private Sub Workbook_Deactivate()
     On Error Resume Next
     Call EmailSorter_CancelEditMode
-    Call EmailSorter_UnregisterTripleEscapeHotkey
 End Sub
 
 Private Sub Workbook_BeforeClose(Cancel As Boolean)
     On Error Resume Next
     Call EmailSorter_CancelEditMode
-    Call EmailSorter_UnregisterTripleEscapeHotkey
 End Sub
 
-Private Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Long)
+Public Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Long)
     Dim iniPath As String
     Dim allText As String
     Dim py As String
@@ -1290,6 +1545,9 @@ Private Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Lo
     Dim shell As Object
 
     On Error GoTo CleanFail
+    If lastInvoiceLinkLaunchAt <> 0 And lastInvoiceLinkLaunchRow = rowNum Then
+        If EmailSorter_ElapsedSeconds(lastInvoiceLinkLaunchAt) < 1.5 Then Exit Sub
+    End If
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     iniPath = Trim(CStr(Sh.Range("AA1").Value))
@@ -1298,23 +1556,47 @@ Private Sub LaunchGiftInvoiceLinkWorkflow(ByVal Sh As Object, ByVal rowNum As Lo
             iniPath = ThisWorkbook.Path & Application.PathSeparator & "excel_clipboard_launch.ini"
         End If
     End If
-    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then Exit Sub
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        MsgBox "Could not start Invoice Link because the launcher config was not found." & vbCrLf & vbCrLf & _
+            "Expected config:" & vbCrLf & iniPath, vbExclamation, "Invoice Link"
+        Exit Sub
+    End If
 
     allText = ReadUtf8File(iniPath)
-    If Len(allText) = 0 Then Exit Sub
+    If Len(allText) = 0 Then
+        MsgBox "Could not start Invoice Link because the launcher config could not be read." & vbCrLf & vbCrLf & _
+            iniPath, vbExclamation, "Invoice Link"
+        Exit Sub
+    End If
 
     py = IniValue(allText, "PY")
     linkScript = IniValue(allText, "GIFTCARD_LINK")
-    If Len(py) = 0 Or Len(linkScript) = 0 Then Exit Sub
-    If Not fso.FileExists(py) Then Exit Sub
-    If Not fso.FileExists(linkScript) Then Exit Sub
+    If Len(py) = 0 Or Len(linkScript) = 0 Then
+        MsgBox "Could not start Invoice Link because PY or GIFTCARD_LINK is missing from:" & vbCrLf & vbCrLf & _
+            iniPath, vbExclamation, "Invoice Link"
+        Exit Sub
+    End If
+    If Not fso.FileExists(py) Then
+        MsgBox "Could not start Invoice Link because Python was not found:" & vbCrLf & vbCrLf & _
+            py, vbExclamation, "Invoice Link"
+        Exit Sub
+    End If
+    If Not fso.FileExists(linkScript) Then
+        MsgBox "Could not start Invoice Link because the link workflow script was not found:" & vbCrLf & vbCrLf & _
+            linkScript, vbExclamation, "Invoice Link"
+        Exit Sub
+    End If
 
     cmd = Chr(34) & py & Chr(34) & " " & Chr(34) & linkScript & Chr(34) & " " & Chr(34) & ThisWorkbook.FullName & Chr(34) & " " & CStr(rowNum)
     Set shell = CreateObject("WScript.Shell")
+    lastInvoiceLinkLaunchRow = rowNum
+    lastInvoiceLinkLaunchAt = Timer
     shell.Run cmd, 1, False
+    Application.StatusBar = "Invoice Link: click the matching gift card/order row."
     Exit Sub
 
 CleanFail:
+    MsgBox "Could not start Invoice Link." & vbCrLf & vbCrLf & Err.Description, vbExclamation, "Invoice Link"
 End Sub
 
 Private Sub LaunchPodWorkflowWatcher()
@@ -1327,7 +1609,6 @@ Private Sub LaunchPodWorkflowWatcher()
     Dim shell As Object
 
     On Error GoTo CleanFail
-
     Set fso = CreateObject("Scripting.FileSystemObject")
     iniPath = Trim(CStr(ThisWorkbook.Worksheets("Orders").Range("AA1").Value))
     If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
@@ -1364,6 +1645,10 @@ Private Sub LaunchRemainingPodViewer(ByVal rowNum As Long)
     Dim shell As Object
 
     On Error GoTo CleanFail
+    If lastRemainingPodLaunchAt <> 0 Then
+        If EmailSorter_ElapsedSeconds(lastRemainingPodLaunchAt) < 1.5 Then Exit Sub
+    End If
+    lastRemainingPodLaunchAt = Timer
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     iniPath = Trim(CStr(ThisWorkbook.Worksheets("Orders").Range("AA1").Value))
@@ -1372,28 +1657,52 @@ Private Sub LaunchRemainingPodViewer(ByVal rowNum As Long)
             iniPath = ThisWorkbook.Path & Application.PathSeparator & "excel_clipboard_launch.ini"
         End If
     End If
-    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then Exit Sub
+    If Len(iniPath) = 0 Or Not fso.FileExists(iniPath) Then
+        MsgBox "Could not open Process Remaining PODs because the launcher config was not found." & vbCrLf & vbCrLf & _
+            "Expected config:" & vbCrLf & iniPath, vbExclamation, "Email Sorter"
+        Exit Sub
+    End If
 
     allText = ReadUtf8File(iniPath)
-    If Len(allText) = 0 Then Exit Sub
+    If Len(allText) = 0 Then
+        MsgBox "Could not open Process Remaining PODs because the launcher config could not be read." & vbCrLf & vbCrLf & _
+            iniPath, vbExclamation, "Email Sorter"
+        Exit Sub
+    End If
 
     py = IniValue(allText, "PY")
     podScript = IniValue(allText, "POD_WORKFLOW")
-    If Len(py) = 0 Or Len(podScript) = 0 Then Exit Sub
-    If Not fso.FileExists(py) Then Exit Sub
-    If Not fso.FileExists(podScript) Then Exit Sub
+    If Len(py) = 0 Or Len(podScript) = 0 Then
+        MsgBox "Could not open Process Remaining PODs because PY or POD_WORKFLOW is missing from:" & vbCrLf & vbCrLf & _
+            iniPath, vbExclamation, "Email Sorter"
+        Exit Sub
+    End If
+    If Not fso.FileExists(py) Then
+        MsgBox "Could not open Process Remaining PODs because Python was not found:" & vbCrLf & vbCrLf & _
+            py, vbExclamation, "Email Sorter"
+        Exit Sub
+    End If
+    If Not fso.FileExists(podScript) Then
+        MsgBox "Could not open Process Remaining PODs because the POD workflow script was not found:" & vbCrLf & vbCrLf & _
+            podScript, vbExclamation, "Email Sorter"
+        Exit Sub
+    End If
 
     cmd = Chr(34) & py & Chr(34) & " " & Chr(34) & podScript & Chr(34) & " launch-remaining " & Chr(34) & ThisWorkbook.FullName & Chr(34) & " " & CStr(rowNum)
     Set shell = CreateObject("WScript.Shell")
     shell.Run cmd, 0, False
+    Application.StatusBar = "Opening Process Remaining PODs..."
     Exit Sub
 
 CleanFail:
+    MsgBox "Could not open Process Remaining PODs." & vbCrLf & vbCrLf & Err.Description, vbExclamation, "Email Sorter"
 End Sub
 
 Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hyperlink)
     Const COL_FILE_URI As Long = 29
     Dim header As String
+    Dim linkText As String
+    Dim rowNum As Long
     Dim uri As String
     Dim py As String
     Dim scriptPath As String
@@ -1405,27 +1714,38 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
 
     On Error GoTo CleanFail
 
+    rowNum = Target.Range.Row
     header = Trim(CStr(Sh.Cells(HeaderRow(Sh), Target.Range.Column).Value))
+    linkText = TrimmedCellText(Target.Range.Value)
+
+    If rowNum = TOP_ROW _
+        And StrComp(header, "Total Paid", vbTextCompare) = 0 _
+        And StrComp(linkText, "Process Remaining PODs", vbTextCompare) = 0 Then
+        Call LaunchRemainingPodViewer(rowNum)
+        Exit Sub
+    End If
 
     If StrComp(header, "View Tracking Links", vbTextCompare) = 0 _
         Or StrComp(header, "View tracking links", vbTextCompare) = 0 _
         Or StrComp(header, "View Link List", vbTextCompare) = 0 Then
-        Call LaunchTrackingLinkViewerForRow(Sh, Target.Range.Row)
+        Call LaunchTrackingLinkViewerForRow(Sh, rowNum)
         Exit Sub
     End If
 
     If StrComp(header, "View Tracking Numbers", vbTextCompare) = 0 _
         Or StrComp(header, "View tracking numbers (web)", vbTextCompare) = 0 Then
-        Call LaunchTrackingNumbersViewerForRow(Sh, Target.Range.Row)
+        Call LaunchTrackingNumbersViewerForRow(Sh, rowNum)
         Exit Sub
     End If
 
     If StrComp(header, "View Tracking Numbers (All For Order)", vbTextCompare) = 0 Then
-        Call LaunchTrackingNumbersOrderViewerForRow(Sh, Target.Range.Row)
+        Call LaunchTrackingNumbersOrderViewerForRow(Sh, rowNum)
         Exit Sub
     End If
 
-    If StrComp(header, "Shipping Status", vbTextCompare) = 0 _
+    If StrComp(header, "POD status", vbTextCompare) = 0 _
+        Or StrComp(header, "POD Status", vbTextCompare) = 0 _
+        Or StrComp(header, "Shipping Status", vbTextCompare) = 0 _
         Or StrComp(header, "Shipping summary", vbTextCompare) = 0 _
         Or StrComp(header, "View shipping status", vbTextCompare) = 0 _
         Or StrComp(header, "View Shipping Status", vbTextCompare) = 0 Then
@@ -1434,26 +1754,28 @@ Private Sub Workbook_SheetFollowHyperlink(ByVal Sh As Object, ByVal Target As Hy
         catCol = HeaderColumn(Sh, "Category")
         catValue = ""
         If catCol > 0 Then
-            catValue = TrimmedCellText(Sh.Cells(Target.Range.Row, catCol).Value)
+            catValue = TrimmedCellText(Sh.Cells(rowNum, catCol).Value)
         End If
         If StrComp(catValue, "Automation Hub", vbTextCompare) = 0 Then
-            Call LaunchRemainingPodViewer(Target.Range.Row)
+            Call LaunchRemainingPodViewer(rowNum)
         Else
-            Call LaunchTrackingStatusViewerForRow(Sh, Target.Range.Row)
+            Call LaunchTrackingStatusViewerForRow(Sh, rowNum)
         End If
         Exit Sub
     End If
 
     If StrComp(header, "Invoice Link", vbTextCompare) = 0 _
         Or StrComp(header, "Invoice link", vbTextCompare) = 0 Then
-        Call LaunchGiftInvoiceLinkWorkflow(Sh, Target.Range.Row)
+        Call LaunchGiftInvoiceLinkWorkflow(Sh, rowNum)
         Exit Sub
     End If
 
     If StrComp(header, "Open File Location", vbTextCompare) <> 0 _
-        And StrComp(header, "Copy Path", vbTextCompare) <> 0 Then Exit Sub
+        And StrComp(header, "Copy Path", vbTextCompare) <> 0 _
+        And StrComp(linkText, "File Loc", vbTextCompare) <> 0 _
+        And StrComp(linkText, "Open File Location", vbTextCompare) <> 0 Then Exit Sub
 
-    uri = CStr(Sh.Cells(Target.Range.Row, COL_FILE_URI).Value)
+    uri = CStr(Sh.Cells(rowNum, COL_FILE_URI).Value)
     uri = Trim(uri)
     If Len(uri) = 0 Then GoTo CleanFail
     If Left(LCase(uri), 5) <> "file:" Then GoTo CleanFail
@@ -1597,7 +1919,7 @@ def build_macro_template_file(dest: Path) -> bool:
                 try:
                     wb = excel.Workbooks.Add()
                     vbp = wb.VBProject
-                    # vbext_ct_StdModule = 1 — Public Sub for Application.OnKey must not live in ThisWorkbook.
+                    # vbext_ct_StdModule = 1 — workbook events call shared edit-sync helpers from here.
                     try:
                         std_kind = int(win32com.client.constants.vbext_ct_StdModule)
                     except Exception:
@@ -1614,6 +1936,12 @@ def build_macro_template_file(dest: Path) -> bool:
                     if n > 0:
                         cm.DeleteLines(1, n)
                     cm.AddFromString(THISWORKBOOK_VBA)
+
+                    sheet_cm = vbp.VBComponents(wb.Worksheets(1).CodeName).CodeModule
+                    n = sheet_cm.CountOfLines
+                    if n > 0:
+                        sheet_cm.DeleteLines(1, n)
+                    sheet_cm.AddFromString(ORDERS_SHEET_VBA)
                     xl_open_xml_macro = 52
                     wb.SaveAs(str(dest), FileFormat=xl_open_xml_macro)
                     wb.Close(SaveChanges=False)

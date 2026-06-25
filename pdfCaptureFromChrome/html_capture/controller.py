@@ -16,6 +16,7 @@ import traceback
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -28,7 +29,6 @@ try:
     from ..chrome_devtools import (
         export_page_pdf,
         extract_outer_html_snippet,
-        inspect_page,
         list_page_targets,
         page_has_focus,
         reserve_free_port,
@@ -43,7 +43,6 @@ except ImportError:
     from chrome_devtools import (  # type: ignore[no-redef]  # noqa: E402
         export_page_pdf,
         extract_outer_html_snippet,
-        inspect_page,
         list_page_targets,
         page_has_focus,
         reserve_free_port,
@@ -57,16 +56,62 @@ except ImportError:
 
 try:
     from .hotkey_win32 import CAPTURE_HOTKEY_LABEL, CaptureHotkey, hotkey_capture_available
+    from .pod_readiness import (
+        highlight_pod_ready_element,
+        highlight_pod_selector,
+        pod_readiness_debug_enabled,
+        pod_selector_candidates,
+        record_user_selected_ready_element,
+        remove_pod_debug_overlay,
+        wait_for_pod_dom_ready,
+    )
 except ImportError:
     from hotkey_win32 import (  # type: ignore[no-redef]  # noqa: E402
         CAPTURE_HOTKEY_LABEL,
         CaptureHotkey,
         hotkey_capture_available,
     )
+    from pod_readiness import (  # type: ignore[no-redef]  # noqa: E402
+        highlight_pod_ready_element,
+        highlight_pod_selector,
+        pod_readiness_debug_enabled,
+        pod_selector_candidates,
+        record_user_selected_ready_element,
+        remove_pod_debug_overlay,
+        wait_for_pod_dom_ready,
+    )
+
+
+_BACKGROUND_POD_CHROME_ARGS = (
+    "--start-minimized",
+    "--window-position=-32000,-32000",
+    "--window-size=1280,1600",
+    "--disable-features=PaintHolding",
+    "--disable-session-crashed-bubble",
+    "--disable-restore-session-state",
+)
 
 _LOG_LOCK = threading.Lock()
 
 _HTTP_PREFIX_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+@dataclass
+class _DebugSelectorSession:
+    target_id: str
+    ws_url: str
+    url: str
+    expected_pdf: Path
+    record: dict | None
+    readiness: dict
+    candidates: list[dict] = field(default_factory=list)
+    index: int = 0
+    approve_event: threading.Event = field(default_factory=threading.Event)
+    approved: bool = False
+    needs_recapture: bool = False
+    pdf_saved: bool = False
+    final_pdf: Path | None = None
+    status: str = ""
 
 
 def _norm_href(s: str) -> str:
@@ -206,10 +251,14 @@ def _audit_unavailable(reason: str) -> bool:
     )
 
 
-def _finalize_pdf_with_audit(staged_pdf: Path, expected_pdf: Path, record: dict | None) -> tuple[Path, bool, str]:
+def _finalize_pdf_with_audit(
+    staged_pdf: Path,
+    expected_pdf: Path,
+    record: dict | None,
+) -> tuple[Path, bool, str, dict]:
     if not record:
         staged_pdf.replace(expected_pdf)
-        return expected_pdf, True, ""
+        return expected_pdf, True, "", {}
 
     try:
         from tracking_pdf_audit import log_tracking_pdf
@@ -217,7 +266,7 @@ def _finalize_pdf_with_audit(staged_pdf: Path, expected_pdf: Path, record: dict 
     except Exception as exc:
         staged_pdf.replace(expected_pdf)
         _log_line(f"audit import unavailable: {exc!r}")
-        return expected_pdf, True, f"Audit unavailable: {exc!s}"
+        return expected_pdf, True, f"Audit unavailable: {exc!s}", {}
 
     try:
         validation = validate_pdf_with_llm(str(staged_pdf))
@@ -244,10 +293,10 @@ def _finalize_pdf_with_audit(staged_pdf: Path, expected_pdf: Path, record: dict 
 
     if visible:
         status = str(validation.get("status_found") or "Unknown").strip() or "Unknown"
-        return final_pdf, True, f"AI audit passed ({status})."
+        return final_pdf, True, f"AI audit passed ({status}).", validation
     if can_advance:
-        return final_pdf, True, reason or "AI audit was unavailable."
-    return final_pdf, False, reason or "AI audit did not confirm visible tracking details."
+        return final_pdf, True, reason or "AI audit was unavailable.", validation
+    return final_pdf, False, reason or "AI audit did not confirm visible tracking details.", validation
 
 
 class HtmlCaptureController:
@@ -256,8 +305,8 @@ class HtmlCaptureController:
     - Each ``enqueue_capture`` opens a new tab (or the first load after a fresh launch) to ``url`` and
       records the target id → expected output ``.pdf`` path.
     - On Ctrl+Shift+P, the focused page is printed to PDF and written to the mapped path.
-    - With ``auto_print_pdf=True``, a background thread waits for the tab to settle (CDP ``inspect_page``),
-      then prints to PDF without requiring Ctrl+Shift+P, and writes an optional HTML snapshot beside the PDF.
+    - With ``auto_print_pdf=True``, a background thread watches DOM/CSS readiness, then prints
+      to PDF without requiring Ctrl+Shift+P and writes an optional HTML snapshot beside the PDF.
     """
 
     def __init__(
@@ -265,10 +314,14 @@ class HtmlCaptureController:
         *,
         on_notify: Callable[[str, str], None] | None = None,
         on_saved: Callable[[], None] | None = None,
+        on_review_saved: Callable[[dict], None] | None = None,
+        on_selector_ready: Callable[[str, dict], None] | None = None,
         verbose: bool = False,
     ) -> None:
         self._on_notify = on_notify
         self._on_saved = on_saved
+        self._on_review_saved = on_review_saved
+        self._on_selector_ready = on_selector_ready
         self._verbose = verbose
         self._lock = threading.Lock()
         self._active = False
@@ -277,8 +330,10 @@ class HtmlCaptureController:
         self._first_enqueued: bool = False
         self._target_to_path: dict[str, Path] = {}
         self._target_to_record: dict[str, dict] = {}
+        self._target_to_url: dict[str, str] = {}
         self._order: list[str] = []
         self._hotkey: CaptureHotkey | None = None
+        self._debug_sessions: dict[str, _DebugSelectorSession] = {}
         atexit.register(self.stop)
 
     @staticmethod
@@ -302,6 +357,28 @@ class HtmlCaptureController:
             except Exception:
                 pass
 
+    def _emit_review_saved(
+        self,
+        *,
+        final_pdf: Path,
+        record: dict | None,
+        audit_message: str,
+        validation: dict,
+    ) -> None:
+        if self._on_review_saved is None:
+            return
+        payload = {
+            "path": str(final_pdf),
+            "filename": final_pdf.name,
+            "record": dict(record or {}),
+            "reason": audit_message,
+            "validation": validation if isinstance(validation, dict) else {},
+        }
+        try:
+            self._on_review_saved(payload)
+        except Exception:
+            pass
+
     def start(self) -> bool:
         with self._lock:
             if self._active:
@@ -316,7 +393,9 @@ class HtmlCaptureController:
             self._debug_port = self._env_debug_port()
             self._target_to_path.clear()
             self._target_to_record.clear()
+            self._target_to_url.clear()
             self._order.clear()
+            self._debug_sessions.clear()
             self._first_enqueued = False
             self._hotkey = CaptureHotkey(self._schedule_snapshot)
             ok = self._hotkey.start() if self._hotkey is not None else False
@@ -339,7 +418,9 @@ class HtmlCaptureController:
             self._first_enqueued = False
             self._target_to_path.clear()
             self._target_to_record.clear()
+            self._target_to_url.clear()
             self._order.clear()
+            self._debug_sessions.clear()
             self._chrome = None
         if h is not None:
             h.stop()
@@ -386,6 +467,7 @@ class HtmlCaptureController:
         *,
         record: dict | None = None,
         auto_print_pdf: bool = False,
+        visible_chrome: bool = False,
     ) -> bool:
         if not self._active:
             self._emit("error", "HTML capture is not started (turn Assisted PDF Capture on first).")
@@ -417,6 +499,11 @@ class HtmlCaptureController:
             proc = launch_isolated_chrome_no_proxy(
                 start_url=u,
                 remote_debugging_port=dport,
+                extra_args=(
+                    _BACKGROUND_POD_CHROME_ARGS
+                    if auto_print_pdf and not visible_chrome and not pod_readiness_debug_enabled()
+                    else None
+                ),
                 verbose=self._verbose,
             )
             if proc is None:
@@ -445,6 +532,7 @@ class HtmlCaptureController:
 
         with self._lock:
             self._target_to_path[str(target_id)] = expected_pdf
+            self._target_to_url[str(target_id)] = u
             if record is not None:
                 self._target_to_record[str(target_id)] = dict(record)
             else:
@@ -494,57 +582,336 @@ class HtmlCaptureController:
             dport = self._debug_port
             self._target_to_path.pop(target_id, None)
             self._target_to_record.pop(target_id, None)
+            self._target_to_url.pop(target_id, None)
+            self._debug_sessions.pop(target_id, None)
             self._order = [tid for tid in self._order if tid != target_id]
         if dport:
             _http_close_tab(dport, target_id)
 
+    def close_debug_target(self, target_id: str) -> None:
+        """Close a supervised debug tab after its PDF has been saved."""
+        self._close_target_id(str(target_id))
+
+    def _debug_session_status_locked(self, session: _DebugSelectorSession) -> dict:
+        total = len(session.candidates)
+        current = session.candidates[session.index] if total else {}
+        return {
+            "target_id": session.target_id,
+            "index": session.index,
+            "total": total,
+            "current": dict(current),
+            "approved": session.approved,
+            "needs_recapture": session.needs_recapture,
+            "pdf_saved": session.pdf_saved,
+            "final_pdf": str(session.final_pdf) if session.final_pdf is not None else "",
+            "status": session.status,
+            "readiness": dict(session.readiness),
+        }
+
+    def debug_selector_status(self, target_id: str) -> dict | None:
+        with self._lock:
+            session = self._debug_sessions.get(str(target_id))
+            if session is None:
+                return None
+            return self._debug_session_status_locked(session)
+
+    def select_debug_element(self, target_id: str, step: int) -> dict | None:
+        """Move the blue POD selector box by *step* and return the new selection status."""
+        tid = str(target_id)
+        with self._lock:
+            session = self._debug_sessions.get(tid)
+            if session is None:
+                return None
+            if session.candidates:
+                session.index = (session.index + int(step)) % len(session.candidates)
+                current = dict(session.candidates[session.index])
+            else:
+                current = {}
+            ws_url = session.ws_url
+            url = session.url
+            record = dict(session.record) if isinstance(session.record, dict) else None
+        selector = str(current.get("selector") or "").strip()
+        if selector:
+            highlight_pod_selector(ws_url, selector=selector, url=url, record=record)
+        with self._lock:
+            session = self._debug_sessions.get(tid)
+            if session is None:
+                return None
+            session.status = f"Selected element {session.index + 1} of {len(session.candidates)}"
+            return self._debug_session_status_locked(session)
+
+    def approve_debug_element(self, target_id: str) -> bool:
+        """Accept the currently highlighted selector and let the waiting capture thread print."""
+        tid = str(target_id)
+        with self._lock:
+            session = self._debug_sessions.get(tid)
+            if session is None or session.pdf_saved:
+                return False
+            if session.needs_recapture:
+                session.approved = True
+                session.needs_recapture = False
+                session.status = "Selection accepted. Saving PDF again..."
+                threading.Thread(
+                    target=self._thread_debug_recapture,
+                    args=(tid,),
+                    name="html-capture-debug-retry",
+                    daemon=True,
+                ).start()
+                return True
+            session.approved = True
+            session.status = "Selection accepted. Saving PDF..."
+            session.approve_event.set()
+            return True
+
+    def _prepare_debug_selector_session(
+        self,
+        *,
+        target_id: str,
+        ws_url: str,
+        expected_pdf: Path,
+        record: dict | None,
+        readiness: dict,
+    ) -> _DebugSelectorSession | None:
+        with self._lock:
+            url = self._target_to_url.get(target_id, "")
+        candidates = pod_selector_candidates(ws_url, url=url, record=record, readiness=readiness)
+        if not candidates:
+            ready_element = readiness.get("ready_element") if isinstance(readiness, dict) else None
+            if isinstance(ready_element, dict) and ready_element.get("selector"):
+                candidates = [dict(ready_element)]
+        highlight_selector = str((candidates[0] if candidates else {}).get("selector") or "").strip()
+        if highlight_selector:
+            highlight_pod_selector(ws_url, selector=highlight_selector, url=url, record=record)
+        else:
+            highlight_pod_ready_element(ws_url, url=url, record=record, readiness=readiness)
+
+        session = _DebugSelectorSession(
+            target_id=target_id,
+            ws_url=ws_url,
+            url=url,
+            expected_pdf=Path(expected_pdf),
+            record=dict(record) if isinstance(record, dict) else None,
+            readiness=dict(readiness),
+            candidates=candidates,
+            index=0,
+            status="Choose the ready element, then capture.",
+        )
+        with self._lock:
+            if not self._active:
+                return None
+            self._debug_sessions[target_id] = session
+            status = self._debug_session_status_locked(session)
+        if self._on_selector_ready is not None:
+            try:
+                self._on_selector_ready(target_id, status)
+            except Exception:
+                pass
+        self._emit(
+            "selector",
+            "POD selector debug is ready. Use the selector controls to choose the page element.",
+        )
+        return session
+
+    def _wait_for_debug_selector_approval(self, session: _DebugSelectorSession) -> dict | None:
+        while True:
+            with self._lock:
+                active = self._active
+                current = self._debug_sessions.get(session.target_id)
+            if not active or current is None:
+                return None
+            if session.approve_event.wait(timeout=0.25):
+                break
+        with self._lock:
+            current = self._debug_sessions.get(session.target_id)
+            if current is None:
+                return None
+            if current.candidates:
+                selected = dict(current.candidates[current.index])
+            else:
+                ready_element = current.readiness.get("ready_element")
+                selected = dict(ready_element) if isinstance(ready_element, dict) else {}
+            current.status = "Selection accepted. Waiting 1 second before PDF capture..."
+        if selected:
+            record_user_selected_ready_element(
+                url=session.url,
+                record=session.record,
+                selected_element=selected,
+                elapsed_seconds=float(session.readiness.get("elapsed_seconds") or 0.0),
+            )
+            highlight_pod_selector(
+                session.ws_url,
+                selector=str(selected.get("selector") or ""),
+                url=session.url,
+                record=session.record,
+            )
+        return selected
+
+    def _thread_debug_recapture(self, target_id: str) -> None:
+        try:
+            with self._lock:
+                session = self._debug_sessions.get(target_id)
+                if session is None:
+                    return
+                ws_url = session.ws_url
+                expected_pdf = Path(session.expected_pdf)
+                record = dict(session.record) if isinstance(session.record, dict) else None
+                url = session.url
+                if session.candidates:
+                    selected = dict(session.candidates[session.index])
+                else:
+                    selected = {}
+            if selected:
+                record_user_selected_ready_element(
+                    url=url,
+                    record=record,
+                    selected_element=selected,
+                    elapsed_seconds=None,
+                )
+                highlight_pod_selector(
+                    ws_url,
+                    selector=str(selected.get("selector") or ""),
+                    url=url,
+                    record=record,
+                )
+            self._emit("progress", "Selection accepted. Waiting 1 second, then saving PDF again...")
+            time.sleep(1.0)
+
+            if expected_pdf.is_file() and not self._verbose:
+                with self._lock:
+                    session = self._debug_sessions.get(target_id)
+                    if session is not None:
+                        session.pdf_saved = True
+                        session.final_pdf = expected_pdf
+                        session.status = "PDF already exists. Use Next POD when ready."
+                if self._on_saved is not None:
+                    try:
+                        self._on_saved()
+                    except Exception:
+                        pass
+                return
+
+            expected_pdf.parent.mkdir(parents=True, exist_ok=True)
+            remove_pod_debug_overlay(ws_url)
+            pdf_bytes = export_page_pdf(ws_url)
+            staged_pdf = _unique_sibling_path(expected_pdf, "_capture_pending")
+            staged_pdf.write_bytes(pdf_bytes)
+            final_pdf, can_advance, audit_message, validation = _finalize_pdf_with_audit(
+                staged_pdf,
+                expected_pdf,
+                record,
+            )
+            _log_line(f"debug re-saved PDF {final_pdf} ({len(pdf_bytes)} bytes)")
+
+            html_path = final_pdf.with_name(final_pdf.stem + "_capture.html")
+            html_snip = extract_outer_html_snippet(ws_url, max_chars=350_000)
+            if html_snip:
+                try:
+                    html_path.write_text(html_snip, encoding="utf-8", errors="replace")
+                    _log_line(f"debug re-saved HTML snapshot {html_path}")
+                except OSError as exc:
+                    _log_line(f"debug html snapshot write failed: {exc!r}")
+
+            with self._lock:
+                session = self._debug_sessions.get(target_id)
+                if session is not None:
+                    if can_advance:
+                        session.pdf_saved = True
+                        session.final_pdf = final_pdf
+                        session.status = "PDF saved. Use Next POD when ready."
+                    else:
+                        session.pdf_saved = True
+                        session.final_pdf = final_pdf
+                        session.status = "PDF saved for manual review. Use Next POD when ready."
+
+            extra = f"\nHTML snapshot:\n{html_path.name}" if html_snip else ""
+            if can_advance:
+                if self._on_saved is not None:
+                    try:
+                        self._on_saved()
+                    except Exception:
+                        pass
+                audit_line = f"\n{audit_message}" if audit_message else ""
+                self._emit("info", f"Proof-of-delivery PDF saved:\n{final_pdf.name}{extra}{audit_line}")
+            else:
+                self._emit_review_saved(
+                    final_pdf=final_pdf,
+                    record=record,
+                    audit_message=audit_message,
+                    validation=validation,
+                )
+                self._emit(
+                    "info",
+                    "POD PDF saved for manual review:\n"
+                    f"{final_pdf.name}{extra}\n\n{audit_message}",
+                )
+        except Exception as e:
+            _log_line("debug recapture error:\n" + traceback.format_exc())
+            with self._lock:
+                session = self._debug_sessions.get(target_id)
+                if session is not None:
+                    session.approved = False
+                    session.needs_recapture = True
+                    session.status = "Recapture failed. Adjust selection and try again."
+            self._emit("error", f"Automatic print to PDF failed: {e!s}")
+
     def _thread_auto_pod_capture(self, target_id: str, expected_pdf: Path) -> None:
         self._emit(
             "info",
-            "Capture: opened carrier tab — waiting for the page to settle, then saving PDF …",
+            "Capture: opened carrier tab - watching page elements before saving PDF...",
         )
-        min_ready = time.monotonic() + 1.25
-        deadline = time.monotonic() + 75.0
-        last_sig: tuple[int, str] | None = None
-        stable = 0
         try:
-            while time.monotonic() < deadline:
-                with self._lock:
-                    if not self._active:
-                        return
-                ws_url = self._websocket_for_target_id(target_id)
-                if not ws_url:
-                    time.sleep(0.45)
-                    continue
-                info = inspect_page(ws_url, text_preview_chars=16000)
-                if info and str(info.get("readyState") or "") == "complete":
-                    text = str(info.get("text") or "")
-                    if len(text) >= 220:
-                        sig = (len(text), str(info.get("title") or "")[:120])
-                        if sig == last_sig:
-                            stable += 1
-                        else:
-                            stable = 0
-                        last_sig = sig
-                        if stable >= 2 and time.monotonic() >= min_ready:
-                            break
-                time.sleep(0.72)
-            else:
-                self._emit(
-                    "error",
-                    "Timed out waiting for the tracking page to finish loading.",
-                )
-                return
-
-            time.sleep(0.4)
             ws_url = self._websocket_for_target_id(target_id)
             if not ws_url:
-                self._emit("error", "Lost the capture tab before saving the PDF.")
+                self._emit("error", "Lost the capture tab before reading the page.")
                 return
+            with self._lock:
+                record = self._target_to_record.get(target_id)
+                target_url = self._target_to_url.get(target_id, "")
+
+            readiness = wait_for_pod_dom_ready(
+                ws_url,
+                url=target_url,
+                record=record,
+                timeout_seconds=75.0,
+                notify=self._emit,
+            )
+            _log_line(
+                "pod readiness "
+                f"target_id={target_id} mode={readiness.get('mode')} "
+                f"elapsed={readiness.get('elapsed_seconds')} "
+                f"selector={readiness.get('ready_selector')}"
+            )
+
+            debug_selector = pod_readiness_debug_enabled()
+            if debug_selector:
+                session = self._prepare_debug_selector_session(
+                    target_id=target_id,
+                    ws_url=ws_url,
+                    expected_pdf=expected_pdf,
+                    record=record,
+                    readiness=readiness,
+                )
+                if session is None:
+                    return
+                selected = self._wait_for_debug_selector_approval(session)
+                if selected is None:
+                    return
+                self._emit("progress", "Selection accepted. Waiting 1 second, then saving PDF...")
+                time.sleep(1.0)
+            else:
+                self._emit("progress", "Page looks ready. Saving POD PDF automatically...")
 
             if expected_pdf.is_file() and not self._verbose:
                 self._emit("info", f"File already exists:\n{expected_pdf.name}")
-                self._close_target_id(target_id)
+                if debug_selector:
+                    with self._lock:
+                        session = self._debug_sessions.get(target_id)
+                        if session is not None:
+                            session.pdf_saved = True
+                            session.final_pdf = expected_pdf
+                            session.status = "PDF already exists. Use Next POD when ready."
+                else:
+                    self._close_target_id(target_id)
                 if self._on_saved is not None:
                     try:
                         self._on_saved()
@@ -553,12 +920,11 @@ class HtmlCaptureController:
                 return
             expected_pdf.parent.mkdir(parents=True, exist_ok=True)
 
+            remove_pod_debug_overlay(ws_url)
             pdf_bytes = export_page_pdf(ws_url)
             staged_pdf = _unique_sibling_path(expected_pdf, "_capture_pending")
             staged_pdf.write_bytes(pdf_bytes)
-            with self._lock:
-                record = self._target_to_record.get(target_id)
-            final_pdf, can_advance, audit_message = _finalize_pdf_with_audit(
+            final_pdf, can_advance, audit_message, validation = _finalize_pdf_with_audit(
                 staged_pdf,
                 expected_pdf,
                 record,
@@ -575,21 +941,44 @@ class HtmlCaptureController:
                     _log_line(f"html snapshot write failed: {exc!r}")
 
             if can_advance:
-                self._close_target_id(target_id)
+                if debug_selector:
+                    with self._lock:
+                        session = self._debug_sessions.get(target_id)
+                        if session is not None:
+                            session.pdf_saved = True
+                            session.final_pdf = final_pdf
+                            session.status = "PDF saved. Use Next POD when ready."
+                else:
+                    self._close_target_id(target_id)
                 if self._on_saved is not None:
                     try:
                         self._on_saved()
                     except Exception:
                         pass
+            elif debug_selector:
+                with self._lock:
+                    session = self._debug_sessions.get(target_id)
+                    if session is not None:
+                        session.pdf_saved = True
+                        session.final_pdf = final_pdf
+                        session.status = "PDF saved for manual review. Use Next POD when ready."
+            else:
+                self._close_target_id(target_id)
             extra = f"\nHTML snapshot:\n{html_path.name}" if html_snip else ""
             if can_advance:
                 audit_line = f"\n{audit_message}" if audit_message else ""
                 self._emit("info", f"Proof-of-delivery PDF saved:\n{final_pdf.name}{extra}{audit_line}")
             else:
+                self._emit_review_saved(
+                    final_pdf=final_pdf,
+                    record=record,
+                    audit_message=audit_message,
+                    validation=validation,
+                )
                 self._emit(
-                    "error",
-                    "AI audit did not approve this capture, so the tab is still open and the batch is paused.\n\n"
-                    f"Review PDF:\n{final_pdf.name}\n\n{audit_message}",
+                    "info",
+                    "POD PDF saved for manual review:\n"
+                    f"{final_pdf.name}{extra}\n\n{audit_message}",
                 )
         except Exception as e:
             _log_line("auto pod capture error:\n" + traceback.format_exc())
@@ -664,7 +1053,9 @@ class HtmlCaptureController:
                     self._first_enqueued = False
                     self._target_to_path.clear()
                     self._target_to_record.clear()
+                    self._target_to_url.clear()
                     self._order.clear()
+                    self._debug_sessions.clear()
                 return
 
             capture = self._resolve_capture_for_focused_tab()
@@ -711,13 +1102,14 @@ class HtmlCaptureController:
                 return
 
             self._emit("progress", "Printing the displayed shipping page to PDF...")
+            remove_pod_debug_overlay(ws_url)
             pdf_bytes = export_page_pdf(ws_url)
             staged_pdf = _unique_sibling_path(out_path, "_capture_pending")
             staged_pdf.write_bytes(pdf_bytes)
             with self._lock:
                 record = self._target_to_record.get(target_id)
             self._emit("progress", "Checking the captured PDF before saving...")
-            final_pdf, can_advance, audit_message = _finalize_pdf_with_audit(
+            final_pdf, can_advance, audit_message, validation = _finalize_pdf_with_audit(
                 staged_pdf,
                 out_path,
                 record,
@@ -733,10 +1125,17 @@ class HtmlCaptureController:
                 audit_line = f"\n{audit_message}" if audit_message else ""
                 self._emit("info", f"Proof-of-delivery PDF saved:\n{final_pdf.name}{audit_line}")
             else:
+                self._close_target_id(target_id)
+                self._emit_review_saved(
+                    final_pdf=final_pdf,
+                    record=record,
+                    audit_message=audit_message,
+                    validation=validation,
+                )
                 self._emit(
-                    "error",
-                    "AI audit did not approve this capture, so the tab is still open and the batch is paused.\n\n"
-                    f"Review PDF:\n{final_pdf.name}\n\n{audit_message}",
+                    "info",
+                    "POD PDF saved for manual review:\n"
+                    f"{final_pdf.name}\n\n{audit_message}",
                 )
         except Exception as e:
             _log_line("snapshot error:\n" + traceback.format_exc())

@@ -58,7 +58,6 @@ class PipelineProgressWindow(tk.Toplevel):
     Dark modal with canvas progress bar + percentage + status line + Stop.
     accent: "run" (blue) or "excel" (green).
     show_log: if True, adds a scrollable log pane for debug output.
-    on_skip_17track: when set, shows "Skip 17Track" (Excel rebuild / 17TRACK prefetch flows).
     """
 
     def __init__(
@@ -69,7 +68,6 @@ class PipelineProgressWindow(tk.Toplevel):
         headline: str,
         accent: str,
         on_stop: Callable[[], None],
-        on_skip_17track: Callable[[], None] | None = None,
         bar_width: int = 420,
         bar_height: int = 14,
         show_log: bool = False,
@@ -77,9 +75,6 @@ class PipelineProgressWindow(tk.Toplevel):
         super().__init__(parent)
         self._accent = accent
         self._on_stop = on_stop
-        self._on_skip_17track = on_skip_17track
-        self._skip_17track_btn: tk.Button | None = None
-        self._skip_17track_done = False
         self._bar_w = bar_width
         self._bar_h = bar_height
         self._pct = 0
@@ -205,25 +200,9 @@ class PipelineProgressWindow(tk.Toplevel):
         else:
             self._log_text = None  # type: ignore[assignment]
 
-        # --- Stop / Skip 17Track row ---
+        # --- Stop row ---
         btn_row = tk.Frame(outer, bg=THEME["bg"])
         btn_row.pack(fill=tk.X, padx=22, pady=(4, 18))
-        if on_skip_17track is not None:
-            self._skip_17track_btn = tk.Button(
-                btn_row,
-                text="Skip 17Track",
-                command=self._skip_17track_clicked,
-                font=("Segoe UI", 10, "bold"),
-                fg=THEME["excel_accent"],
-                bg=THEME["surface"],
-                activeforeground=THEME["excel_accent_dim"],
-                activebackground=THEME["track"],
-                relief=tk.FLAT,
-                padx=18,
-                pady=6,
-                cursor="hand2",
-            )
-            self._skip_17track_btn.pack(side=tk.RIGHT, padx=(0, 10))
         self._stop_btn = tk.Button(
             btn_row,
             text="Stop",
@@ -271,18 +250,6 @@ class PipelineProgressWindow(tk.Toplevel):
         except tk.TclError:
             pass
 
-    def _skip_17track_clicked(self) -> None:
-        if self._skip_17track_done or self._stopped:
-            return
-        self._skip_17track_done = True
-        if self._skip_17track_btn is not None:
-            try:
-                self._skip_17track_btn.config(state=tk.DISABLED, text="Skipping…")
-            except tk.TclError:
-                pass
-        if self._on_skip_17track:
-            self._on_skip_17track()
-
     def _stop_clicked(self) -> None:
         if self._stopped:
             return
@@ -299,11 +266,6 @@ class PipelineProgressWindow(tk.Toplevel):
             return
         self._stopped = True
         self._stop_btn.config(state=tk.DISABLED, text="Stopping…")
-        if self._skip_17track_btn is not None:
-            try:
-                self._skip_17track_btn.config(state=tk.DISABLED)
-            except tk.TclError:
-                pass
         self._on_stop()
 
     @property
@@ -362,11 +324,6 @@ class PipelineProgressWindow(tk.Toplevel):
             self._status.config(text=status_message, fg=THEME["stop_fg"], justify=tk.LEFT)
         except tk.TclError:
             return
-        if self._skip_17track_btn is not None:
-            try:
-                self._skip_17track_btn.config(state=tk.DISABLED)
-            except tk.TclError:
-                pass
         self._stopped = True
         self._on_stop = lambda: None
         try:

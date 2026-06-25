@@ -38,7 +38,7 @@ def normalize_carrier_for_public_url(
     tracking_id: str = "",
 ) -> str | None:
     """
-    Map 17TRACK / long carrier names to labels ``public_tracking_url`` understands
+    Map long carrier names to labels ``public_tracking_url`` understands
     (``UPS``, ``USPS``, ``FEDEX``, ``DHL``). Returns ``None`` to fall back to
     :func:`infer_carrier` for the tracking id.
     """
@@ -81,5 +81,5 @@ def public_tracking_url(tracking_id: str, carrier: str | None = None) -> str:
     if c == "DHL":
         return f"https://www.dhl.com/en/express/tracking.html?AWB={q}"
 
-    # Universal fallback (no carrier guess)
-    return f"https://www.17track.net/en/track#nums={q}"
+    # Universal fallback (no carrier guess, no tracking-status API dependency).
+    return f"https://www.google.com/search?q={q}+tracking"

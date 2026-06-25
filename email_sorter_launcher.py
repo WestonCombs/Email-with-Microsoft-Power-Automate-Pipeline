@@ -8,7 +8,6 @@ import queue
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -22,6 +21,7 @@ from launcher_progress_ui import (
     parse_excel_progress_line,
     parse_run_progress_line,
 )
+from fix_flagged_dialog import FixFlaggedDialog
 from shared.project_paths import ensure_base_dir_in_environ
 from shared.settings_store import (
     apply_runtime_settings_from_json,
@@ -749,6 +749,25 @@ def orders_workbook_open_in_excel(target: Path) -> bool:
     return _find_workbook_by_path(excel, str(target.resolve())) is not None
 
 
+def ensure_orders_workbook_row2_filter(target: Path) -> None:
+    """Ensure the Orders sheet has Excel filter arrows on row 2 before opening."""
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+    except Exception:
+        return
+    try:
+        path = target.expanduser().resolve()
+        wb = load_workbook(str(path), keep_vba=path.suffix.lower() == ".xlsm")
+        ws = wb["Orders"] if "Orders" in wb.sheetnames else wb.active
+        if ws.max_row >= 2 and ws.max_column >= 1:
+            ws.auto_filter.ref = f"A2:{get_column_letter(ws.max_column)}{max(ws.max_row, 2)}"
+            wb.save(str(path))
+        wb.close()
+    except Exception:
+        pass
+
+
 def focus_or_open_orders_workbook() -> None:
     target = resolve_orders_workbook_path()
     if target is None:
@@ -764,6 +783,7 @@ def focus_or_open_orders_workbook() -> None:
         )
         return
     path_str = str(target.resolve())
+    ensure_orders_workbook_row2_filter(target)
 
     if sys.platform == "win32":
         try:
@@ -860,8 +880,6 @@ def _missing_run_config_message(*, require_mail_and_azure: bool) -> str | None:
             missing.append("Azure application client ID (AZURE_CLIENT_ID)")
     if not (os.getenv("OPENAI_API_KEY") or "").strip():
         missing.append("OpenAI API key (OPENAI_API_KEY)")
-    if not (os.getenv("SEVENTEEN_TRACK_API_KEY") or "").strip():
-        missing.append("17TRACK API key (SEVENTEEN_TRACK_API_KEY)")
     if not missing:
         return None
     return (
@@ -872,7 +890,7 @@ def _missing_run_config_message(*, require_mail_and_azure: bool) -> str | None:
 
 
 def _missing_excel_menu_config_message() -> str | None:
-    """Excel workbook refresh (no mailbox fetch): OpenAI + 17TRACK only."""
+    """Excel workbook refresh (no mailbox fetch): OpenAI only."""
     return _missing_run_config_message(require_mail_and_azure=False)
 
 
@@ -909,12 +927,12 @@ class SettingsDialog:
         azure = (cfg.get("AZURE_CLIENT_ID") or os.getenv("AZURE_CLIENT_ID") or "").strip()
         tenant = (cfg.get("AZURE_TENANT_ID") or os.getenv("AZURE_TENANT_ID") or "common").strip()
         oa = (cfg.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-        t17 = (cfg.get("SEVENTEEN_TRACK_API_KEY") or os.getenv("SEVENTEEN_TRACK_API_KEY") or "").strip()
         dbg = _settings_truthy(cfg.get("DEBUG_MODE") or os.getenv("DEBUG_MODE"))
         login_next = _settings_truthy(cfg.get("LOGIN_NEW_ACCOUNT_NEXT_RUN"))
         delete_saved_email_data = _settings_truthy(
             cfg.get("DELETE_SAVED_EMAIL_DATA_NEXT_RUN")
         )
+        pod_readiness_debug = _settings_truthy(cfg.get("POD_READINESS_DEBUG"))
 
         content = self._win
         outer = tk.Frame(content, padx=18, pady=18, bg=THEME["bg"])
@@ -923,6 +941,24 @@ class SettingsDialog:
         entry_opts = settings_entry_opts()
 
         r = 0
+        update_top = tk.Button(
+            outer,
+            text="Update",
+            bg=_UPDATE_BG,
+            fg="#0f1117",
+            activebackground=_UPDATE_ACTIVE_BG,
+            activeforeground="#0f1117",
+            command=lambda: prompt_update(self._win),
+            font=tkfont.Font(family="Segoe UI", size=11, weight="bold"),
+            height=1,
+            cursor="hand2",
+            relief=tk.FLAT,
+            bd=0,
+        )
+        update_top.grid(row=r, column=0, columnspan=2, sticky=tk.EW, pady=(0, 12))
+        _add_button_hover(update_top, normal_bg=_UPDATE_BG, hover_bg="#fbbf24")
+        r += 1
+
         tk.Label(
             outer,
             text="Mailbox folder name (GRAPH_MAIL_FOLDER)",
@@ -985,6 +1021,18 @@ class SettingsDialog:
         self._refresh_delete_saved_email_label()
         r += 1
 
+        self._pod_readiness_debug = tk.IntVar(value=1 if pod_readiness_debug else 0)
+        pod_debug_row = tk.Frame(outer, bg=THEME["bg"])
+        pod_debug_row.grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 8))
+        _SettingsSwitch(pod_debug_row, self._pod_readiness_debug).pack(side=tk.LEFT)
+        tk.Label(
+            pod_debug_row,
+            text="POD selector debug (blue box + manual element controls)",
+            anchor=tk.W,
+            **label_opts,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        r += 1
+
         tk.Label(
             outer,
             text="Azure application (client) ID (AZURE_CLIENT_ID)",
@@ -1026,17 +1074,6 @@ class SettingsDialog:
         self._openai = tk.Entry(outer, width=64, **entry_opts)
         self._openai.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
         self._openai.insert(0, oa)
-        r += 2
-
-        tk.Label(
-            outer,
-            text="17TRACK API key (SEVENTEEN_TRACK_API_KEY)",
-            anchor=tk.W,
-            **label_opts,
-        ).grid(row=r, column=0, columnspan=2, sticky=tk.W, pady=(0, 4))
-        self._track = tk.Entry(outer, width=64, **entry_opts)
-        self._track.grid(row=r + 1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 8))
-        self._track.insert(0, t17)
         r += 2
 
         btn_row = tk.Frame(outer, bg=THEME["bg"])
@@ -1094,19 +1131,18 @@ class SettingsDialog:
         azure = self._azure.get().strip()
         tenant = self._tenant.get().strip()
         oa = self._openai.get().strip()
-        t17 = self._track.get().strip()
 
         updates = {
             "GRAPH_MAIL_FOLDER": mail,
             "AZURE_CLIENT_ID": azure,
             "AZURE_TENANT_ID": tenant,
             "OPENAI_API_KEY": oa,
-            "SEVENTEEN_TRACK_API_KEY": t17,
             "DEBUG_MODE": "1" if self._debug.get() else "0",
             "LOGIN_NEW_ACCOUNT_NEXT_RUN": "1" if self._login_next.get() else "0",
             "DELETE_SAVED_EMAIL_DATA_NEXT_RUN": (
                 "1" if self._delete_saved_email_data.get() else "0"
             ),
+            "POD_READINESS_DEBUG": "1" if self._pod_readiness_debug.get() else "0",
         }
         try:
             write_settings_json(updates)
@@ -1218,23 +1254,12 @@ def main() -> None:
             if p is not None and p.poll() is None:
                 p.terminate()
 
-        fd_skip, skip17_path = tempfile.mkstemp(prefix="email_sorter_skip17_", suffix=".flag")
-        os.close(fd_skip)
-        skip17_flag_path = str(Path(skip17_path).resolve())
-
-        def on_skip_17track_excel() -> None:
-            try:
-                Path(skip17_flag_path).write_text("1", encoding="utf-8")
-            except OSError:
-                pass
-
         win = PipelineProgressWindow(
             root,
             title="Excel",
-            headline="Updating workbook and 17TRACK data…",
+            headline="Updating workbook…",
             accent="excel",
             on_stop=on_stop_excel,
-            on_skip_17track=on_skip_17track_excel,
             show_log=show_console,
         )
 
@@ -1247,8 +1272,6 @@ def main() -> None:
             env["PYTHONUNBUFFERED"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
             env["EXCEL_LAUNCHER_PROGRESS"] = "1"
-            env["EMAIL_SORTER_17TRACK_QUOTA_SESSION"] = "1"
-            env["EMAIL_SORTER_17TRACK_SKIP_FLAG"] = skip17_flag_path
             try:
                 kw: dict = {
                     "args": [sys.executable, str(rebuild_helper), str(target.resolve())],
@@ -1281,11 +1304,6 @@ def main() -> None:
             *,
             log_tail: list[str] | None = None,
         ) -> None:
-            try:
-                Path(skip17_flag_path).unlink(missing_ok=True)
-            except OSError:
-                pass
-
             def release_excel_btn() -> None:
                 excel_btn.config(state=tk.NORMAL)
 
@@ -1496,23 +1514,6 @@ def main() -> None:
         set_pipeline_ui_busy(True)
         show_console = _env_debug_enabled()
 
-        skip17_flag_path_run: str | None = None
-        if is_excel_rebuild_only:
-            fd_sr, skip17_path_run = tempfile.mkstemp(
-                prefix="email_sorter_skip17_", suffix=".flag"
-            )
-            os.close(fd_sr)
-            skip17_flag_path_run = str(Path(skip17_path_run).resolve())
-
-        def on_skip_17track_run() -> None:
-            p = skip17_flag_path_run
-            if not p:
-                return
-            try:
-                Path(p).write_text("1", encoding="utf-8")
-            except OSError:
-                pass
-
         proc_holder: list[subprocess.Popen | None] = [None]
 
         def on_stop_run() -> None:
@@ -1527,26 +1528,22 @@ def main() -> None:
             root,
             title="Excel rebuild" if is_excel_rebuild_only else "Run",
             headline=(
-                "Rebuilding workbook (17TRACK prefetch)…"
+                "Rebuilding workbook…"
                 if is_excel_rebuild_only
                 else "Running pipeline…"
             ),
             accent="excel" if is_excel_rebuild_only else "run",
             on_stop=on_stop_run,
-            on_skip_17track=on_skip_17track_run if is_excel_rebuild_only else None,
             show_log=show_console,
         )
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
-        env["EMAIL_SORTER_17TRACK_QUOTA_SESSION"] = "1"
         if delete_saved_email_data_next_run:
             env[_DELETE_SAVED_EMAIL_DATA_THIS_RUN_ENV] = "1"
         if is_excel_rebuild_only:
             env["EXCEL_LAUNCHER_PROGRESS"] = "1"
-            if skip17_flag_path_run:
-                env["EMAIL_SORTER_17TRACK_SKIP_FLAG"] = skip17_flag_path_run
         else:
             env["EMAIL_SORTER_LAUNCHER_PROGRESS"] = "1"
 
@@ -1590,12 +1587,6 @@ def main() -> None:
             log_tail: list[str] | None = None,
         ) -> None:
             nonlocal run_in_progress
-            if skip17_flag_path_run:
-                try:
-                    Path(skip17_flag_path_run).unlink(missing_ok=True)
-                except OSError:
-                    pass
-
             def release_run_ui() -> None:
                 nonlocal run_in_progress
                 run_in_progress = False
@@ -1799,18 +1790,18 @@ def main() -> None:
     _attach_tooltip(pdf_folder_btn, "Open PDF folder")
     pdf_folder_btn.pack(side=tk.LEFT, fill=tk.Y)
 
-    update_btn = tk.Button(
+    fix_flagged_btn = tk.Button(
         inner,
-        text="Update",
+        text="Fix Flagged",
         bg=_UPDATE_BG,
         fg="#0f1117",
         activebackground=_UPDATE_ACTIVE_BG,
         activeforeground="#0f1117",
-        command=lambda: prompt_update(root),
+        command=lambda: FixFlaggedDialog(root),
         **common_btn,
     )
-    _add_button_hover(update_btn, normal_bg=_UPDATE_BG, hover_bg="#fbbf24")
-    update_btn.pack(fill=tk.X, **pad)
+    _add_button_hover(fix_flagged_btn, normal_bg=_UPDATE_BG, hover_bg="#fbbf24")
+    fix_flagged_btn.pack(fill=tk.X, **pad)
 
     settings_btn = tk.Button(
         inner,

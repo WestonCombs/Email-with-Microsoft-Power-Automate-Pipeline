@@ -4,7 +4,7 @@ Email Sorter replaces a Power Automate flow with a local Python pipeline and des
 
 1. Sign in to Microsoft Graph and fetch email bodies/attachments
 2. Extract structured order data with OpenAI
-3. Track shipment links/numbers and cache 17TRACK status
+3. Extract shipment links/numbers for carrier-page viewing and POD capture
 4. Build and maintain an Excel workbook (`orders.xlsm` when macro template is available)
 5. Support post-processing workflows (gift invoice linking, proof-of-delivery sync/capture, Excel user edits back to JSON)
 
@@ -35,7 +35,6 @@ python email_sorter_launcher.py
    - `AZURE_CLIENT_ID`
    - `AZURE_TENANT_ID` (optional override; defaults to `common`)
    - `OPENAI_API_KEY`
-   - `SEVENTEEN_TRACK_API_KEY`
 3. Click **Run** (or run `python mainRunner.py` directly).
 
 ## Main Pipeline (mainRunner.py)
@@ -79,7 +78,7 @@ Primary workbook output:
 Macro/template support (`createExcelDocument/macro_template.py`):
 
 - Builds/refreshes `orders_template.xlsm` through Excel COM
-- Wires in `ThisWorkbook` VBA + hotkey module
+- Wires in `ThisWorkbook` VBA + edit-sync module
 - Writes `excel_clipboard_launch.ini` with paths to helper scripts
 
 Workbook capabilities:
@@ -89,11 +88,12 @@ Workbook capabilities:
   - View Tracking Links
   - View Tracking Numbers
   - View Tracking Numbers (All For Order)
-  - Shipping Status (17TRACK viewer)
+  - POD workflow / capture viewer
 - Gift invoice workflow launch from `Invoice Link`
-- Triple-Escape edit mode:
-  - top-row rainbow cycle while armed
-  - editable fields: company, total paid, tax paid
+- Live edit sync:
+  - supported order-field edits save immediately
+  - top-row rainbow success cycle runs for 3 seconds after a saved edit
+  - editable fields: category, order number, company, purchase date, subtotal, total paid, tax paid, gift card, accounting
   - writes edits back to JSON via `createExcelDocument/excel_user_edit_sync.py`
   - persists overlay in `email_contents/json/excel_user_edits.json`
   - clearing an edited field restores original value and removes `*` marker
@@ -115,19 +115,19 @@ Workbook capabilities:
 - `web` mode: per-number quick open to carrier page
 - `order` mode: aggregated by tracking ID with frequency
 
-### Shipping status viewer (17TRACK)
+### POD capture viewer
 
 `trackingNumbersViewer/tracking_status_viewer.py`
 
-- Smart cache-backed 17TRACK status lookups
+- Lists parser-found tracking numbers without live tracking API validation
 - Row highlighting:
   - green: processed POD exists
-  - gray: NotFound temporary/final retry state
 - Right-click menu includes:
   - `Open` (plain browser open, no automation dependency)
   - `Delete` on processed rows (removes POD PDF + JSON references, marks as unprocessed again)
-  - `Force Check Tracking Number`
-- Assisted PDF capture controls (`Play`/`Pause`, toggle)
+- Assisted PDF capture controls
+  - Normal assisted mode opens each remaining POD carrier page, watches DOM/CSS changes, and saves the PDF automatically once the page is ready.
+  - `POD_READINESS_DEBUG` keeps Chrome open with a blue DOM selection box and manual selector controls before each PDF is saved.
 
 ### POD data/workflow
 
@@ -149,9 +149,9 @@ Core settings keys:
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID` (runtime default: `common`)
 - `OPENAI_API_KEY`
-- `SEVENTEEN_TRACK_API_KEY`
 - `DEBUG_MODE`
 - `LOGIN_NEW_ACCOUNT_NEXT_RUN`
+- `POD_READINESS_DEBUG`
 
 Common runtime env keys:
 
@@ -163,7 +163,6 @@ Common runtime env keys:
 - `EXCEL_CLIPBOARD_INI_PATH`
 - `EXCEL_OUTPUT_PATH`
 - `OPENAI_TRACKING_PDF_MODEL`
-- `SEVENTEEN_TRACK_MIN_INTERVAL_SEC`
 
 ## Authentication (Microsoft Graph)
 
@@ -198,6 +197,8 @@ Logs:
 - `<BASE_DIR>/logs/` (timing, extraction/debug segments, OpenAI usage files)
 - `<BASE_DIR>/logs/program_errors.txt`
 - Tracking PDF audit: `email_contents/json/tracking_pdf_audit.json`
+- POD readiness profiles: `email_contents/json/tracking_page_readiness_profiles.json`
+- POD readiness event log: `email_contents/logs/pod_readiness_events.jsonl`
 
 ## Important Scripts
 

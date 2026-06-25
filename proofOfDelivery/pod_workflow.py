@@ -28,8 +28,8 @@ from proofOfDelivery.pod_data import (
     AUTOMATION_HUB_CATEGORY,
     AUTOMATION_HUB_COMPANY_LABEL,
     AUTOMATION_HUB_ORDER_LABEL,
+    POD_CATEGORY,
     POD_HUB_MODE,
-    missing_proof_of_delivery_records,
     project_root_from_env,
     sync_proof_of_delivery_records,
 )
@@ -93,6 +93,65 @@ def _copy_orders_sheet_from_temp(target_workbook, temp_workbook_path: Path) -> N
         excel.DisplayAlerts = old_alerts
 
 
+def _source_key(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return raw.replace("/", "\\").casefold()
+
+
+def _pod_record_source_key(record: dict) -> str:
+    return _source_key(record.get("source_file_link") or record.get("source_file"))
+
+
+def _workbook_pod_source_keys(workbook) -> set[str]:
+    try:
+        ws = workbook.Worksheets("Orders")
+    except Exception:
+        return set()
+    try:
+        header_row = 2
+        headers: dict[str, int] = {}
+        last_col = int(ws.Cells(header_row, ws.Columns.Count).End(-4159).Column)  # xlToLeft
+        for col in range(1, last_col + 1):
+            header = str(ws.Cells(header_row, col).Value or "").strip()
+            if header:
+                headers[header.casefold()] = col
+        category_col = headers.get("category", 1)
+        source_col = 29
+        record_id_col = headers.get("record id", 75)
+        last_row = int(ws.Cells(ws.Rows.Count, record_id_col).End(-4162).Row)  # xlUp
+    except Exception:
+        return set()
+
+    keys: set[str] = set()
+    for row in range(3, last_row + 1):
+        try:
+            category = str(ws.Cells(row, category_col).Value or "").strip()
+        except Exception:
+            continue
+        if category != POD_CATEGORY:
+            continue
+        try:
+            keys.add(_source_key(ws.Cells(row, source_col).Value))
+        except Exception:
+            pass
+    keys.discard("")
+    return keys
+
+
+def _missing_workbook_pod_row_count(workbook, pod_records: list[dict]) -> int:
+    desired = {
+        key
+        for key in (_pod_record_source_key(record) for record in pod_records)
+        if key
+    }
+    if not desired:
+        return 0
+    existing = _workbook_pod_source_keys(workbook)
+    return len(desired - existing)
+
+
 def sync_open_workbook(workbook_path: str | Path) -> bool:
     workbook_path = str(Path(workbook_path).resolve())
     _records, changed = sync_proof_of_delivery_records(PROJECT_ROOT)
@@ -101,7 +160,8 @@ def sync_open_workbook(workbook_path: str | Path) -> bool:
     wb = find_workbook_by_path(excel, workbook_path)
     if wb is None:
         raise RuntimeError("Open this workbook in Excel and keep it as the active file.")
-    if not changed:
+    missing_workbook_rows = _missing_workbook_pod_row_count(wb, _records)
+    if not changed and not missing_workbook_rows:
         return False
 
     ced = _create_excel_document_module()
@@ -255,12 +315,15 @@ def watch_workbook(workbook_path: str | Path) -> int:
         if selection_signature and selection_signature != last_selection_signature:
             last_selection_signature = selection_signature
             if not deferred_until_close:
-                missing = missing_proof_of_delivery_records(PROJECT_ROOT)
-                if missing:
-                    if _ask_sync_prompt(len(missing)):
+                pod_records, changed = sync_proof_of_delivery_records(PROJECT_ROOT)
+                missing_count = _missing_workbook_pod_row_count(wb, pod_records)
+                if changed and missing_count == 0:
+                    missing_count = len(pod_records)
+                if missing_count:
+                    if _ask_sync_prompt(missing_count):
                         try:
-                            changed = sync_open_workbook(workbook_path)
-                            if changed:
+                            synced = sync_open_workbook(workbook_path)
+                            if synced:
                                 _show_status_dialog(
                                     "POD Sync",
                                     "Proof of delivery rows were added to the workbook.",

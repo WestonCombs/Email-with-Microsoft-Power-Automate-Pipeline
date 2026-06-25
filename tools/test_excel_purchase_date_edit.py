@@ -34,7 +34,14 @@ class ExcelPurchaseDateEditTests(unittest.TestCase):
                             "purchase_datetime": "",
                             "email_category": "Invoice",
                             "company": "Example Store",
-                        }
+                        },
+                        {
+                            "source_file_link": "file:///C:/tmp/DOC Example Store 1234 SHIPPED.pdf",
+                            "order_number": "1234",
+                            "purchase_datetime": "",
+                            "email_category": "Shipped",
+                            "company": "Example Store",
+                        },
                     ],
                     indent=2,
                 ),
@@ -51,10 +58,98 @@ class ExcelPurchaseDateEditTests(unittest.TestCase):
 
             rows = json.loads(results_path.read_text(encoding="utf-8"))
             self.assertEqual(rows[0]["purchase_datetime"], "2026-05-22")
+            self.assertEqual(rows[1]["purchase_datetime"], "2026-05-22")
             self.assertEqual(rows[0]["purchase_datetime_source"], "user_excel_edit")
+            self.assertEqual(rows[1]["purchase_datetime_source"], "user_excel_edit")
             self.assertEqual(rows[0]["purchase_datetime_confidence"], "high")
+            self.assertEqual(rows[1]["purchase_datetime_confidence"], "high")
             self.assertTrue(rows[0]["modified_purchase_datetime"])
+            self.assertTrue(rows[1]["modified_purchase_datetime"])
             self.assertEqual(summary["display_value"], "2026-05-22")
+            self.assertEqual(summary["matched_records"], 2)
+
+    def test_same_purchase_date_edit_does_not_mark_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project_root = Path(td)
+            json_dir = project_root / "email_contents" / "json"
+            json_dir.mkdir(parents=True)
+            source_uri = "file:///C:/tmp/DOC Example Store 1234 INVOICE.pdf"
+            json_dir.joinpath("results.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "source_file_link": source_uri,
+                            "order_number": "1234",
+                            "purchase_datetime": "2026-05-22",
+                            "email_category": "Invoice",
+                            "company": "Example Store",
+                            "llm_obtained_company": "Example Store",
+                            "original_llm_obtained_company": "Example Store",
+                        },
+                        {
+                            "source_file_link": "file:///C:/tmp/DOC Example Store 1234 SHIPPED.pdf",
+                            "order_number": "1234",
+                            "purchase_datetime": "2026-05-22",
+                            "email_category": "Shipped",
+                            "company": "Example Store",
+                            "llm_obtained_company": "Example Store",
+                            "original_llm_obtained_company": "Example Store",
+                        },
+                    ],
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = record_excel_user_edit(
+                project_root,
+                field="purchase_datetime",
+                raw_value="5/22/2026",
+                order_number="1234",
+                source_uri=source_uri,
+            )
+
+            rows = json.loads(json_dir.joinpath("results.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["mode"], "unchanged")
+            self.assertEqual(summary["display_value"], "2026-05-22")
+            self.assertNotIn("modified_purchase_datetime", rows[0])
+            self.assertNotIn("modified_purchase_datetime", rows[1])
+
+    def test_same_total_paid_edit_does_not_mark_modified(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project_root = Path(td)
+            json_dir = project_root / "email_contents" / "json"
+            json_dir.mkdir(parents=True)
+            source_uri = "file:///C:/tmp/DOC Example Store 1234 INVOICE.pdf"
+            json_dir.joinpath("results.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "source_file_link": source_uri,
+                            "order_number": "1234",
+                            "total_amount_paid": 10.0,
+                            "email_category": "Invoice",
+                            "company": "Example Store",
+                            "llm_obtained_company": "Example Store",
+                            "original_llm_obtained_company": "Example Store",
+                        }
+                    ],
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = record_excel_user_edit(
+                project_root,
+                field="total_amount_paid",
+                raw_value="$10.00",
+                source_uri=source_uri,
+            )
+
+            row = json.loads(json_dir.joinpath("results.json").read_text(encoding="utf-8"))[0]
+            self.assertEqual(summary["mode"], "unchanged")
+            self.assertEqual(row["total_amount_paid"], 10.0)
+            self.assertNotIn("modified_total_amount_paid", row)
 
     def test_purchase_date_edit_rejects_not_a_date(self) -> None:
         with self.assertRaises(ValueError):
@@ -64,6 +159,7 @@ class ExcelPurchaseDateEditTests(unittest.TestCase):
         self.assertIn("Purchase Date", macro_template.EMAIL_SORTER_HOTKEYS_VBA)
         self.assertIn('Case "purchase date"', macro_template.EMAIL_SORTER_HOTKEYS_VBA)
         self.assertIn('EmailSorter_FieldKeyForColumn = "purchase_datetime"', macro_template.EMAIL_SORTER_HOTKEYS_VBA)
+        self.assertIn("EmailSorter_ApplyFieldEditToOrder Sh, orderNumber, \"Purchase Date\"", macro_template.EMAIL_SORTER_HOTKEYS_VBA)
 
 
 if __name__ == "__main__":
