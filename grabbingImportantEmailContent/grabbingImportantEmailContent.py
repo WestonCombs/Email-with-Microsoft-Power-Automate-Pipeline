@@ -163,6 +163,7 @@ BASE_DIR_ENV = "BASE_DIR"
 API_KEY = os.getenv(OPENAI_API_KEY_ENV)
 
 MODEL = "gpt-4o-mini"
+DATE_RESCUE_MODEL = os.getenv("OPENAI_DATE_RESCUE_MODEL") or MODEL
 
 VALID_CATEGORIES = [
     "Invoice",
@@ -244,6 +245,7 @@ _ALLOWED_FILENAME_DATE_SOURCES = frozenset(
         "filename_date",
         "html_text",
         "pdf_text",
+        "llm_date_rescue",
         "user_excel_edit",
     }
 )
@@ -252,6 +254,7 @@ _DISALLOWED_FILENAME_DATE_SOURCES = frozenset(
 )
 _LEGACY_EXPLICIT_DATE_SOURCES = frozenset({"tracking_or_order_link"})
 _DATE_CONFIDENCE_RANK = {"low": 1, "medium": 2, "high": 3}
+_DATE_RESCUE_ACCEPTED_SOURCE_TYPES = frozenset({"purchase_order_date"})
 
 _ORDER_DATE_PARAM_HINTS = frozenset(
     {
@@ -266,12 +269,25 @@ _ORDER_DATE_PARAM_HINTS = frozenset(
 
 _ISO_DATE_TOKEN_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _US_DATE_TOKEN_RE = re.compile(r"\b(0?[1-9]|1[0-2])[/-](0?[1-9]|[12]\d|3[01])[/-]((?:20)?\d{2})\b")
-_MONTH_NAME_DATE_RE = re.compile(r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b")
+_DOTTED_DATE_TOKEN_RE = re.compile(r"\b(0?[1-9]|1[0-2])\.(0?[1-9]|[12]\d|3[01])\.((?:20)?\d{2})\b")
+_MONTH_NAME_DATE_RE = re.compile(
+    r"\b([A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4})\b",
+    re.IGNORECASE,
+)
 _ORDER_DATE_LABEL_RE = re.compile(
     r"\b("
     r"order\s+date|ordered(?:\s+on)?|order\s+placed|purchase\s+date|"
     r"purchased(?:\s+on)?|placed(?:\s+on)?|invoice\s+date|receipt\s+date|"
-    r"confirmation\s+date"
+    r"confirmation\s+date|date\s+ordered|date\s+purchased|date\s+of\s+purchase|"
+    r"transaction\s+date|payment\s+date|order\s+received|order\s+created"
+    r")\b",
+    re.IGNORECASE,
+)
+_DATE_RESCUE_DISALLOWED_CONTEXT_RE = re.compile(
+    r"\b("
+    r"deliver(?:ed|y)|arriv(?:ed|al)|proof\s+of\s+delivery|out\s+for\s+delivery|"
+    r"shipp(?:ed|ing)|in\s+transit|expected\s+(?:delivery|arrival)|estimated\s+(?:delivery|arrival)|"
+    r"return\s+window|return\s+by|forwarded|received|sent\s*:|processing\s+date|current\s+date"
     r")\b",
     re.IGNORECASE,
 )
@@ -394,9 +410,20 @@ def _write_openai_log(
         f"  OpenAI: {'ran' if timings.get('step5_ran') else 'skipped'}  "
         f"{timings.get('step5_s', 0.0):.2f}s  |  "
         f"GiftCard check: {'ran' if timings.get('step5b_ran') else 'skipped'}  "
-        f"{timings.get('step5b_s', 0.0):.2f}s",
+        f"{timings.get('step5b_s', 0.0):.2f}s  |  "
+        f"Date rescue: {'ran' if timings.get('step5c_date_rescue_ran') else 'skipped'}  "
+        f"{timings.get('step5c_date_rescue_s', 0.0):.2f}s",
         "",
     ]
+    if extracted.get("purchase_datetime_rescue_attempted"):
+        lines.insert(
+            -1,
+            "  Date rescue: "
+            f"source_type={extracted.get('purchase_datetime_rescue_source_type') or 'unknown'}  |  "
+            f"confidence={extracted.get('purchase_datetime_rescue_confidence') or 'low'}  |  "
+            f"evidence={extracted.get('purchase_datetime_rescue_evidence') or 'n/a'}  |  "
+            f"reason={extracted.get('purchase_datetime_rescue_reason') or 'n/a'}",
+        )
     RL.log("openai_extraction", "\n".join(lines))
     RL.debug("openai_extraction",
         f"\n{ts}  |  {file_name}  [debug]\n"
@@ -1684,6 +1711,241 @@ EMAIL TEXT:
     return data
 
 
+def extract_purchase_date_rescue_with_openai(
+    text_only: str,
+    subject: str | None = None,
+) -> dict:
+    """Ask the LLM only for a missing purchase/order date, with evidence."""
+    text_only = _sanitize_for_api(text_only)
+    if subject:
+        subject = _sanitize_for_api(subject)
+    subject_section = f"\nEMAIL SUBJECT: {subject}" if subject else ""
+
+    prompt = f"""The main extraction pass did not find a safe purchase date.
+
+Use ONLY the provided subject and email text.
+
+Task:
+- Find the actual date the order was placed, purchase was made, receipt was issued,
+  invoice was issued, transaction happened, or payment happened.
+- Do NOT return shipment, delivery, expected delivery, return-window, email sent,
+  forwarded, processing, or current dates.
+- If the actual purchase/order/receipt/invoice/transaction/payment date is not clear,
+  return null.
+- When returning a date, evidence must be a short exact quote copied from the provided
+  subject or email text and must include that date. Do not paraphrase the evidence.
+
+Return null rather than guessing.
+{subject_section}
+
+EMAIL TEXT:
+{text_only}""".strip()
+
+    api_kwargs = dict(
+        model=DATE_RESCUE_MODEL,
+        messages=[
+            {
+                "role": "developer",
+                "content": (
+                    "You rescue missing purchase dates from invoice or receipt text. "
+                    "Return only valid structured JSON data."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "purchase_date_rescue",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "purchase_datetime": {
+                            "type": ["string", "null"],
+                            "description": "Actual purchase/order/receipt/invoice/transaction/payment date as YYYY-MM-DD, or null.",
+                        },
+                        "source_type": {
+                            "type": "string",
+                            "enum": [
+                                "purchase_order_date",
+                                "shipment_or_delivery_date",
+                                "email_or_forward_date",
+                                "processing_or_current_date",
+                                "uncertain",
+                            ],
+                            "description": "What kind of date was found, or uncertain.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                            "description": "Confidence that purchase_datetime is the real purchase/order date.",
+                        },
+                        "evidence": {
+                            "type": ["string", "null"],
+                            "description": "Short evidence from the email text supporting the date, or null.",
+                        },
+                        "reason": {
+                            "type": ["string", "null"],
+                            "description": "Short reason for null or low-confidence results.",
+                        },
+                    },
+                    "required": [
+                        "purchase_datetime",
+                        "source_type",
+                        "confidence",
+                        "evidence",
+                        "reason",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        temperature=0,
+    )
+    return _chat_completion_json_parsed(api_kwargs)
+
+
+def _normalized_rescue_evidence(value: object) -> str:
+    cleaned = clean_text(value) or ""
+    return re.sub(r"\s+", " ", cleaned).strip().casefold()
+
+
+def _purchase_date_rescue_rejection_reason(
+    model_reason: str | None,
+    validation_reason: str,
+) -> str:
+    if not model_reason:
+        return validation_reason
+    if validation_reason.casefold() in model_reason.casefold():
+        return model_reason
+    return f"{model_reason}; {validation_reason}"
+
+
+def validate_purchase_date_rescue_result(
+    rescue: dict | None,
+    source_text: str | None = None,
+) -> tuple[str | None, str, str, str | None, str | None]:
+    """Return an accepted, grounded rescue date plus audit metadata.
+
+    A rescue is accepted only when the model identifies a purchase/order date with
+    at least medium confidence and supplies an exact evidence quote containing the
+    same real calendar date. When ``source_text`` is provided, the quote and date
+    must both occur in that source and obvious shipping/email-event contexts are
+    rejected.
+    """
+    if not isinstance(rescue, dict):
+        return None, "llm_date_rescue", "low", None, "missing rescue result"
+
+    evidence = clean_text(rescue.get("evidence"))
+    reason = clean_text(rescue.get("reason"))
+    confidence = clean_text(rescue.get("confidence")) or "low"
+    confidence = confidence.casefold()
+    if confidence not in _DATE_CONFIDENCE_RANK:
+        confidence = "low"
+
+    source_type = (clean_text(rescue.get("source_type")) or "uncertain").casefold()
+    if source_type not in _DATE_RESCUE_ACCEPTED_SOURCE_TYPES:
+        return (
+            None,
+            "llm_date_rescue",
+            confidence,
+            evidence,
+            _purchase_date_rescue_rejection_reason(reason, f"source_type={source_type}"),
+        )
+
+    date_str = _extract_date_str(rescue.get("purchase_datetime"))
+    if not date_str:
+        return (
+            None,
+            "llm_date_rescue",
+            confidence,
+            evidence,
+            _purchase_date_rescue_rejection_reason(reason, "no valid purchase date"),
+        )
+
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return (
+            None,
+            "llm_date_rescue",
+            confidence,
+            evidence,
+            _purchase_date_rescue_rejection_reason(reason, "invalid calendar date"),
+        )
+
+    if _date_confidence_rank(confidence) < _DATE_CONFIDENCE_RANK["medium"]:
+        return (
+            None,
+            "llm_date_rescue",
+            confidence,
+            evidence,
+            _purchase_date_rescue_rejection_reason(reason, "confidence below medium"),
+        )
+
+    if not evidence:
+        return None, "llm_date_rescue", confidence, None, "missing evidence quote"
+
+    evidence_dates = {item[0] for item in _iter_date_context_matches(evidence)}
+    if date_str not in evidence_dates:
+        return (
+            None,
+            "llm_date_rescue",
+            confidence,
+            evidence,
+            _purchase_date_rescue_rejection_reason(reason, "evidence does not contain the rescued date"),
+        )
+
+    evidence_has_purchase_context = bool(_ORDER_DATE_LABEL_RE.search(evidence))
+    if _DATE_RESCUE_DISALLOWED_CONTEXT_RE.search(evidence) and not evidence_has_purchase_context:
+        return (
+            None,
+            "llm_date_rescue",
+            confidence,
+            evidence,
+            _purchase_date_rescue_rejection_reason(reason, "evidence describes a non-purchase event date"),
+        )
+
+    if source_text is not None:
+        normalized_source = _normalized_rescue_evidence(source_text)
+        normalized_evidence = _normalized_rescue_evidence(evidence)
+        if not normalized_evidence or normalized_evidence not in normalized_source:
+            return (
+                None,
+                "llm_date_rescue",
+                confidence,
+                evidence,
+                _purchase_date_rescue_rejection_reason(reason, "evidence quote was not found in the provided email"),
+            )
+        source_dates = {item[0] for item in _iter_date_context_matches(source_text)}
+        if date_str not in source_dates:
+            return (
+                None,
+                "llm_date_rescue",
+                confidence,
+                evidence,
+                _purchase_date_rescue_rejection_reason(reason, "rescued date was not found in the provided email"),
+            )
+        source_context = "\n".join(_date_context_windows(source_text, date_str, radius=100))
+        source_has_purchase_context = bool(_ORDER_DATE_LABEL_RE.search(source_context))
+        if (
+            _DATE_RESCUE_DISALLOWED_CONTEXT_RE.search(source_context)
+            and not source_has_purchase_context
+        ):
+            return (
+                None,
+                "llm_date_rescue",
+                confidence,
+                evidence,
+                _purchase_date_rescue_rejection_reason(
+                    reason,
+                    "source context describes a non-purchase event date",
+                ),
+            )
+
+    return date_str, "llm_date_rescue", confidence, evidence, reason
+
+
 # =========================
 # ARGS
 # =========================
@@ -1971,6 +2233,14 @@ def process_file(
         if final_category not in VALID_CATEGORIES:
             final_category = "Unknown"
 
+        date_rescue_attempted = False
+        date_rescue_source_type: str | None = None
+        date_rescue_confidence: str | None = None
+        date_rescue_evidence: str | None = None
+        date_rescue_reason: str | None = None
+        timings["step5c_date_rescue_ran"] = False
+        timings["step5c_date_rescue_s"] = 0.0
+
         (
             selected_purchase_date,
             purchase_datetime_source,
@@ -1991,21 +2261,13 @@ def process_file(
                 }
             )
             if not selected_date_allowed:
-                fallback_date, fallback_source, fallback_confidence = _email_datetime_fallback_date(
-                    email_datetime,
-                    email_datetime_source,
+                extracted["purchase_datetime"] = None
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: rejected weak extracted date "
+                    f"{selected_purchase_date} source={purchase_datetime_source} "
+                    f"confidence={purchase_datetime_confidence}",
                 )
-                if fallback_date:
-                    extracted["purchase_datetime"] = fallback_date
-                    purchase_datetime_source = fallback_source
-                    purchase_datetime_confidence = fallback_confidence
-                    RL.log(
-                        "grabbingImportantEmailContent",
-                        f"{RL.ts()}  {file_path.name}: weak extracted date "
-                        f"{selected_purchase_date} replaced with original email sent date {fallback_date}",
-                    )
-                else:
-                    extracted["purchase_datetime"] = None
 
         if not _extract_date_str(extracted.get("purchase_datetime")):
             labeled_order_date = infer_order_date_from_labeled_text(
@@ -2020,41 +2282,109 @@ def process_file(
                     f"{RL.ts()}  {file_path.name}: purchase_datetime fallback "
                     f"from labeled invoice/email text -> {labeled_order_date}",
                 )
-            else:
-                inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
-                if inferred_order_date:
-                    extracted["purchase_datetime"] = inferred_order_date
-                    purchase_datetime_source = "explicit_order_date"
-                    purchase_datetime_confidence = "medium"
+
+        if not _extract_date_str(extracted.get("purchase_datetime")):
+            inferred_order_date = infer_order_date_from_tracking_links(tracking_links)
+            if inferred_order_date:
+                extracted["purchase_datetime"] = inferred_order_date
+                purchase_datetime_source = "explicit_order_date"
+                purchase_datetime_confidence = "medium"
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
+                )
+
+        if API_KEY and not _extract_date_str(extracted.get("purchase_datetime")):
+            date_rescue_attempted = True
+            timings["step5c_date_rescue_ran"] = True
+            t5c = _time.perf_counter()
+            print("  » Purchase-date rescue...", end=" ", flush=True)
+            try:
+                rescue = extract_purchase_date_rescue_with_openai(text_only, subject=subject)
+                date_rescue_source_type = clean_text(rescue.get("source_type")) if isinstance(rescue, dict) else None
+                (
+                    rescued_date,
+                    rescue_source,
+                    date_rescue_confidence,
+                    date_rescue_evidence,
+                    date_rescue_reason,
+                ) = validate_purchase_date_rescue_result(
+                    rescue,
+                    source_text="\n".join([subject or "", text_only or ""]),
+                )
+                timings["step5c_date_rescue_s"] = round(_time.perf_counter() - t5c, 3)
+                if rescued_date:
+                    extracted["purchase_datetime"] = rescued_date
+                    purchase_datetime_source = rescue_source
+                    purchase_datetime_confidence = date_rescue_confidence
+                    print(f"done  ({timings['step5c_date_rescue_s']:.2f}s, accepted {rescued_date})")
                     RL.log(
                         "grabbingImportantEmailContent",
-                        f"{RL.ts()}  {file_path.name}: purchase_datetime fallback from tracking link -> {inferred_order_date}",
+                        f"{RL.ts()}  {file_path.name}: purchase_datetime rescued -> {rescued_date} "
+                        f"confidence={date_rescue_confidence} evidence={date_rescue_evidence!r}",
                     )
                 else:
-                    fallback_date, fallback_source, fallback_confidence = _email_datetime_fallback_date(
-                        email_datetime,
-                        email_datetime_source,
+                    print(f"done  ({timings['step5c_date_rescue_s']:.2f}s, no safe date)")
+                    _log_warning(
+                        "grabbingImportantEmailContent",
+                        f"{file_path.name}: purchase-date rescue rejected "
+                        f"source_type={date_rescue_source_type or 'unknown'} "
+                        f"confidence={date_rescue_confidence or 'low'} "
+                        f"reason={date_rescue_reason or 'no safe date'}",
                     )
-                    if fallback_date:
-                        extracted["purchase_datetime"] = fallback_date
-                        purchase_datetime_source = fallback_source
-                        purchase_datetime_confidence = fallback_confidence
-                        RL.log(
-                            "grabbingImportantEmailContent",
-                            f"{RL.ts()}  {file_path.name}: purchase_datetime fallback "
-                            f"from original email sent date -> {fallback_date}",
-                        )
-                    else:
-                        if fallback_source:
-                            _log_warning(
-                                "grabbingImportantEmailContent",
-                                f"{file_path.name}: email_datetime source={fallback_source} "
-                                "not allowed as a purchase date",
-                            )
-                        _log_warning(
-                            "grabbingImportantEmailContent",
-                            f"{file_path.name}: purchase_datetime missing or non-ISO; leaving blank unless another email for this order supplies a verified date",
-                        )
+            except OpenAIRateLimitFatalError:
+                timings["step5c_date_rescue_s"] = round(_time.perf_counter() - t5c, 3)
+                print(f"FAILED  ({timings['step5c_date_rescue_s']:.2f}s)")
+                raise
+            except Exception as e:
+                timings["step5c_date_rescue_s"] = round(_time.perf_counter() - t5c, 3)
+                date_rescue_reason = f"rescue call failed: {e}"
+                print(
+                    f"FAILED  ({timings['step5c_date_rescue_s']:.2f}s, "
+                    f"{console_safe_text(e)})"
+                )
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: Purchase-date rescue failed after "
+                    f"{timings['step5c_date_rescue_s']:.2f}s: {e}",
+                )
+
+        if not _extract_date_str(extracted.get("purchase_datetime")):
+            fallback_date, fallback_source, fallback_confidence = _email_datetime_fallback_date(
+                email_datetime,
+                email_datetime_source,
+            )
+            if fallback_date:
+                extracted["purchase_datetime"] = fallback_date
+                purchase_datetime_source = fallback_source
+                purchase_datetime_confidence = fallback_confidence
+                RL.log(
+                    "grabbingImportantEmailContent",
+                    f"{RL.ts()}  {file_path.name}: purchase_datetime fallback "
+                    f"from original email sent date -> {fallback_date}",
+                )
+            else:
+                if fallback_source:
+                    _log_warning(
+                        "grabbingImportantEmailContent",
+                        f"{file_path.name}: email_datetime source={fallback_source} "
+                        "not allowed as a purchase date",
+                    )
+                _log_warning(
+                    "grabbingImportantEmailContent",
+                    f"{file_path.name}: purchase_datetime missing or non-ISO; leaving blank unless another email for this order supplies a verified date",
+                )
+
+        extracted.update(
+            {
+                "purchase_datetime_rescue_attempted": date_rescue_attempted,
+                "purchase_datetime_rescue_model": DATE_RESCUE_MODEL if date_rescue_attempted else None,
+                "purchase_datetime_rescue_source_type": date_rescue_source_type,
+                "purchase_datetime_rescue_confidence": date_rescue_confidence,
+                "purchase_datetime_rescue_evidence": date_rescue_evidence,
+                "purchase_datetime_rescue_reason": date_rescue_reason,
+            }
+        )
         date_log_record = {
             "purchase_datetime": extracted.get("purchase_datetime"),
             "purchase_datetime_source": purchase_datetime_source,
@@ -2125,6 +2455,12 @@ def process_file(
             "purchase_datetime": clean_text(extracted.get("purchase_datetime")),
             "purchase_datetime_source": clean_text(purchase_datetime_source),
             "purchase_datetime_confidence": clean_text(purchase_datetime_confidence),
+            "purchase_datetime_rescue_attempted": date_rescue_attempted,
+            "purchase_datetime_rescue_model": clean_text(extracted.get("purchase_datetime_rescue_model")),
+            "purchase_datetime_rescue_source_type": clean_text(date_rescue_source_type),
+            "purchase_datetime_rescue_confidence": clean_text(date_rescue_confidence),
+            "purchase_datetime_rescue_evidence": clean_text(date_rescue_evidence),
+            "purchase_datetime_rescue_reason": clean_text(date_rescue_reason),
             "total_amount_paid": extracted.get("total_amount_paid"),
             "subtotal_amount": extracted.get("subtotal_amount"),
             "tax_paid": extracted.get("tax_paid"),
@@ -2164,6 +2500,12 @@ def process_file(
             "purchase_datetime": None,
             "purchase_datetime_source": None,
             "purchase_datetime_confidence": "low",
+            "purchase_datetime_rescue_attempted": False,
+            "purchase_datetime_rescue_model": None,
+            "purchase_datetime_rescue_source_type": None,
+            "purchase_datetime_rescue_confidence": None,
+            "purchase_datetime_rescue_evidence": None,
+            "purchase_datetime_rescue_reason": None,
             "total_amount_paid": None,
             "subtotal_amount": None,
             "tax_paid": None,
@@ -2265,7 +2607,7 @@ def _extract_date_str(purchase_datetime: str | None) -> str | None:
     m = _ISO_DATE_TOKEN_RE.search(cleaned)
     if m:
         return m.group(1)
-    m_us = _US_DATE_TOKEN_RE.search(cleaned)
+    m_us = _US_DATE_TOKEN_RE.search(cleaned) or _DOTTED_DATE_TOKEN_RE.search(cleaned)
     if m_us:
         month = int(m_us.group(1))
         day = int(m_us.group(2))
@@ -2281,7 +2623,9 @@ def _extract_date_str(purchase_datetime: str | None) -> str | None:
     m_named = _MONTH_NAME_DATE_RE.search(cleaned)
     if m_named:
         token = m_named.group(1)
-        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        token = re.sub(r"(\d{1,2})(st|nd|rd|th)\b", r"\1", token, flags=re.IGNORECASE)
+        token = re.sub(r"\s+", " ", token.strip())
+        for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y"):
             try:
                 normalized = datetime.strptime(token, fmt)
                 return normalized.strftime("%Y-%m-%d")
@@ -2295,7 +2639,7 @@ def _iter_date_context_matches(text: str | None) -> list[tuple[str, int, int]]:
     if not cleaned:
         return []
     matches: list[tuple[str, int, int]] = []
-    for regex in (_ISO_DATE_TOKEN_RE, _US_DATE_TOKEN_RE, _MONTH_NAME_DATE_RE):
+    for regex in (_ISO_DATE_TOKEN_RE, _US_DATE_TOKEN_RE, _DOTTED_DATE_TOKEN_RE, _MONTH_NAME_DATE_RE):
         for match in regex.finditer(cleaned):
             token = _extract_date_str(match.group(0))
             if token:
@@ -2310,7 +2654,7 @@ def infer_order_date_from_labeled_text(text: str | None) -> str | None:
     if not cleaned:
         return None
     for date_str, start, end in _iter_date_context_matches(cleaned):
-        window = cleaned[max(0, start - 90) : min(len(cleaned), end + 90)]
+        window = cleaned[max(0, start - 140) : min(len(cleaned), end + 140)]
         if _ORDER_DATE_LABEL_RE.search(window):
             return date_str
     return None
@@ -2327,18 +2671,25 @@ def infer_order_date_from_order_number_context(
         return None
     order_digits = re.sub(r"\D", "", order)
     for date_str, start, end in _iter_date_context_matches(cleaned):
-        prefix = cleaned[max(0, start - 110) : start]
+        prefix = cleaned[max(0, start - 140) : start]
         label_match = re.search(
             r"\border\s*(?:no\.?|number|#)?\b",
             prefix,
             flags=re.IGNORECASE,
         )
-        if not label_match:
+        if label_match:
+            order_segment = prefix[label_match.start() :]
+            if order in order_segment:
+                return date_str
+            if order_digits and order_digits in re.sub(r"\D", "", order_segment):
+                return date_str
+
+        window = cleaned[max(0, start - 160) : min(len(cleaned), end + 160)]
+        if not _ORDER_DATE_LABEL_RE.search(window):
             continue
-        order_segment = prefix[label_match.start() :]
-        if order in order_segment:
+        if order in window:
             return date_str
-        if order_digits and order_digits in re.sub(r"\D", "", order_segment):
+        if order_digits and order_digits in re.sub(r"\D", "", window):
             return date_str
     return None
 
@@ -2955,7 +3306,14 @@ def _record_date_candidate_for_consensus(record: dict) -> tuple[str | None, str,
 
 def _consensus_date_source_rank(source: str) -> int:
     canonical = _canonical_purchase_datetime_source(source)
-    if canonical in {"metadata", "subject", "html_text", "pdf_text", "explicit_order_date"}:
+    if canonical in {
+        "metadata",
+        "subject",
+        "html_text",
+        "pdf_text",
+        "explicit_order_date",
+        "llm_date_rescue",
+    }:
         return 5
     if canonical == "user_excel_edit":
         return 6
