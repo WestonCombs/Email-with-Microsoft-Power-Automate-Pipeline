@@ -838,7 +838,8 @@ def fetch_emails(
 
                 sent_iso = detail.get("sentDateTime")
                 received_iso = detail.get("receivedDateTime")
-                sent_line = format_graph_datetime_local(sent_iso or received_iso)
+                sent_line = format_graph_datetime_local(sent_iso)
+                received_line = format_graph_datetime_local(received_iso)
 
                 attachments: list[tuple[str, bytes]] = []
                 inline_cid_payloads: dict[str, tuple[str, bytes]] = {}
@@ -886,6 +887,7 @@ def fetch_emails(
                         attachments=attachments,
                         to_line=to_line,
                         sent_line=sent_line,
+                        received_line=received_line,
                         header_title=header_title,
                         sent_datetime_iso=str(sent_iso or "").strip(),
                         received_datetime_iso=str(received_iso or "").strip(),

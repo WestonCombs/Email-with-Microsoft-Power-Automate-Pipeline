@@ -22,6 +22,7 @@ class EmailMessage:
     # Outlook-style header (optional; filled by Graph fetcher when available)
     to_line: str = ""
     sent_line: str = ""
+    received_line: str = ""
     header_title: str = ""
     sent_datetime_iso: str = ""
     received_datetime_iso: str = ""
@@ -55,48 +56,103 @@ def format_graph_datetime_local(iso_ts: str | None) -> str:
 
 
 def _build_outlook_header_fragment(msg: EmailMessage) -> str:
-    """HTML fragment: bold recipient title, rule, then From / Sent / To / Subject rows."""
-    rows = []
-    if msg.from_raw.strip():
-        rows.append(
-            ("From", msg.from_raw.strip()),
-        )
-    if msg.sent_line.strip():
-        rows.append(("Sent", msg.sent_line.strip()))
-    if msg.to_line.strip():
-        rows.append(("To", msg.to_line.strip()))
-    subj = msg.subject or ""
-    rows.append(("Subject", subj))
+    """Return an isolated, print-safe Outlook-style metadata block.
+
+    Email bodies commonly contain broad rules for ``table``, ``tr``, and
+    ``td`` elements.  Using uniquely-classed div/span elements with defensive
+    inline styles keeps those rules from hiding the metadata during PDF print.
+    Every expected row is rendered so missing Graph data is explicit instead
+    of making the header appear partially broken.
+    """
+
+    unavailable = "(not available)"
+
+    def display_value(value: str | None) -> str:
+        cleaned = (value or "").strip()
+        return cleaned or unavailable
+
+    rows = [
+        ("From", display_value(msg.from_raw)),
+        ("Sent", display_value(msg.sent_line)),
+        ("Received", display_value(msg.received_line)),
+        ("To", display_value(msg.to_line)),
+        ("Subject", display_value(msg.subject)),
+    ]
+
+    row_style = (
+        "display:table-row !important;visibility:visible !important;"
+        "opacity:1 !important;position:static !important;height:auto !important;"
+        "overflow:visible !important;color:#000 !important;"
+        "font-family:Arial,Helvetica,sans-serif !important;"
+        "font-size:11pt !important;line-height:1.35 !important;"
+    )
+    label_style = (
+        "display:table-cell !important;visibility:visible !important;"
+        "opacity:1 !important;position:static !important;vertical-align:top !important;"
+        "width:78px !important;min-width:78px !important;height:auto !important;"
+        "padding:2px 12px 2px 0 !important;overflow:visible !important;"
+        "white-space:nowrap !important;color:#000 !important;background:#fff !important;"
+        "font-family:Arial,Helvetica,sans-serif !important;font-size:11pt !important;"
+        "font-weight:700 !important;line-height:1.35 !important;text-align:left !important;"
+    )
+    value_style = (
+        "display:table-cell !important;visibility:visible !important;"
+        "opacity:1 !important;position:static !important;vertical-align:top !important;"
+        "width:auto !important;height:auto !important;padding:2px 0 !important;"
+        "overflow:visible !important;white-space:normal !important;"
+        "color:#000 !important;background:#fff !important;"
+        "font-family:Arial,Helvetica,sans-serif !important;font-size:11pt !important;"
+        "font-weight:400 !important;line-height:1.35 !important;text-align:left !important;"
+    )
 
     inner_rows = []
     for label, value in rows:
         inner_rows.append(
-            "<tr>"
-            f'<td style="font-weight:bold;white-space:nowrap;vertical-align:top;'
-            f'padding:2px 12px 2px 0;font-family:Arial,Helvetica,sans-serif;">'
-            f"{html.escape(label)}:</td>"
-            f'<td style="vertical-align:top;padding:2px 0;font-family:Arial,Helvetica,sans-serif;">'
-            f"{html.escape(value)}</td>"
-            "</tr>"
+            f'<div class="email-sorter-meta-row" style="{row_style}">'
+            f'<span class="email-sorter-meta-label" style="{label_style}">'
+            f"{html.escape(label)}:</span>"
+            f'<span class="email-sorter-meta-value" style="{value_style}">'
+            f"{html.escape(value)}</span>"
+            "</div>"
         )
 
-    table = (
-        '<table style="border-collapse:collapse;width:100%;max-width:900px;">'
+    metadata_rows = (
+        '<div class="email-sorter-meta-rows" style="display:table !important;'
+        'visibility:visible !important;opacity:1 !important;position:static !important;'
+        'table-layout:auto !important;border-collapse:collapse !important;width:100% !important;'
+        'max-width:900px !important;height:auto !important;overflow:visible !important;'
+        'color:#000 !important;background:#fff !important;'
+        'font-family:Arial,Helvetica,sans-serif !important;font-size:11pt !important;'
+        'line-height:1.35 !important;text-align:left !important;">'
         + "".join(inner_rows)
-        + "</table>"
+        + "</div>"
     )
 
     title = (msg.header_title or "").strip()
     parts: list[str] = [
-        '<div class="email-meta-header" style="margin-bottom:16px;">',
+        '<div class="email-sorter-meta-header" style="display:block !important;'
+        'visibility:visible !important;opacity:1 !important;position:static !important;'
+        'float:none !important;clear:both !important;width:auto !important;max-width:none !important;'
+        'height:auto !important;min-height:0 !important;margin:0 0 16px 0 !important;'
+        'padding:0 !important;overflow:visible !important;color:#000 !important;'
+        'background:#fff !important;font-family:Arial,Helvetica,sans-serif !important;'
+        'font-size:11pt !important;font-weight:400 !important;line-height:1.35 !important;'
+        'text-align:left !important;writing-mode:horizontal-tb !important;">',
     ]
     if title:
         parts.append(
-            '<div style="font-weight:bold;font-size:14pt;font-family:Arial,Helvetica,sans-serif;">'
+            '<div class="email-sorter-meta-title" style="display:block !important;'
+            'visibility:visible !important;opacity:1 !important;position:static !important;'
+            'width:auto !important;height:auto !important;margin:0 !important;padding:0 0 8px 0 !important;'
+            'overflow:visible !important;border:0 !important;border-bottom:2px solid #000 !important;'
+            'color:#000 !important;background:#fff !important;'
+            'font-family:Arial,Helvetica,sans-serif !important;font-size:14pt !important;'
+            'font-weight:700 !important;line-height:1.25 !important;text-align:left !important;">'
             f"{html.escape(title)}</div>"
-            '<hr style="border:none;border-top:2px solid #000;margin:8px 0;" />'
+            '<div aria-hidden="true" style="display:block !important;height:8px !important;'
+            'visibility:visible !important;background:#fff !important;"></div>'
         )
-    parts.append(table)
+    parts.append(metadata_rows)
     parts.append("</div>")
     return "".join(parts)
 

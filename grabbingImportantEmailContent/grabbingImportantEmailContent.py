@@ -1047,6 +1047,7 @@ def _outlook_msg_for_pdf_from_env(subject: str | None) -> EmailMessage | None:
         attachments=[],
         to_line=os.getenv("OUTLOOK_TO_LINE", ""),
         sent_line=os.getenv("OUTLOOK_SENT_LINE", ""),
+        received_line=os.getenv("OUTLOOK_RECEIVED_LINE", ""),
         header_title=os.getenv("OUTLOOK_HEADER_TITLE", ""),
     )
 
