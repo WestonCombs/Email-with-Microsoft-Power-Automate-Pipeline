@@ -502,8 +502,9 @@ def _custom_import_outlook_env() -> dict[str, str]:
     from_raw = f"{_CUSTOM_IMPORT_LABEL} <{_CUSTOM_IMPORT_EMAIL}>"
     return {
         "OUTLOOK_FROM_RAW": from_raw,
-        "OUTLOOK_SENT_LINE": _CUSTOM_IMPORT_LABEL,
-        "OUTLOOK_TO_LINE": _CUSTOM_IMPORT_LABEL,
+        "OUTLOOK_SENT_LINE": "",
+        "OUTLOOK_RECEIVED_LINE": "",
+        "OUTLOOK_TO_LINE": "",
         "OUTLOOK_HEADER_TITLE": _CUSTOM_IMPORT_LABEL,
     }
 
@@ -1453,6 +1454,7 @@ def main() -> None:
                 outlook_pdf_header_env={
                     "OUTLOOK_FROM_RAW": msg.from_raw,
                     "OUTLOOK_SENT_LINE": msg.sent_line,
+                    "OUTLOOK_RECEIVED_LINE": msg.received_line,
                     "OUTLOOK_TO_LINE": msg.to_line,
                     "OUTLOOK_HEADER_TITLE": msg.header_title,
                 },
